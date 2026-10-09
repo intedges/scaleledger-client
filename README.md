@@ -1,64 +1,55 @@
-# 🐟 ScaleLedger Client
+# ScaleLedger Client
 
-**High-Frequency IoT Edge Controller for Fishery Weighing Automation**
+ScaleLedger Client는 수산물 계량 현장의 PC에서 SUWOL-1000 계량 장비와 통신하는 프로그램입니다. RFID 카드를 확인하고 중량을 읽어 계량 전표를 출력하며, 계량 기록을 ScaleLedger 관리 프로그램에 전달합니다. 별도의 조작 화면 없이 실행되고, 기준정보와 장비 등록은 관리 프로그램의 브라우저 화면에서 처리합니다.
 
-ScaleLedger Client is a **Headless IoT Edge Controller** running on gateway PCs at wholesale fishery auction sites. It acts as a critical bridge that orchestrates physical weighing hardware (`SUWOL-1000`) while maintaining real-time synchronization with the central ScaleLedger Django server.
+현재는 개발 중입니다. 현장 설치와 실제 장비 검증을 마친 뒤 운영에 사용할 예정입니다.
 
-## 📖 Project Overview
+## 사용 구성
 
-This project is not just a passive data forwarder. It operates as a **Master Controller** for field equipment, utilizing a **PC-Driven Polling Architecture** to dominate hardware I/O. Simultaneously, it employs an **Event-Driven Sync Strategy** to ensure zero-latency data transmission to the cloud, strictly adhering to **Local-First** principles for data integrity.
+첫 운영은 **인터넷이 연결되지 않은 PC 한 대**에서 다음 프로그램을 함께 실행하는 구성을 목표로 합니다. 현장 운영체제와 설치·자동 시작 방법은 확인 중입니다.
 
-## 🎯 Core Responsibilities
+| 구성 | 역할 |
+| --- | --- |
+| ScaleLedger 관리 프로그램 | 생산자·품목·카드 배정, 장비 설정과 계량 기록을 관리합니다. |
+| ScaleLedger Client | 연결된 계량 장비에서 RFID와 중량을 읽고 계량 전표를 출력합니다. |
+| 브라우저 | 운영자가 기준정보를 등록하고 계량 기록을 확인합니다. |
+| SUWOL-1000과 프린터 | 계량·카드 인식·전광판·음성 안내·종이 전표 출력을 담당합니다. |
 
-The client handles two distinct operational domains with different concurrency models:
+관리 화면에서 **Gateway**는 장비가 연결된 PC, **Station**은 그 PC에 연결된 계량대를 뜻합니다.
 
-### 1. Hardware Orchestration (The Polling Domain)
-The client acts as the **Master** driver for the `SUWOL-1000` integrated weighing system.
+## 기본 업무 흐름
 
-* **Active Polling & Data Capture**: Since the hardware does not buffer data, the client performs high-frequency polling (sub-100ms) to capture volatile RFID tags and weight data before they vanish.
-* **Feedback Control**: It actively renders visual information on the LED display and triggers voice guidance (TTS) and printer outputs based on the weighing workflow state.
+1. 설치 담당자와 PC·계량대·프린터 연결, 생산자·품목·RFID 카드 배정을 확인합니다.
+2. 업무 시작 전 PC의 날짜와 시간, 장비 전원과 프린터 용지를 확인하고 두 프로그램을 실행합니다.
+3. 등록된 카드를 사용해 계량하고, 장비 안내와 출력된 전표를 확인합니다.
+4. 전표와 관리 화면의 생산자·품목·중량·측정 시각이 일치하는지 확인합니다.
 
-### 2. Reactive Cloud Synchronization (The Event Domain)
-Unlike the hardware layer, the network layer avoids polling.
+계량 전표에는 측정 시각, 전표번호, PC·계량대 이름, 생산자·품목, 카드번호와 중량이 표시됩니다. 현재 전표 양식은 고정되어 있습니다.
 
-* **Zero-Latency Upload**: Weighing records are pushed to a transmission queue immediately upon creation, triggering an instant upload to the server without waiting for a scheduled interval.
-* **Offline Resilience**: If the network is down, the queue pauses, but data is safely secured in the local SQLite database. Upon reconnection, the system automatically replays the pending events.
-* **Identity Management**: Securely manages device identity via MAC address and auto-refreshing access tokens.
+**전표 출력과 관리 프로그램의 기록 저장은 각각 확인해야 합니다.** 출력되거나 완료 안내가 나왔다는 사실만으로 기록 저장까지 성공했다고 판단할 수 없습니다. 기록이 없거나 내용이 다르면 출력물을 보관하고 발생 시각과 계량대를 담당자에게 전달합니다.
 
-## 🏗 System Architecture
+## 기록 보관과 장애 대응
 
-To satisfy both the strict timing requirements of hardware and the asynchronous nature of network I/O, the system uses a **Producer-Consumer Pattern**:
+- 관리 프로그램으로 아직 전달하지 못한 기록은 PC에 보관하고, 통신 오류나 서버 오류가 발생하면 다시 전송을 시도합니다. 내용 오류로 반려된 기록은 담당자의 확인이 필요합니다.
+- 전송이 성공하면 클라이언트의 해당 기록은 삭제됩니다. 클라이언트만으로 전체 계량 이력을 복구할 수 없으므로 관리 프로그램의 데이터 백업이 필요합니다.
+- 장비 연결이 끊기거나 카드가 인식되지 않으면 연결·전원·카드 등록 상태를 확인하고 담당자에게 알립니다. 프로그램 재설치나 데이터 파일 삭제로 해결하려 하지 않습니다.
+- 생산자·품목·카드 배정을 바꾼 뒤에는 현장 프로그램에 반영됐는지 확인해야 합니다. 업무 중 변경을 자동으로 반영하는 기능은 아직 없습니다.
 
-### 1. Dedicated Hardware Thread (Producer)
-* Isolates blocking serial I/O from the main event loop.
-* Continuously polls the hardware in a tight loop (Request-Response).
-* Parses raw packets and produces "Physical Events" (e.g., RFID detected, Weight Stabilized) into a thread-safe queue.
+## 설치 시 인수인계받을 내용
 
-### 2. Asyncio Main Loop (Processor)
-* Operates on a **Finite State Machine (FSM)**: `INITIALIZE` → `SYNC` → `REGISTER` → `HEARTBEAT`.
-* Consumes physical events, executes business logic (e.g., deciding when to finalize a transaction), and persists data to the local database (**Tortoise ORM**).
+- 두 프로그램의 시작·종료 방법과 브라우저에서 열 업무 화면 주소
+- 장비 연결 포트·드라이버, 카드 등록·변경 후 반영 방법
+- 재부팅과 통신 장애 후 상태 확인·재시작 방법
+- 계량 단위·정밀도와 전표·관리 화면의 결과를 대조하는 방법
+- 업무 기록과 전송 대기 기록의 보관 위치, 백업·복구 방법
+- 출력 실패나 기록 누락이 발생했을 때 연락할 담당자
 
-### 3. Sync Worker (Consumer)
-* A dedicated background task that monitors the **Sync Queue**.
-* As soon as the Main Loop commits a record to the DB, it pushes a task to this queue.
-* The worker consumes the task and executes the HTTP REST call to the server, ensuring immediate data synchronization.
+실제 실행·백업 절차는 현장 구성을 확정하고 검증한 뒤 안내합니다. 현재 개발용 프로그램에는 외부 시험 서버 주소가 고정되어 있어, 그대로 실행하면 같은 PC의 관리 프로그램에 연결되지 않습니다.
 
-## 🔌 Hardware Interface (`SUWOL-1000` Protocol)
+## 현재 준비 상태와 제한사항
 
-The client implements the full **Master-Slave protocol** for `SUWOL-1000`:
-
-* **Communication**: RS-232 Serial (9600bps).
-* **Protocol Logic**:
-    * **Request (PC → MCU)**: Sends display updates, relay control bits, and voice commands in a single packet.
-    * **Response (MCU → PC)**: Receives weight sensor data, RFID tags, and keypad inputs.
-* **Constraint**: The MCU has no memory. If the client stops polling even for a second, field data is permanently lost. Reliability is paramount.
-
-## 🛠 Tech Stack
-
-* **Language**: Python 3.14+
-* **Runtime Manager**: uv
-* **Core**: asyncio (Event Loop), asyncio.Queue (Data Pipeline), threading
-* **Networking**: httpx (Async HTTP), websockets
-* **Database**: Tortoise ORM (Async SQLite)
-* **Hardware**: pyserial
-* **Logging**: structlog (Structured JSON Logging)
+- 카드 확인, 계량 결과 전달, 로컬 저장, 서버 전송과 고정 양식 전표 출력이 구현되어 있습니다. 실제 장비에서 계량 정확성과 출력 결과를 확인해야 합니다.
+- 서버와 연결되지 않아도 계량·출력을 계속하는 것이 운영 목표지만, 현재는 서버 장애 시 기동과 지속 운전을 보장하지 못합니다.
+- 중량의 소수 부분 처리와 안정 상태 확인, 측정 시각의 시간대 처리는 수정·검증이 필요합니다.
+- 용지 없음·출력 실패·로컬 기록 저장 실패를 완료 안내와 구분하는 처리가 충분하지 않습니다.
+- 서버에서 전표 양식을 변경하고 현장에 보관하는 기능, 전표 재발행과 자동 백업은 아직 제공하지 않습니다.

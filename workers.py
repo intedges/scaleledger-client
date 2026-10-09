@@ -1,4 +1,3 @@
-# workers.py
 import asyncio
 import httpx
 from structlog.stdlib import get_logger

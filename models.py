@@ -1,4 +1,3 @@
-# models.py
 from tortoise.models import Model
 from tortoise import fields
 
