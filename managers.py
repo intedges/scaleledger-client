@@ -16,6 +16,7 @@ class StationRuntime:
     worker: WeighingStationWorker
     thread: threading.Thread
     port: str
+    station_name: str
 
 
 class WeighingStationManager:
@@ -50,6 +51,8 @@ class WeighingStationManager:
                     )
                     self.stop_worker(station.id)
                     self.start_worker(station)
+                else:
+                    runtime.station_name = station.name
         self.logger.info("sys.manager.station.sync_completed", running_workers=len(self.workers))
 
     def start_worker(self, station: WeighingStation):
@@ -69,7 +72,7 @@ class WeighingStationManager:
             receipt = Receipt(
                 record_uuid=event.uuid,
                 gateway_name=self.market_cache.gateway_name,
-                station_name=station.name,
+                station_name=runtime.station_name,
                 rfid_card_uid=event.rfid_card_uid,
                 producer_name=info.producer_name,
                 species_name=info.species_name,
@@ -86,17 +89,23 @@ class WeighingStationManager:
         )
 
         thread = threading.Thread(target=worker.run, name=f"WeighingStation-{station.id}-{station.serial_port}", daemon=True)
+        runtime = StationRuntime(worker=worker, thread=thread, port=station.serial_port, station_name=station.name)
         thread.start()
-        self.workers[station.id] = StationRuntime(worker=worker, thread=thread, port=station.serial_port)
+        self.workers[station.id] = runtime
 
     def stop_worker(self, station_id: int):
-        runtime = self.workers.pop(station_id)
+        runtime = self.workers[station_id]
         self.logger.info("sys.manager.station.stop_worker", station_id=station_id, port=runtime.port)
         runtime.worker.stop()
-        runtime.thread.join(timeout=3.0)
+        runtime.thread.join()
+        del self.workers[station_id]
 
     def stop_all(self):
         self.logger.info("sys.manager.station.stop_all.requested")
-        station_ids = list(self.workers.keys())
-        for station_id in station_ids:
-            self.stop_worker(station_id)
+        runtimes = list(self.workers.items())
+        for station_id, runtime in runtimes:
+            self.logger.info("sys.manager.station.stop_worker", station_id=station_id, port=runtime.port)
+            runtime.worker.stop()
+        for station_id, runtime in runtimes:
+            runtime.thread.join()
+            del self.workers[station_id]

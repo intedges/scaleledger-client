@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import json
 import ssl
 
@@ -54,6 +55,7 @@ class HeadlessClient:
 
         self.access_token: str | None = None
         self.gateway_id: int | None = None
+        self._gateway_data: dict | None = None
 
         self.market_cache = MarketDataCache()
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -105,7 +107,6 @@ class HeadlessClient:
                 self.event_queue.task_done()
 
     async def close(self):
-        self.station_manager.stop_all()
         await self.api_client.close()
         await Tortoise.close_connections()
         self.logger.info("sys.lifecycle.process.shutdown")
@@ -119,47 +120,60 @@ class HeadlessClient:
         await Tortoise.generate_schemas()
         self.logger.debug("sys.db.schema.ready")
     
-    async def wipe_local_auth(self):
-        self.logger.warning("sys.auth.local_db.wipe")
-        await Gateway.all().delete()
-        self.access_token = None
-        self.gateway_id = None
-    
-    async def bootstrap(self):
-        self.logger.debug("sys.boot.state.evaluating")
+    async def restore_local_state(self):
+        unsynced_records = await Record.all().values_list("uuid", flat=True)
+        for record_uuid in unsynced_records:
+            self.upload_queue.put_nowait(str(record_uuid))
+        self.logger.info("sys.recovery.records_enqueued", count=len(unsynced_records))
 
-        if not self.access_token:
-            gateway = await Gateway.get_or_none(mac_address=self.mac_address)
-            if gateway:
-                self.access_token = gateway.access_token
-                self.gateway_id = gateway.id
-                self.logger.info("sys.boot.local_cache.loaded", gateway_id=self.gateway_id)
-            else:
-                self.logger.info("sys.boot.auth.missing", action="require_provisioning")
-                return
-        
+        gateway = await Gateway.get_or_none(mac_address=self.mac_address)
+        if gateway is None:
+            self.logger.info("sys.boot.auth.missing", action="require_provisioning")
+            return
+
+        self.access_token = gateway.access_token or None
+        self.gateway_id = gateway.id
+        await self.refresh_market_cache()
+        stations = await WeighingStation.filter(gateway_id=gateway.id)
+        self.station_manager.sync(stations)
+        self.logger.info("sys.boot.local_cache.loaded", gateway_id=gateway.id)
+
+    async def wipe_local_auth(self):
+        self.logger.warning("sys.auth.credentials.rejected")
+        # Preserve the Gateway row: deleting it also deletes cached Stations.
+        await Gateway.filter(mac_address=self.mac_address).update(access_token="")
+        self.access_token = None
+        self._gateway_data = None
+
+    async def bootstrap(self) -> bool:
         self.logger.info("sys.boot.remote_api.syncing")
         try:
             retrieved_gateway = await self.api_client.retrieve_gateway_self(self.access_token)
-
-            await Gateway.filter(id__not=retrieved_gateway["id"]).delete()
-
-            gateway, _ = await Gateway.update_or_create(
-                id=retrieved_gateway["id"],
-                defaults={
-                    "mac_address": retrieved_gateway["mac_address"],
-                    "hostname": retrieved_gateway["hostname"],
-                    "ip_address": retrieved_gateway["ip_address"],
-                    "name": retrieved_gateway["name"],
-                    "description": retrieved_gateway["description"],
-                    "access_token": retrieved_gateway["access_token"],
-                    "last_heartbeat": retrieved_gateway["last_heartbeat"],
-                    "created_at": retrieved_gateway["created_at"],
-                    "updated_at": retrieved_gateway["updated_at"],
-                }
+            # Validated credentials must survive a later settings sync failure.
+            # Keep the cached Gateway ID and Stations until a complete snapshot arrives.
+            saved = await Gateway.filter(mac_address=self.mac_address).update(
+                access_token=self.access_token,
             )
-            self.gateway_id = gateway.id
+            if not saved:
+                await Gateway.create(
+                    id=retrieved_gateway["id"],
+                    mac_address=retrieved_gateway["mac_address"],
+                    hostname=retrieved_gateway["hostname"],
+                    ip_address=retrieved_gateway["ip_address"],
+                    name=retrieved_gateway["name"],
+                    description=retrieved_gateway["description"],
+                    access_token=self.access_token,
+                    last_heartbeat=retrieved_gateway["last_heartbeat"],
+                    created_at=retrieved_gateway["created_at"],
+                    updated_at=retrieved_gateway["updated_at"],
+                )
+            # Commit a replacement Gateway together with its Station snapshot.
+            # Deleting the previous Gateway earlier would discard offline settings.
+            self._gateway_data = retrieved_gateway
+            self.gateway_id = retrieved_gateway["id"]
+            self.market_cache.gateway_name = retrieved_gateway["name"]
             self.logger.info("sys.boot.remote_api.success", gateway_id=self.gateway_id)
+            return True
             
         except httpx.HTTPStatusError as e:
             if e.response.status_code in (401, 403):
@@ -169,30 +183,49 @@ class HeadlessClient:
                 self.logger.exception("sys.boot.remote_api.error", status=e.response.status_code)
         except httpx.RequestError:
             self.logger.warning("sys.boot.network.offline", action="fallback_to_local_cache")
+        return False
     
-    async def sync_weighing_stations(self):
+    async def sync_weighing_stations(self) -> bool:
         self.logger.info("sys.sync.weighing_stations.started")
         try:
             retrieved_stations = await self.api_client.list_gateway_stations(self.access_token)
 
-            station_ids = []
-            for station in retrieved_stations:
-                station_ids.append(station["id"])
-                await WeighingStation.update_or_create(
-                    id=station["id"],
-                    defaults={
-                        "gateway_id": station["gateway"],
-                        "name": station["name"],
-                        "description": station["description"],
-                        "serial_port": station["serial_port"],
-                        "serial_description": station["serial_description"],
-                        "serial_location": station["serial_location"],
-                        "serial_number": station["serial_number"],
-                        "serial_manufacturer": station["serial_manufacturer"],
-                    },
-                )
+            async with in_transaction():
+                if self._gateway_data is not None:
+                    data = self._gateway_data
+                    await Gateway.filter(id__not=data["id"]).delete()
+                    await Gateway.update_or_create(
+                        id=data["id"],
+                        defaults={
+                            "mac_address": data["mac_address"],
+                            "hostname": data["hostname"],
+                            "ip_address": data["ip_address"],
+                            "name": data["name"],
+                            "description": data["description"],
+                            "access_token": data["access_token"],
+                            "last_heartbeat": data["last_heartbeat"],
+                            "created_at": data["created_at"],
+                            "updated_at": data["updated_at"],
+                        },
+                    )
+                station_ids = []
+                for station in retrieved_stations:
+                    station_ids.append(station["id"])
+                    await WeighingStation.update_or_create(
+                        id=station["id"],
+                        defaults={
+                            "gateway_id": station["gateway"],
+                            "name": station["name"],
+                            "description": station["description"],
+                            "serial_port": station["serial_port"],
+                            "serial_description": station["serial_description"],
+                            "serial_location": station["serial_location"],
+                            "serial_number": station["serial_number"],
+                            "serial_manufacturer": station["serial_manufacturer"],
+                        },
+                    )
 
-            deleted_count = await WeighingStation.filter(id__not_in=station_ids).delete()
+                deleted_count = await WeighingStation.filter(id__not_in=station_ids).delete()
             
             current_stations = await WeighingStation.all()
             self.station_manager.sync(current_stations)
@@ -202,6 +235,7 @@ class HeadlessClient:
                 synced_count=len(retrieved_stations),
                 deleted_count=deleted_count,
             )
+            return True
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code in (401, 403):
@@ -212,8 +246,9 @@ class HeadlessClient:
             self.logger.warning("net.api.sync_stations.network_error")
         except Exception:
             self.logger.exception("sys.sync.weighing_stations.fatal_error")
+        return False
     
-    async def sync_market_data(self):
+    async def sync_market_data(self) -> bool:
         self.logger.info("sys.sync.market_data.started")
         try:
             species_data = await self.api_client.fetch_species(self.access_token)
@@ -248,6 +283,7 @@ class HeadlessClient:
                 producers=len(producers_data), 
                 rfids=len(rfid_cards_data)
             )
+            return True
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code in (401, 403):
@@ -258,6 +294,7 @@ class HeadlessClient:
             self.logger.warning("net.api.sync_market.network_error")
         except Exception:
             self.logger.exception("sys.sync.market_data.fatal_error")
+        return False
 
     async def refresh_market_cache(self):
         self.logger.info("sys.cache.refresh.started")
@@ -275,8 +312,9 @@ class HeadlessClient:
             
             self.market_cache.update_rfid_data(rfid_cache_data)
 
-            gateway = await Gateway.get(id=self.gateway_id)
-            self.market_cache.gateway_name = gateway.name
+            if self._gateway_data is None:
+                gateway = await Gateway.get(id=self.gateway_id)
+                self.market_cache.gateway_name = gateway.name
 
             self.logger.info("sys.cache.refresh.completed", cached_rfid_count=len(rfid_cache_data))
             
@@ -289,42 +327,55 @@ class HeadlessClient:
         self.main_loop = asyncio.get_running_loop()
         await self.setup()
 
-        is_running = True
-        while is_running:
-            try:
-                await self.bootstrap()
+        # Network restarts must never cancel a local write in progress.
+        consumer = asyncio.create_task(self.event_consumer_worker())
+        try:
+            await self.restore_local_state()
+            await self.run_network_loop()
+        finally:
+            await asyncio.to_thread(self.station_manager.stop_all)
+            # Deliver callbacks already submitted by the stopped hardware threads.
+            await asyncio.sleep(0)
+            await self.event_queue.join()
+            consumer.cancel()
+            with suppress(asyncio.CancelledError):
+                await consumer
 
+    async def run_network_loop(self):
+        while True:
+            try:
                 if not self.access_token:
                     await self.run_provisioning_loop()
+
+                await self.bootstrap()
+                if self.gateway_id is None:
+                    await asyncio.sleep(self.retry_interval)
                 else:
                     await self.run_active_loop()
 
             except* AuthDegradedError:
-                self.logger.warning("sys.loop.auth_degraded", action="wipe_and_retry")
+                self.logger.warning("sys.loop.auth_degraded", action="require_provisioning")
                 await self.wipe_local_auth()
 
-            except* (ConnectionClosed, OSError):
-                self.logger.exception("net.ws.connection_lost", retry_in=self.retry_interval)
-                await asyncio.sleep(self.retry_interval)
-
-            except* asyncio.CancelledError:
-                self.logger.info("sys.loop.cancelled")
-                is_running = False
-
             except* Exception:
-                self.logger.exception("sys.loop.unexpected_crashed", retry_in=self.retry_interval)
+                self.logger.exception("net.worker.failed", retry_in=self.retry_interval)
                 await asyncio.sleep(self.retry_interval)
     
     async def run_provisioning_loop(self):
         self.logger.info("net.ws.provisioning.connecting", url=self.provisioning_url)
-        async with websockets.connect(self.provisioning_url, **self.ws_kwargs) as ws:
+        async for ws in websockets.connect(self.provisioning_url, **self.ws_kwargs):
             self.logger.info("net.ws.provisioning.connected")
-            async for message in ws:
-                await self.dispatch_provisioning(ws, message)
+            try:
+                async for message in ws:
+                    await self.dispatch_provisioning(ws, message)
 
-                if self.access_token:
-                    self.logger.info("biz.provisioning.handover_ready")
-                    break
+                    if self.access_token:
+                        self.logger.info("biz.provisioning.handover_ready")
+                        await ws.close()
+                        return
+            except ConnectionClosed:
+                self.logger.warning("net.ws.provisioning.disconnected")
+            await asyncio.sleep(self.retry_interval)
     
     async def dispatch_provisioning(self, websocket, message: str):
         try:
@@ -346,49 +397,51 @@ class HeadlessClient:
                     new_token = data["payload"]["access_token"]
                     if new_token:
                         self.access_token = new_token
+                        # Resolve this registration before opening its active socket.
+                        self.gateway_id = None
+                        self._gateway_data = None
                 case _:
                     self.logger.warning("net.ws.message.ignored", type=message_type)
         except json.JSONDecodeError:
             self.logger.error("net.ws.message.invalid_json", message=message)
     
     async def run_active_loop(self):
+        heartbeat_worker = HeartbeatWorker(
+            api_client=self.api_client,
+            access_token=self.access_token,
+        )
+        upload_worker = RecordUploadWorker(
+            api_client=self.api_client,
+            upload_queue=self.upload_queue,
+            access_token=self.access_token,
+        )
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self.run_active_ws_loop())
+            tg.create_task(heartbeat_worker.run())
+            tg.create_task(upload_worker.run())
+
+    async def run_active_ws_loop(self):
+        # A cached ID may belong to settings saved before re-registration.
+        # HTTP workers can already use the token while its current ID is resolved.
+        while self._gateway_data is None:
+            if await self.bootstrap():
+                break
+            await asyncio.sleep(self.retry_interval)
+
         target_ws_url = f"{self.ws_url}/ws/devices/gateways/{self.gateway_id}/"
         self.logger.info("net.ws.active.connecting", url=target_ws_url)
 
-        try:
-            unsynced_records = await Record.all().values_list("uuid", flat=True)
-            for record_uuid in unsynced_records:
-                self.upload_queue.put_nowait(str(record_uuid))
-            
-            if unsynced_records:
-                self.logger.info("sys.recovery.records_enqueued", count=len(unsynced_records))
-            
-            await self.sync_market_data()
-
-            await self.refresh_market_cache()
-            
-            await self.sync_weighing_stations()
-
-            async with websockets.connect(target_ws_url, **self.ws_kwargs) as ws:
-                self.logger.info("net.ws.active.connected")
-
-                heartbeat_worker = HeartbeatWorker(
-                    api_client=self.api_client,
-                    access_token=self.access_token,
-                )
-                upload_worker = RecordUploadWorker(
-                    api_client=self.api_client,
-                    upload_queue=self.upload_queue,
-                    access_token=self.access_token,
-                )
-                
-                async with asyncio.TaskGroup() as tg:
-                    tg.create_task(self.event_consumer_worker())
-                    tg.create_task(self.listen_active_ws(ws))
-                    tg.create_task(heartbeat_worker.run())
-                    tg.create_task(upload_worker.run())
-        finally:
-            self.station_manager.stop_all()
+        async for ws in websockets.connect(target_ws_url, **self.ws_kwargs):
+            self.logger.info("net.ws.active.connected")
+            try:
+                if await self.bootstrap() and await self.sync_market_data():
+                    await self.refresh_market_cache()
+                    if await self.sync_weighing_stations():
+                        await self.listen_active_ws(ws)
+            except ConnectionClosed:
+                self.logger.warning("net.ws.active.disconnected")
+            # Also reconnect on normal closes and retry an incomplete sync.
+            await asyncio.sleep(self.retry_interval)
     
     async def listen_active_ws(self, ws):
         async for message in ws:
@@ -408,7 +461,8 @@ class HeadlessClient:
 
                     case "sync.weighing_stations":
                         self.logger.info("biz.active.sync_stations.executing")
-                        await self.sync_weighing_stations()
+                        if not await self.sync_weighing_stations():
+                            return
 
                     case _:
                         self.logger.debug("net.ws.message.ignored", type=message_type)
