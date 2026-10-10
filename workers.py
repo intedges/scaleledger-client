@@ -19,11 +19,13 @@ class RecordUploadWorker:
 
         while True:
             record_uuid = await self.upload_queue.get()
+            unfinished = True
 
             try:
                 record = await Record.get_or_none(uuid=record_uuid)
 
                 if not record:
+                    unfinished = False
                     self.logger.debug("biz.record.already_purged_or_missing", uuid=record_uuid)
                     continue
 
@@ -38,6 +40,7 @@ class RecordUploadWorker:
                 )
 
                 await record.delete()
+                unfinished = False
                 self.logger.info("biz.record.upload_success_and_purged", uuid=record_uuid)
 
             except httpx.HTTPStatusError as e:
@@ -47,6 +50,7 @@ class RecordUploadWorker:
                         self.logger.error("net.api.record_upload.auth_rejected", status=status_code)
                         raise AuthDegradedError("Token expired during upload")
                     case 400 | 422:
+                        unfinished = False
                         self.logger.critical(
                             "biz.record.upload_permanently_rejected",
                             uuid=record_uuid,
@@ -55,22 +59,23 @@ class RecordUploadWorker:
                         )
                     case _ if status_code >= 500:
                         self.logger.error("net.api.record_upload.server_down", status=status_code)
-                        await self._requeue(record_uuid)
+                        await self._wait_before_retry(record_uuid)
                     case _:
                         self.logger.warning("net.api.record_upload.unhandlected_status", status=status_code)
-                        await self._requeue(record_uuid)
+                        await self._wait_before_retry(record_uuid)
 
             except httpx.RequestError:
                 self.logger.warning("net.api.record_upload.network_offline")
-                await self._requeue(record_uuid)
+                await self._wait_before_retry(record_uuid)
 
             finally:
+                if unfinished:
+                    self.upload_queue.put_nowait(record_uuid)
                 self.upload_queue.task_done()
 
-    async def _requeue(self, record_uuid: str):
+    async def _wait_before_retry(self, record_uuid: str):
         self.logger.info("sys.worker.record_upload.requeue", uuid=record_uuid, delay=self.retry_delay)
         await asyncio.sleep(self.retry_delay)
-        await self.upload_queue.put(record_uuid)
 
 
 class HeartbeatWorker:
