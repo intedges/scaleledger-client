@@ -229,6 +229,25 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await Record.filter(uuid=record.uuid).exists())
         self.manager.stop_all.assert_not_called()
 
+    async def test_measurement_time_keeps_its_local_offset_through_storage_and_upload(self):
+        await self.cached_setup()
+        self.online_responses()
+        uploaded = asyncio.Event()
+
+        async def accept_record(**kwargs):
+            uploaded.set()
+            return {}
+
+        self.api.create_record.side_effect = accept_record
+        self.start(self.client.run())
+        await self.wait_for(self.started.wait())
+        event = await self.emit_and_save()
+        await self.wait_for(uploaded.wait())
+
+        measured_at = self.api.create_record.call_args.kwargs["record"].measured_at
+        self.assertEqual(event.timestamp.utcoffset(), datetime.now().astimezone().utcoffset())
+        self.assertEqual(measured_at, event.timestamp)
+
     async def test_reconnected_socket_refreshes_cached_market_and_station_data(self):
         await self.cached_setup()
         self.online_responses()

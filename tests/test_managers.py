@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 import unittest
 from unittest.mock import Mock, patch
 
@@ -61,6 +62,23 @@ class WeighingStationManagerTests(unittest.TestCase):
         self.assertIs(self.manager.workers[1].worker, workers[1])
         self.assertEqual(self.manager.workers[1].port, "new-port")
         self.assertIn(b"Updated station", receipt)
+
+    def test_receipt_prints_the_measurement_time_in_local_time(self):
+        self.manager.market_cache.update_rfid_data({
+            "12345678": RFIDInfo(True, "Producer", "Species"),
+        })
+        event = WeighingCompletedEvent(
+            rfid_card_uid="12345678", weight=23,
+            timestamp=datetime(2026, 10, 11, 5, 0, tzinfo=UTC),
+        )
+        station = WeighingStation(id=1, name="Station", serial_port="test-port")
+
+        with patch("managers.WeighingStationWorker") as worker, patch("managers.threading.Thread"):
+            self.manager.sync([station])
+            receipt = worker.call_args.kwargs["receipt_builder"](event)
+
+        local_time = event.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        self.assertIn(local_time.encode(), receipt)
 
     def test_stop_all_signals_every_worker_before_waiting_for_threads(self):
         actions = []
