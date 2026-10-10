@@ -190,7 +190,7 @@ class ReceiptTemplate:
             # Meta Data
             .set_align(Alignment.LEFT)
             .add_separator("=", 42)
-            .add_kv("발행일시", receipt.measured_at.strftime("%Y-%m-%d %H:%M:%S"))
+            .add_kv("발행일시", receipt.measured_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
             .add_kv("전표번호", short_uuid)
             .add_kv("계 량 기", receipt.gateway_name)
             .add_kv("계 근 대", receipt.station_name)
