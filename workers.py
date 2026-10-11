@@ -1,5 +1,6 @@
 import asyncio
-import httpx
+
+import httpx2
 from structlog.stdlib import get_logger
 
 from api import APIClient, AuthDegradedError, RecordCreateDTO
@@ -43,7 +44,7 @@ class RecordUploadWorker:
                 unfinished = False
                 self.logger.info("biz.record.upload_success_and_purged", uuid=record_uuid)
 
-            except httpx.HTTPStatusError as e:
+            except httpx2.HTTPStatusError as e:
                 status_code = e.response.status_code
                 match status_code:
                     case 401 | 403:
@@ -64,7 +65,7 @@ class RecordUploadWorker:
                         self.logger.warning("net.api.record_upload.unhandlected_status", status=status_code)
                         await self._wait_before_retry(record_uuid)
 
-            except httpx.RequestError:
+            except httpx2.RequestError:
                 self.logger.warning("net.api.record_upload.network_offline")
                 await self._wait_before_retry(record_uuid)
 
@@ -94,13 +95,13 @@ class HeartbeatWorker:
                 await self.api_client.send_heartbeat(self.access_token)
                 self.logger.debug("net.api.heartbeat.success")
 
-            except httpx.HTTPStatusError as e:
+            except httpx2.HTTPStatusError as e:
                 if e.response.status_code in (401, 403):
                     self.logger.error("net.api.heartbeat.auth_rejected", status=e.response.status_code)
                     raise AuthDegradedError("Token expired during heartbeat")
                 self.logger.error("net.api.heartbeat.server_error", status=e.response.status_code)
 
-            except httpx.RequestError:
+            except httpx2.RequestError:
                 self.logger.warning("net.api.heartbeat.network_error")
 
             await asyncio.sleep(self.interval)

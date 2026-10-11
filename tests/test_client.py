@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 import uuid
 
-import httpx
+import httpx2
 from tortoise import Tortoise
 from websockets.exceptions import ConnectionClosedError
 
@@ -68,7 +68,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "retrieve_gateway_self", "list_gateway_stations", "send_heartbeat",
             "create_record", "fetch_species", "fetch_producers", "fetch_rfid_cards",
         ):
-            setattr(self.api, name, AsyncMock(side_effect=httpx.ConnectError("offline")))
+            setattr(self.api, name, AsyncMock(side_effect=httpx2.ConnectError("offline")))
         self.connections = StubConnections()
         patches = (
             patch("main.APIClient", return_value=self.api),
@@ -263,7 +263,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 return cached_gateway
             if not self.connections.opened.empty():
                 sync_attempted.set()
-            raise httpx.ConnectError("offline")
+            raise httpx2.ConnectError("offline")
 
         self.api.retrieve_gateway_self.side_effect = unavailable_gateway
         self.start(self.client.run())
@@ -380,7 +380,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         }))
 
         self.assertTrue(await self.client.bootstrap())
-        self.api.list_gateway_stations.side_effect = httpx.ConnectError("offline")
+        self.api.list_gateway_stations.side_effect = httpx2.ConnectError("offline")
         self.assertFalse(await self.client.sync_weighing_stations())
 
         restarted = HeadlessClient(base_url="http://127.0.0.1:8000")
@@ -434,7 +434,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "type": "gateway.registered", "payload": {"access_token": "new-token"},
         }))
         self.assertTrue(await self.client.bootstrap())
-        self.api.list_gateway_stations.side_effect = httpx.ConnectError("offline")
+        self.api.list_gateway_stations.side_effect = httpx2.ConnectError("offline")
         self.assertFalse(await self.client.sync_weighing_stations())
 
         restarted = HeadlessClient(base_url="http://127.0.0.1:8000")
@@ -446,7 +446,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         heartbeat_sent = asyncio.Event()
         self.api.send_heartbeat.side_effect = lambda token: heartbeat_sent.set()
-        self.api.retrieve_gateway_self.side_effect = httpx.ConnectError("offline")
+        self.api.retrieve_gateway_self.side_effect = httpx2.ConnectError("offline")
         restarted.run_provisioning_loop = AsyncMock()
         connected = StubWebSocket(hold=asyncio.Event())
         self.connections.sockets = [connected]
@@ -483,7 +483,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.gateway_id, 2)
         self.assertEqual(await Gateway.all().values_list("id", flat=True), [1])
 
-        self.api.list_gateway_stations.side_effect = httpx.ConnectError("offline")
+        self.api.list_gateway_stations.side_effect = httpx2.ConnectError("offline")
         self.assertFalse(await self.client.sync_weighing_stations())
         self.assertEqual(await Gateway.all().values_list("id", flat=True), [1])
         self.assertEqual((await WeighingStation.get(id=1)).serial_port, "mock-port")
@@ -513,7 +513,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         current = self.api.list_gateway_stations.return_value
         updated = [dict(current[0], name="Updated station", serial_port="updated-port")]
         self.api.list_gateway_stations.side_effect = [
-            current, httpx.ConnectError("temporary outage"), updated,
+            current, httpx2.ConnectError("temporary outage"), updated,
         ]
         notifying = StubWebSocket(
             messages=[json.dumps({"type": "sync.weighing_stations"})],

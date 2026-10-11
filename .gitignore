@@ -22,6 +22,7 @@ ENV/
 .pypirc
 
 # Local SQLite state, journals, and backups
+/data/
 /db.sqlite3*
 
 # Logs, test results, and tool caches

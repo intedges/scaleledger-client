@@ -1,14 +1,12 @@
-import re
 import socket
-from typing import List, Dict, Any
+from typing import Any
 import uuid
 
 import serial.tools.list_ports
 
 
 def get_mac_address() -> str:
-    mac = uuid.getnode()
-    return ":".join(re.findall("..", "%012x" % mac))
+    return uuid.getnode().to_bytes(6).hex(":")
 
 
 def get_ip_address() -> str:
@@ -27,7 +25,7 @@ def get_hostname() -> str:
     return socket.gethostname()
 
 
-def scan_peripherals() -> List[Dict[str, Any]]:
+def scan_peripherals() -> list[dict[str, Any]]:
     ports = serial.tools.list_ports.comports()
     return [
         {

@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 import dataclasses
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
-from typing import Callable, ClassVar, Literal
+from typing import ClassVar, Literal, Self
 
 import threading
 
@@ -153,7 +154,7 @@ class DisplayRequestPacket(RequestPacket):
 class PrinterRequestPacket(RequestPacket):
     command_code: ClassVar[CommandCode] = CommandCode.PRINTER
     copies: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9] = 1
-    document_bytes: bytes = bytes()
+    document_bytes: bytes = b""
 
     def to_bytes(self) -> bytes:
         if len(self.document_bytes) > 9999:
@@ -203,7 +204,7 @@ class ResponsePacket:
     weight_unit: str = "kg"
 
     @classmethod
-    def from_bytes(cls, raw: bytes) -> "ResponsePacket":
+    def from_bytes(cls, raw: bytes) -> Self:
         if len(raw) != 53:
             raise ValueError(f"Invalid response packet length: {len(raw)} bytes")
         if raw[0] != STX or raw[-1] != ETX:

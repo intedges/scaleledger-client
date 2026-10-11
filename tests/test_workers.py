@@ -1,11 +1,11 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 import uuid
 
-import httpx
+import httpx2
 
 from api import AuthDegradedError
 from workers import RecordUploadWorker
@@ -17,7 +17,7 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
             uuid=uuid.uuid4(),
             rfid_card_uid="test-card",
             weight=125,
-            measured_at=datetime.now(timezone.utc),
+            measured_at=datetime.now(UTC),
             delete=AsyncMock(),
         )
         self.record_uuid = str(self.record.uuid)
@@ -32,9 +32,9 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def http_error(status):
-        request = httpx.Request("POST", "http://test.invalid/weighing/api/records/")
-        response = httpx.Response(status, request=request)
-        return httpx.HTTPStatusError("Simulated response", request=request, response=response)
+        request = httpx2.Request("POST", "http://test.invalid/weighing/api/records/")
+        response = httpx2.Response(status, request=request)
+        return httpx2.HTTPStatusError("Simulated response", request=request, response=response)
 
     async def start_worker(self):
         task = asyncio.create_task(self.worker.run())
@@ -84,7 +84,7 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.api.create_record.assert_awaited_once()
 
     async def test_cancellation_during_retry_delay_returns_record_once(self):
-        for error in (httpx.ConnectError("Simulated outage"), self.http_error(500)):
+        for error in (httpx2.ConnectError("Simulated outage"), self.http_error(500)):
             with self.subTest(error=type(error).__name__):
                 self.api.create_record.side_effect = error
                 retry_started = asyncio.Event()
@@ -121,7 +121,7 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_network_and_server_errors_retry_then_purge_success(self):
         self.worker.retry_delay = 0
         self.api.create_record.side_effect = [
-            httpx.ConnectError("Simulated outage"),
+            httpx2.ConnectError("Simulated outage"),
             self.http_error(503),
             {},
         ]

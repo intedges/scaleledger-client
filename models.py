@@ -3,7 +3,7 @@ from tortoise import fields
 
 
 class Gateway(Model):
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
     mac_address = fields.CharField(max_length=17, unique=True)
     hostname = fields.CharField(max_length=255)
     ip_address = fields.CharField(max_length=39)
@@ -22,7 +22,7 @@ class Gateway(Model):
 
 
 class WeighingStation(Model):
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
     gateway = fields.ForeignKeyField("models.Gateway", related_name="weighing_stations")
     name = fields.CharField(max_length=100)
     description = fields.TextField()
@@ -40,7 +40,7 @@ class WeighingStation(Model):
 
 
 class Record(Model):
-    uuid = fields.UUIDField(pk=True)
+    uuid = fields.UUIDField(primary_key=True)
     rfid_card_uid = fields.CharField(max_length=20)
     weight = fields.IntField()
     measured_at = fields.DatetimeField()
@@ -53,7 +53,7 @@ class Record(Model):
 
 
 class Species(Model):
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
     name = fields.CharField(max_length=100)
 
     class Meta:
@@ -61,7 +61,7 @@ class Species(Model):
 
 
 class Producer(Model):
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
     uuid = fields.UUIDField(unique=True)
     name = fields.CharField(max_length=100)
     phone = fields.CharField(max_length=20, null=True)
@@ -72,7 +72,7 @@ class Producer(Model):
 
 
 class RFIDCard(Model):
-    id = fields.IntField(pk=True)
+    id = fields.IntField(primary_key=True)
     uuid = fields.UUIDField(unique=True)
     uid = fields.CharField(max_length=50, unique=True)
     producer = fields.ForeignKeyField("models.Producer", related_name="rfid_cards")
