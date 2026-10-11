@@ -1,6 +1,6 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 import threading
-from typing import Callable, Dict
 
 from structlog.stdlib import get_logger
 
@@ -23,7 +23,7 @@ class WeighingStationManager:
     def __init__(self, on_event: Callable[[BaseEvent], None], market_cache: MarketDataCache):
         self.on_event = on_event
         self.market_cache = market_cache
-        self.workers: Dict[int, StationRuntime] = {}
+        self.workers: dict[int, StationRuntime] = {}
         self.logger = get_logger()
 
     def sync(self, stations: list[WeighingStation]):

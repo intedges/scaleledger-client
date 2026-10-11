@@ -1,10 +1,9 @@
 import asyncio
 from contextlib import suppress
 import json
-import ssl
+from pathlib import Path
 
-import certifi
-import httpx
+import httpx2
 import structlog
 from structlog.stdlib import get_logger
 from tortoise import Tortoise
@@ -18,6 +17,7 @@ from events import BaseEvent, WeighingCompletedEvent
 from managers import WeighingStationManager
 from models import Gateway, Record, WeighingStation, Species, Producer, RFIDCard
 from utils import get_hostname, get_ip_address, get_mac_address, scan_peripherals
+from paths import AppPaths, program_dir
 from workers import HeartbeatWorker, RecordUploadWorker
 
 
@@ -38,8 +38,9 @@ def setup_logging():
 
 
 class HeadlessClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, db_path: Path | None = None):
         self.base_url = base_url.rstrip("/")
+        self.db_path = db_path or AppPaths(program_dir()).db_file
 
         self.api_client = APIClient(base_url=self.base_url)
         self.ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
@@ -68,7 +69,8 @@ class HeadlessClient:
 
         self.ws_kwargs = {}
         if self.ws_url.startswith("wss://"):
-            self.ws_kwargs["ssl"] = ssl.create_default_context(cafile=certifi.where())
+            # Trust the same certificates as the HTTP client (the OS trust store).
+            self.ws_kwargs["ssl"] = httpx2.create_ssl_context()
 
 
     def handle_hardware_event(self, event: BaseEvent):
@@ -112,11 +114,22 @@ class HeadlessClient:
         self.logger.info("sys.lifecycle.process.shutdown")
 
     async def setup(self):
-        self.logger.info("sys.lifecycle.process.startup", server_url=self.api_client.client.base_url)
-        await Tortoise.init(
-            db_url="sqlite://db.sqlite3",
-            modules={"models": ["models"]},
+        self.logger.info(
+            "sys.lifecycle.process.startup",
+            server_url=self.base_url,
+            db_path=str(self.db_path),
         )
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        await Tortoise.init(config={
+            "connections": {
+                # A file path needs no escaping, unlike a Windows path inside a database URL.
+                "default": {
+                    "engine": "tortoise.backends.sqlite",
+                    "credentials": {"file_path": str(self.db_path)},
+                },
+            },
+            "apps": {"models": {"models": ["models"], "default_connection": "default"}},
+        })
         await Tortoise.generate_schemas()
         self.logger.debug("sys.db.schema.ready")
     
@@ -175,13 +188,13 @@ class HeadlessClient:
             self.logger.info("sys.boot.remote_api.success", gateway_id=self.gateway_id)
             return True
             
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             if e.response.status_code in (401, 403):
                 self.logger.warning("sys.boot.auth.rejected", status=e.response.status_code)
                 raise AuthDegradedError("Bootstrap auth failed")
             else:
                 self.logger.exception("sys.boot.remote_api.error", status=e.response.status_code)
-        except httpx.RequestError:
+        except httpx2.RequestError:
             self.logger.warning("sys.boot.network.offline", action="fallback_to_local_cache")
         return False
     
@@ -237,12 +250,12 @@ class HeadlessClient:
             )
             return True
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             if e.response.status_code in (401, 403):
                 self.logger.error("net.api.sync_stations.auth_rejected", status=e.response.status_code)
                 raise AuthDegradedError("Sync stations auth failed")
             self.logger.error("net.api.sync_stations.server_error", status=e.response.status_code)
-        except httpx.RequestError:
+        except httpx2.RequestError:
             self.logger.warning("net.api.sync_stations.network_error")
         except Exception:
             self.logger.exception("sys.sync.weighing_stations.fatal_error")
@@ -285,12 +298,12 @@ class HeadlessClient:
             )
             return True
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             if e.response.status_code in (401, 403):
                 self.logger.error("net.api.sync_market.auth_rejected", status=e.response.status_code)
                 raise AuthDegradedError("Sync market data auth failed")
             self.logger.error("net.api.sync_market.server_error", status=e.response.status_code)
-        except httpx.RequestError:
+        except httpx2.RequestError:
             self.logger.warning("net.api.sync_market.network_error")
         except Exception:
             self.logger.exception("sys.sync.market_data.fatal_error")
