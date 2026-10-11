@@ -38,10 +38,8 @@ htmlcov/
 .nox/
 .hypothesis/
 
-# Local working documents and temporary artifacts
-.tmp/
-*.md
-!/README.md
+# Local work artifacts
+/.ai/
 
 # OS metadata
 .DS_Store
