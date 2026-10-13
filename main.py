@@ -23,6 +23,7 @@ from events import BaseEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
 from models import Gateway, Record, WeighingStation, Species, Producer, RFIDCard
+from telemetry import LatestWeightBuffer, LiveWeightPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, get_mac_address, scan_peripherals
 from workers import HeartbeatWorker, RecordUploadWorker
 from windows_runtime import WindowsStopEvent, request_stop
@@ -58,13 +59,19 @@ class HeadlessClient:
         self.access_token: str | None = None
         self.gateway_id: int | None = None
         self._gateway_data: dict | None = None
+        self._station_config_ready = asyncio.Event()
+        self._station_sync_lock = asyncio.Lock()
+        self._live_weight_stop_code: int | None = None
 
         self.market_cache = MarketDataCache()
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
         self.event_queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
+        self.live_weight_updates = LatestWeightBuffer()
         self.station_manager = WeighingStationManager(
             on_event=self.handle_hardware_event,
             market_cache = self.market_cache,
+            on_live_weight=self.live_weight_updates.update,
+            on_station_removed=self.live_weight_updates.remove,
         )
         self.main_loop = None
         self._cleanup_started = False
@@ -159,6 +166,7 @@ class HeadlessClient:
         await Gateway.filter(mac_address=self.mac_address).update(access_token="")
         self.access_token = None
         self._gateway_data = None
+        self._station_config_ready.clear()
 
     async def bootstrap(self) -> bool:
         self.log_step("sys.boot.remote_api.syncing")
@@ -206,6 +214,12 @@ class HeadlessClient:
         return False
     
     async def sync_weighing_stations(self) -> bool:
+        # Control notifications and a rejected telemetry station can both request
+        # a refresh. Keep the DB snapshot and worker replacement in one order.
+        async with self._station_sync_lock:
+            return await self._sync_weighing_stations()
+
+    async def _sync_weighing_stations(self) -> bool:
         self.log_step("sys.sync.weighing_stations.started")
         try:
             retrieved_stations = await self.api_client.list_gateway_stations(self.access_token)
@@ -249,6 +263,7 @@ class HeadlessClient:
             
             current_stations = await WeighingStation.all()
             self.station_manager.sync(current_stations)
+            self._station_config_ready.set()
 
             self.logger.info(
                 "sys.sync.weighing_stations.completed",
@@ -452,6 +467,23 @@ class HeadlessClient:
             tg.create_task(self.run_active_ws_loop())
             tg.create_task(heartbeat_worker.run())
             tg.create_task(upload_worker.run())
+            tg.create_task(self.run_live_weights_loop())
+
+    async def run_live_weights_loop(self):
+        if self._live_weight_stop_code is not None:
+            return
+        # A successful server snapshot establishes station ownership after registration.
+        await self._station_config_ready.wait()
+        publisher = LiveWeightPublisher(
+            url=f"{self.ws_url}/ws/devices/gateways/{self.gateway_id}/weights/",
+            access_token=self.access_token,
+            updates=self.live_weight_updates,
+            ws_kwargs=self.ws_kwargs,
+            refresh_stations=self.sync_weighing_stations,
+        )
+        # Preserve a terminal protocol/ownership rejection across control socket
+        # restarts. Only restarting this client enables publication again.
+        self._live_weight_stop_code = await publisher.run()
 
     async def run_active_ws_loop(self):
         # A cached ID may belong to settings saved before re-registration.

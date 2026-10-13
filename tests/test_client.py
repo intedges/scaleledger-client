@@ -70,6 +70,12 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             setattr(self.api, name, AsyncMock(side_effect=httpx2.ConnectError("offline")))
         self.connections = StubConnections()
+        self.publisher = Mock()
+
+        async def hold_telemetry():
+            await asyncio.Future()
+
+        self.publisher.run = AsyncMock(side_effect=hold_telemetry)
         patches = (
             patch("main.APIClient", return_value=self.api),
             patch("main.WeighingStationManager", return_value=self.manager),
@@ -78,6 +84,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch("main.get_hostname", return_value="test-gateway"),
             patch("main.get_logger", return_value=Mock()),
             patch("main.websockets.connect", return_value=self.connections),
+            patch("main.LiveWeightPublisher", return_value=self.publisher),
         )
         for patcher in patches:
             patcher.start()

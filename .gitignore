@@ -44,7 +44,7 @@ htmlcov/
 .hypothesis/
 
 # Local work artifacts
-/.ai/
+/.ai
 
 # OS metadata
 .DS_Store

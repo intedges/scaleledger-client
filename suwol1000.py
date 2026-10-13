@@ -2,12 +2,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 import dataclasses
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
 import logging
 from typing import ClassVar, Literal, Self
 
 import threading
+import time
 
 import serial
 import structlog
@@ -326,6 +328,19 @@ class WorkerState(Enum):
     RECOVER = auto()
 
 
+@dataclass(frozen=True)
+class LiveWeightSnapshot:
+    weight: Decimal | None = None
+    unit: str = "kg"
+    weight_status: WeightStatus = WeightStatus.NONE
+    weight_type: WeightType = WeightType.NONE
+    sampled_at: datetime | None = None
+    sampled_monotonic: float | None = None
+    sample_seq: int = 0
+    connection_status: str = "waiting"
+    sample_valid: bool = False
+
+
 class WeighingStationWorker:
     def __init__(
         self,
@@ -335,6 +350,8 @@ class WeighingStationWorker:
         receipt_builder: Callable[[WeighingCompletedEvent], bytes | None] | None = None,
         polling_interval: float = 0.1,
         retry_interval: float = 1.0,
+        initial_sample_seq: int = 0,
+        on_live_weight: Callable[[LiveWeightSnapshot], None] | None = None,
     ):
         self.client = serial_client
         self.on_event = on_event or print
@@ -342,21 +359,56 @@ class WeighingStationWorker:
         self.receipt_builder = receipt_builder
         self.polling_interval = polling_interval
         self.retry_interval = retry_interval
+        self.on_live_weight = on_live_weight
 
         self.state = WorkerState.INITIALIZE
         self.last_weight = Decimal("0")
         self.last_plate = ""
         self.last_event: BaseEvent | None = None
         self.stop_event = threading.Event()
+        self._snapshot_lock = threading.Lock()
+        self._live_weight = LiveWeightSnapshot()
+        self._sample_seq = initial_sample_seq
 
         self.logger = get_logger().bind(port=serial_client.port)
         # A powered-off scale fails about once a second; summarize the repeats.
         self.failures = RepeatedFailureLog(self.logger, "hw.station")
+        self.live_weight_failures = RepeatedFailureLog(self.logger, "hw.station.live_weight")
 
     def stop(self):
         self.logger.info("sys.worker.stop_requested")
         self.stop_event.set()
+        self._set_connection_status("disconnected")
         self.client.interrupt()
+
+    def get_live_weight(self) -> LiveWeightSnapshot:
+        # Keep weight, device status and sample time from the same serial response.
+        with self._snapshot_lock:
+            return self._live_weight
+
+    def _set_connection_status(self, status: str):
+        with self._snapshot_lock:
+            if self.stop_event.is_set():
+                status = "disconnected"
+            if self._live_weight.connection_status == status and not self._live_weight.sample_valid:
+                return
+            self._live_weight = dataclasses.replace(
+                self._live_weight, connection_status=status, sample_valid=False,
+            )
+            self._notify_live_weight()
+
+    def _notify_live_weight(self):
+        # Called under _snapshot_lock so stop cannot publish before an older sample.
+        # The callback must only enqueue/update state; it must not wait for I/O or
+        # re-enter this worker. The separate sender performs all network work.
+        if self.on_live_weight is None:
+            return
+        try:
+            self.on_live_weight(self._live_weight)
+        except Exception as exc:
+            self.live_weight_failures.failure("hw.station.live_weight.callback_failed", exc)
+        else:
+            self.live_weight_failures.success()
 
     def run(self):
         self.logger.info("sys.worker.started")
@@ -398,12 +450,14 @@ class WeighingStationWorker:
                 self.state = WorkerState.RECOVER
 
         self.client.disconnect()
+        self._set_connection_status("disconnected")
         self.logger.info("sys.worker.terminated")
 
     def record_failure(self, event: str, exc: Exception):
         # stop() cancels a pending read or write; that is not a device failure.
         if self.stop_event.is_set():
             return
+        self._set_connection_status("disconnected" if isinstance(exc, serial.SerialException) else "error")
         if self.state in (WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.PRINT):
             # An interrupted weighing must stay traceable to its card and receipt.
             context = {"rfid_card_uid": self.last_plate}
@@ -414,9 +468,52 @@ class WeighingStationWorker:
             self.failures.failure(event, exc)
 
     def exchange(self, request: RequestPacket) -> ResponsePacket:
-        response = self.client.send_and_receive(request)
+        try:
+            response = self.client.send_and_receive(request)
+        except Exception as exc:
+            # Voice polling handles parse errors locally, so capture failures here too.
+            if not self.stop_event.is_set():
+                self._set_connection_status("disconnected" if isinstance(exc, serial.SerialException) else "error")
+            raise
+        with self._snapshot_lock:
+            if not self.stop_event.is_set():
+                if self._valid_live_response(response):
+                    self._sample_seq += 1
+                    self._live_weight = LiveWeightSnapshot(
+                        weight=response.weight_value,
+                        unit=response.weight_unit,
+                        weight_status=response.weight_status,
+                        weight_type=response.weight_type,
+                        sampled_at=datetime.now(UTC),
+                        sampled_monotonic=time.monotonic(),
+                        sample_seq=self._sample_seq,
+                        connection_status="connected",
+                        sample_valid=True,
+                    )
+                    self._notify_live_weight()
+                elif self._live_weight.connection_status != "error":
+                    # Leave the business parser contract intact; invalid numbers aren't live samples.
+                    self._live_weight = dataclasses.replace(
+                        self._live_weight, connection_status="error", sample_valid=False,
+                    )
+                    self._notify_live_weight()
         self.failures.success()
         return response
+
+    @staticmethod
+    def _valid_live_response(response: ResponsePacket) -> bool:
+        # Keep the business parser unchanged while obeying the live API bounds.
+        # Check the exponent before formatting so malformed tiny values cannot
+        # allocate arbitrarily long fixed-point strings.
+        weight = response.weight_value
+        return (
+            weight.is_finite()
+            and weight.copy_abs() <= Decimal("1000000000")
+            and weight.as_tuple().exponent >= -30
+            and len(format(weight, "f")) <= 32
+            and bool(response.weight_unit.strip())
+            and len(response.weight_unit) <= 8
+        )
     
     def poll_until_voice_ends(self, base_request: DisplayRequestPacket) -> ResponsePacket | None:
         response = None
@@ -452,6 +549,7 @@ class WeighingStationWorker:
     def connect(self) -> WorkerState:
         self.logger.debug("hw.serial.connecting")
         self.client.connect()
+        self._set_connection_status("connected")
         # Reconnects repeat with every retry while failing; the failure summary covers them.
         log = self.logger.debug if self.failures.failing else self.logger.info
         log("hw.serial.connected", next_state="IDLE")
