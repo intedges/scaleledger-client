@@ -21,11 +21,15 @@ ENV/
 .envrc
 .pypirc
 
+# Site configuration (copied from config.example.toml)
+/config.toml
+
 # Local SQLite state, journals, and backups
 /data/
 /db.sqlite3*
 
 # Logs, test results, and tool caches
+/logs/
 *.log
 .cache/
 .pytest_cache/

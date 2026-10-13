@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import dataclasses
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
+import logging
 from typing import ClassVar, Literal, Self
 
 import threading
@@ -13,6 +14,7 @@ import structlog
 from structlog.stdlib import get_logger
 
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
+from logconfig import RepeatedFailureLog
 
 
 STX = 2
@@ -348,6 +350,8 @@ class WeighingStationWorker:
         self.stop_event = threading.Event()
 
         self.logger = get_logger().bind(port=serial_client.port)
+        # A powered-off scale fails about once a second; summarize the repeats.
+        self.failures = RepeatedFailureLog(self.logger, "hw.station")
 
     def stop(self):
         self.logger.info("sys.worker.stop_requested")
@@ -376,25 +380,43 @@ class WeighingStationWorker:
                     case WorkerState.RECOVER:
                         self.state = self.recover()
             
-            except ValueError:
-                self.logger.exception("hw.protocol.parse_error")
+            except ValueError as e:
+                self.record_failure("hw.protocol.parse_error", e)
                 self.stop_event.wait(self.polling_interval)
                 self.state = WorkerState.IDLE
 
-            except serial.SerialTimeoutException:
-                self.logger.exception("hw.serial.timeout")
+            except serial.SerialTimeoutException as e:
+                self.record_failure("hw.serial.timeout", e)
                 self.state = WorkerState.RECOVER
 
-            except serial.SerialException:
-                self.logger.exception("hw.serial.connection_lost")
+            except serial.SerialException as e:
+                self.record_failure("hw.serial.connection_lost", e)
                 self.state = WorkerState.RECOVER
 
-            except Exception:
-                self.logger.exception("sys.worker.unexpected_error")
+            except Exception as e:
+                self.record_failure("sys.worker.unexpected_error", e)
                 self.state = WorkerState.RECOVER
 
         self.client.disconnect()
         self.logger.info("sys.worker.terminated")
+
+    def record_failure(self, event: str, exc: Exception):
+        # stop() cancels a pending read or write; that is not a device failure.
+        if self.stop_event.is_set():
+            return
+        if self.state in (WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.PRINT):
+            # An interrupted weighing must stay traceable to its card and receipt.
+            context = {"rfid_card_uid": self.last_plate}
+            if isinstance(self.last_event, WeighingCompletedEvent):
+                context["event_id"] = self.last_event.uuid
+            self.failures.failure(event, exc, always_log=True, **context)
+        else:
+            self.failures.failure(event, exc)
+
+    def exchange(self, request: RequestPacket) -> ResponsePacket:
+        response = self.client.send_and_receive(request)
+        self.failures.success()
+        return response
     
     def poll_until_voice_ends(self, base_request: DisplayRequestPacket) -> ResponsePacket | None:
         response = None
@@ -411,12 +433,15 @@ class WeighingStationWorker:
                 voice_code=VoiceCode.NONE if voice_sent else base_request.voice_code,
             )
             try:
-                response = self.client.send_and_receive(request)
+                response = self.exchange(request)
                 self.last_weight = response.weight_value
                 is_speaker_busy = response.voice_code != VoiceCode.NONE
                 voice_sent |= response.voice_code == base_request.voice_code
-            except ValueError:
-                self.logger.warning("hw.protocol.parse_error", action="ignore_and_continue")
+            except ValueError as e:
+                if not self.stop_event.is_set():
+                    self.failures.failure(
+                        "hw.protocol.parse_error", e, level=logging.WARNING, action="ignore_and_continue",
+                    )
             self.stop_event.wait(self.polling_interval)
         return response
 
@@ -427,12 +452,14 @@ class WeighingStationWorker:
     def connect(self) -> WorkerState:
         self.logger.debug("hw.serial.connecting")
         self.client.connect()
-        self.logger.info("hw.serial.connected", next_state="IDLE")
+        # Reconnects repeat with every retry while failing; the failure summary covers them.
+        log = self.logger.debug if self.failures.failing else self.logger.info
+        log("hw.serial.connected", next_state="IDLE")
         return WorkerState.IDLE
 
     def idle(self) -> WorkerState:
         request = DisplayRequestPacket(display_weight=self.last_weight)
-        response = self.client.send_and_receive(request)
+        response = self.exchange(request)
         self.last_weight = response.weight_value
 
         if response.rfid_card_uid != "00000000":
@@ -502,7 +529,7 @@ class WeighingStationWorker:
         if receipt_bytes:
             self.logger.info("hw.printer.command.sending", payload_length = len(receipt_bytes))
             request = PrinterRequestPacket(document_bytes=receipt_bytes)
-            response = self.client.send_and_receive(request)
+            response = self.exchange(request)
             self.last_weight = response.weight_value
 
 
@@ -519,7 +546,7 @@ class WeighingStationWorker:
         return WorkerState.IDLE
 
     def recover(self) -> WorkerState:
-        self.logger.info("sys.worker.recovery_scheduled", retry_in=self.retry_interval, next_state="CONNECT")
+        self.logger.debug("sys.worker.recovery_scheduled", retry_in=self.retry_interval, next_state="CONNECT")
         self.client.disconnect()
 
         self.stop_event.wait(self.retry_interval)

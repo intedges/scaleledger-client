@@ -65,8 +65,8 @@ class RecordUploadWorker:
                         self.logger.warning("net.api.record_upload.unhandlected_status", status=status_code)
                         await self._wait_before_retry(record_uuid)
 
-            except httpx2.RequestError:
-                self.logger.warning("net.api.record_upload.network_offline")
+            except httpx2.RequestError as e:
+                self.logger.warning("net.api.record_upload.network_offline", error=repr(e))
                 await self._wait_before_retry(record_uuid)
 
             finally:
@@ -101,7 +101,7 @@ class HeartbeatWorker:
                     raise AuthDegradedError("Token expired during heartbeat")
                 self.logger.error("net.api.heartbeat.server_error", status=e.response.status_code)
 
-            except httpx2.RequestError:
-                self.logger.warning("net.api.heartbeat.network_error")
+            except httpx2.RequestError as e:
+                self.logger.warning("net.api.heartbeat.network_error", error=repr(e))
 
             await asyncio.sleep(self.interval)

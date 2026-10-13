@@ -1,10 +1,11 @@
 import asyncio
-from contextlib import suppress
+from contextlib import chdir, suppress
 from datetime import UTC, datetime
 import json
-from types import SimpleNamespace
+from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 import uuid
 
 import httpx2
@@ -62,7 +63,6 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.manager = Mock()
         self.manager.sync.side_effect = lambda stations: self.started.set() if stations else None
         self.api = Mock(spec=APIClient)
-        self.api.client = SimpleNamespace(base_url="http://127.0.0.1:8000")
         self.api.close = AsyncMock()
         for name in (
             "retrieve_gateway_self", "list_gateway_stations", "send_heartbeat",
@@ -77,7 +77,6 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch("main.get_ip_address", return_value="127.0.0.1"),
             patch("main.get_hostname", return_value="test-gateway"),
             patch("main.get_logger", return_value=Mock()),
-            patch("main.setup_logging"),
             patch("main.websockets.connect", return_value=self.connections),
         )
         for patcher in patches:
@@ -532,6 +531,68 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.sync.call_args.args[0][0].serial_port, "updated-port")
         self.manager.stop_all.assert_not_called()
 
+    async def test_without_server_url_stations_and_local_storage_keep_running(self):
+        await self.cached_setup()
+        with patch("main.APIClient") as api_client, patch("main.websockets.connect") as connect:
+            client = HeadlessClient(base_url=None)
+            client.setup = AsyncMock()
+            self.start(client.run())
+            await self.wait_for(self.started.wait())
+            event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=41)
+            client.handle_hardware_event(event)
+            await asyncio.sleep(0)
+            await self.wait_for(client.event_queue.join())
+
+        self.assertEqual((await Record.get(uuid=event.uuid)).weight, 41)
+        self.assertEqual(client.market_cache.get_rfid_info("12345678").producer_name, "Cached producer")
+        api_client.assert_not_called()
+        connect.assert_not_called()
+
+    async def test_repeated_server_failures_are_logged_once_until_resynchronized(self):
+        await self.cached_setup()
+        logger = self.client.logger
+        retried = asyncio.Event()
+
+        async def offline(token):
+            if self.api.retrieve_gateway_self.await_count == 20:
+                retried.set()
+            raise httpx2.ConnectError("offline")
+
+        self.api.retrieve_gateway_self.side_effect = offline
+        connected = StubWebSocket(hold=asyncio.Event())
+        self.connections.sockets = [connected]
+        self.start(self.client.run())
+        await self.wait_for(retried.wait())
+
+        self.assertEqual([c.args[1] for c in logger.log.call_args_list], ["sys.boot.network.offline"])
+        self.assertEqual(
+            [c for c in logger.info.call_args_list if c.args[0] == "sys.boot.remote_api.syncing"],
+            [call("sys.boot.remote_api.syncing")],
+        )
+
+        self.online_responses()
+        await self.wait_for(connected.listening.wait())
+        recovered = [c for c in logger.info.call_args_list if c.args[0] == "net.server.recovered"]
+        self.assertEqual(len(recovered), 1)
+        self.assertGreaterEqual(recovered[0].kwargs["total_failures"], 20)
+        self.assertFalse(self.client.network_failures.failing)
+
+    async def test_repeated_network_task_failures_are_summarized(self):
+        attempts = asyncio.Event()
+
+        async def rejected_registration():
+            if self.client.run_provisioning_loop.await_count == 20:
+                attempts.set()
+            raise RuntimeError("provisioning socket rejected")
+
+        self.client.run_provisioning_loop = AsyncMock(side_effect=rejected_registration)
+        self.start(self.client.run())
+        await self.wait_for(attempts.wait())
+
+        failures = [c for c in self.client.logger.log.call_args_list if c.args[1] == "net.worker.failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0].kwargs["exc_info"].exceptions[0], RuntimeError)
+
     async def test_first_install_waits_for_registration_without_starting_stations(self):
         provisioning = asyncio.Event()
 
@@ -548,6 +609,36 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(call.args[0] for call in self.manager.sync.call_args_list))
         self.api.send_heartbeat.assert_not_awaited()
         self.api.list_gateway_stations.assert_not_awaited()
+
+
+class DatabaseLocationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_database_file_is_created_at_the_configured_path_and_reused(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # The configured path decides the location, not the working directory.
+        self.enterContext(chdir(self.enterContext(tempfile.TemporaryDirectory())))
+        db_path = root / "data" / "db.sqlite3"
+        record_uuid = uuid.uuid4()
+
+        client = HeadlessClient(base_url="http://127.0.0.1:8000", db_path=db_path)
+        client.logger = Mock()
+        try:
+            await client.setup()
+            await Record.create(
+                uuid=record_uuid, rfid_card_uid="12345678", weight=31,
+                measured_at=datetime(2026, 10, 11, tzinfo=UTC),
+            )
+        finally:
+            await client.close()
+        self.assertTrue(db_path.is_file())
+        self.assertFalse(list(Path.cwd().iterdir()))
+
+        restarted = HeadlessClient(base_url="http://127.0.0.1:8000", db_path=db_path)
+        restarted.logger = Mock()
+        try:
+            await restarted.setup()
+            self.assertEqual((await Record.get(uuid=record_uuid)).weight, 31)
+        finally:
+            await restarted.close()
 
 
 if __name__ == "__main__":
