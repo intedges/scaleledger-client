@@ -17,9 +17,21 @@ class AppPaths:
     root: Path
 
     @property
+    def config_file(self) -> Path:
+        return self.root / "config.toml"
+
+    @property
     def data_dir(self) -> Path:
         return self.root / "data"
 
     @property
     def db_file(self) -> Path:
         return self.data_dir / "db.sqlite3"
+
+    @property
+    def lock_file(self) -> Path:
+        return self.data_dir / "client.lock"
+
+    @property
+    def log_dir(self) -> Path:
+        return self.root / "logs"

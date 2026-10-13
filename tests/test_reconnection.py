@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import websockets
 from websockets.protocol import State
 
+from logconfig import RepeatedFailureLog
 from main import HeadlessClient
 
 
@@ -23,8 +24,9 @@ class WebSocketReconnectionTests(unittest.IsolatedAsyncioTestCase):
         client.access_token = "test-token"
         client.mac_address = "00:11:22:33:44:55"
         client.hostname = "test-gateway"
-        client.ip_address = "127.0.0.1"
+        client.server_host = "127.0.0.1"
         client.logger = Mock()
+        client.network_failures = RepeatedFailureLog(client.logger, "net.server", settle_time=0)
         client.bootstrap = AsyncMock(return_value=True)
         client.sync_market_data = AsyncMock(return_value=True)
         client.refresh_market_cache = AsyncMock()

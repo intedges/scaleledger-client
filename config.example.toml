@@ -1,0 +1,20 @@
+# ScaleLedger Client 설정
+#
+# 이 파일을 같은 폴더에 config.toml 이름으로 복사한 뒤 현장에 맞게 고칩니다.
+# UTF-8로 저장하고, 고친 뒤에는 프로그램을 다시 시작합니다.
+# 계량 기록(data 폴더)과 로그(logs 폴더)는 프로그램 폴더 아래에 만들어집니다.
+
+# ScaleLedger 관리 프로그램 주소
+# - 같은 PC에서 실행하면: http://127.0.0.1:8000
+#   (localhost는 Windows에서 IPv6 주소를 먼저 시도하므로 쓰지 않습니다.)
+# - 인트라넷의 다른 PC면 그 PC의 주소: 예) http://192.168.0.10:8000
+server_url = "http://127.0.0.1:8000"
+
+# 생략한 항목은 아래 기본값을 사용합니다.
+[logging]
+# DEBUG, INFO, WARNING, ERROR, CRITICAL 중 하나. 일반 운영에는 INFO를 사용합니다.
+level = "INFO"
+# 파일 하나의 최대 크기(바이트)와 보관할 이전 파일 수. 둘 다 1 이상의 정수입니다.
+# 기본값은 현재 파일을 포함해 약 110MiB를 보관합니다.
+max_bytes = 10485760
+backup_count = 10
