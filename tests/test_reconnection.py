@@ -28,9 +28,7 @@ class WebSocketReconnectionTests(unittest.IsolatedAsyncioTestCase):
         client.logger = Mock()
         client.network_failures = RepeatedFailureLog(client.logger, "net.server", settle_time=0)
         client.bootstrap = AsyncMock(return_value=True)
-        client.sync_market_data = AsyncMock(return_value=True)
-        client.refresh_market_cache = AsyncMock()
-        client.sync_weighing_stations = AsyncMock(return_value=True)
+        client.request_settings_sync = Mock()
         return client
 
     async def test_active_socket_reconnects_after_normal_and_abnormal_closes(self):
@@ -51,20 +49,18 @@ class WebSocketReconnectionTests(unittest.IsolatedAsyncioTestCase):
                     port = server.sockets[0].getsockname()[1]
                     client = self.make_client(f"ws://127.0.0.1:{port}")
 
-                    async def sync_stations():
-                        # Each connection performs initial sync, then receives a command.
-                        if client.sync_weighing_stations.await_count == 4:
+                    def request_sync():
+                        # Startup and each connection request a snapshot, then receive a command.
+                        if client.request_settings_sync.call_count == 5:
                             command_received_again.set()
-                        return True
 
-                    client.sync_weighing_stations.side_effect = sync_stations
+                    client.request_settings_sync.side_effect = request_sync
                     task = asyncio.create_task(client.run_active_ws_loop())
                     try:
                         await asyncio.wait_for(command_received_again.wait(), timeout=2)
                         self.assertEqual(connections, ["/ws/devices/gateways/1/"] * 2)
-                        self.assertEqual(client.bootstrap.await_count, 2)
-                        self.assertEqual(client.sync_market_data.await_count, 2)
-                        self.assertEqual(client.refresh_market_cache.await_count, 2)
+                        client.bootstrap.assert_not_awaited()
+                        self.assertEqual(client.request_settings_sync.call_count, 5)
                     finally:
                         task.cancel()
                         with suppress(asyncio.CancelledError):

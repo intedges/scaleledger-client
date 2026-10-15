@@ -11,7 +11,6 @@ from urllib.parse import urlsplit
 import httpx2
 from structlog.stdlib import get_logger
 from tortoise import Tortoise
-from tortoise.transactions import in_transaction
 from websockets.exceptions import ConnectionClosed
 import websockets
 
@@ -22,7 +21,8 @@ from paths import AppPaths, program_dir
 from events import BaseEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
-from models import Gateway, Record, WeighingStation, Species, Producer, RFIDCard
+from models import Gateway, Record, WeighingStation, RFIDCard
+from settings_sync import SettingsSnapshot
 from telemetry import LatestWeightBuffer, LiveWeightPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, get_mac_address, scan_peripherals
 from workers import HeartbeatWorker, RecordUploadWorker
@@ -60,7 +60,9 @@ class HeadlessClient:
         self.gateway_id: int | None = None
         self._gateway_data: dict | None = None
         self._station_config_ready = asyncio.Event()
-        self._station_sync_lock = asyncio.Lock()
+        self._settings_sync_requested = asyncio.Event()
+        self._settings_sync_pending: asyncio.Future[bool] | None = None
+        self.settings_sync_timeout = 60
         self._live_weight_stop_code: int | None = None
 
         self.market_cache = MarketDataCache()
@@ -172,6 +174,11 @@ class HeadlessClient:
         self.log_step("sys.boot.remote_api.syncing")
         try:
             retrieved_gateway = await self.api_client.retrieve_gateway_self(self.access_token)
+            # Resolve the authenticated route without publishing partial settings.
+            SettingsSnapshot.from_responses(
+                retrieved_gateway, [], [], [], [],
+                mac_address=self.mac_address, access_token=self.access_token,
+            )
             # Validated credentials must survive a later settings sync failure.
             # Keep the cached Gateway ID and Stations until a complete snapshot arrives.
             saved = await Gateway.filter(mac_address=self.mac_address).update(
@@ -194,7 +201,6 @@ class HeadlessClient:
             # Deleting the previous Gateway earlier would discard offline settings.
             self._gateway_data = retrieved_gateway
             self.gateway_id = retrieved_gateway["id"]
-            self.market_cache.gateway_name = retrieved_gateway["name"]
             self.logger.info("sys.boot.remote_api.success", gateway_id=self.gateway_id)
             return True
             
@@ -213,130 +219,97 @@ class HeadlessClient:
             )
         return False
     
+    def request_settings_sync(self) -> asyncio.Future[bool]:
+        # A request during a running fetch belongs to one subsequent snapshot.
+        if self._settings_sync_pending is None:
+            self._settings_sync_pending = asyncio.get_running_loop().create_future()
+            self._settings_sync_requested.set()
+        return self._settings_sync_pending
+
     async def sync_weighing_stations(self) -> bool:
-        # Control notifications and a rejected telemetry station can both request
-        # a refresh. Keep the DB snapshot and worker replacement in one order.
-        async with self._station_sync_lock:
-            return await self._sync_weighing_stations()
+        # Telemetry ownership refresh uses the same queue as control notifications.
+        return await asyncio.shield(self.request_settings_sync())
 
-    async def _sync_weighing_stations(self) -> bool:
-        self.log_step("sys.sync.weighing_stations.started")
+    async def run_settings_sync_worker(self):
+        current = None
         try:
-            retrieved_stations = await self.api_client.list_gateway_stations(self.access_token)
+            while True:
+                await self._settings_sync_requested.wait()
+                self._settings_sync_requested.clear()
+                current = self._settings_sync_pending
+                self._settings_sync_pending = None
+                success = await self.sync_settings()
+                if not current.done():
+                    current.set_result(success)
+                current = None
+                if success:
+                    self.network_failures.success()
+                else:
+                    # Retry only an unsuccessful request, never poll healthy settings.
+                    self.request_settings_sync()
+                    await asyncio.sleep(self.retry_interval)
+        finally:
+            for pending in (current, self._settings_sync_pending):
+                if pending is not None and not pending.done():
+                    pending.cancel()
+            self._settings_sync_pending = None
+            self._settings_sync_requested.clear()
 
-            async with in_transaction():
-                if self._gateway_data is not None:
-                    data = self._gateway_data
-                    await Gateway.filter(id__not=data["id"]).delete()
-                    await Gateway.update_or_create(
-                        id=data["id"],
-                        defaults={
-                            "mac_address": data["mac_address"],
-                            "hostname": data["hostname"],
-                            "ip_address": data["ip_address"],
-                            "name": data["name"],
-                            "description": data["description"],
-                            "access_token": data["access_token"],
-                            "last_heartbeat": data["last_heartbeat"],
-                            "created_at": data["created_at"],
-                            "updated_at": data["updated_at"],
-                        },
-                    )
-                station_ids = []
-                for station in retrieved_stations:
-                    station_ids.append(station["id"])
-                    await WeighingStation.update_or_create(
-                        id=station["id"],
-                        defaults={
-                            "gateway_id": station["gateway"],
-                            "name": station["name"],
-                            "description": station["description"],
-                            "serial_port": station["serial_port"],
-                            "serial_description": station["serial_description"],
-                            "serial_location": station["serial_location"],
-                            "serial_number": station["serial_number"],
-                            "serial_manufacturer": station["serial_manufacturer"],
-                        },
-                    )
-
-                deleted_count = await WeighingStation.filter(id__not_in=station_ids).delete()
-            
-            current_stations = await WeighingStation.all()
-            self.station_manager.sync(current_stations)
+    async def sync_settings(self) -> bool:
+        self.log_step("sys.sync.settings.started")
+        try:
+            # Keep network waits outside the SQLite transaction and bound the
+            # complete fetch, including a server that keeps streaming slowly.
+            async with asyncio.timeout(self.settings_sync_timeout):
+                gateway = await self.api_client.retrieve_gateway_self(self.access_token)
+                species = await self.api_client.fetch_species(self.access_token)
+                producers = await self.api_client.fetch_producers(self.access_token)
+                cards = await self.api_client.fetch_rfid_cards(self.access_token)
+                stations = await self.api_client.list_gateway_stations(self.access_token)
+            snapshot = SettingsSnapshot.from_responses(
+                gateway, stations, species, producers, cards,
+                mac_address=self.mac_address, access_token=self.access_token,
+            )
+            if snapshot.gateway_id != self.gateway_id:
+                raise ValueError("Gateway identity changed; registration must be resolved first")
+            await snapshot.persist()
+        except httpx2.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                raise AuthDegradedError("Settings sync auth failed") from exc
+            self.network_failures.failure(
+                "net.api.sync_settings.server_error", exc,
+                traceback=False, status=exc.response.status_code,
+            )
+        except (httpx2.RequestError, TimeoutError) as exc:
+            self.network_failures.failure(
+                "net.api.sync_settings.network_error", exc,
+                level=logging.WARNING, traceback=False,
+            )
+        except Exception as exc:
+            self.network_failures.failure("sys.sync.settings.failed", exc)
+        else:
+            self.market_cache.replace(snapshot.rfid_map, snapshot.gateway_name)
+            # join() can wait for serial I/O. Never block WS, heartbeat or writes.
+            # A cancelled to_thread continues running, so finish it before any
+            # replacement task or process cleanup touches the station manager.
+            applying = asyncio.create_task(asyncio.to_thread(self.station_manager.sync, snapshot.stations))
+            cancelled = None
+            while True:
+                try:
+                    await asyncio.shield(applying)
+                    break
+                except asyncio.CancelledError as exc:
+                    if applying.cancelled():
+                        raise
+                    cancelled = exc
+            if cancelled is not None:
+                raise cancelled
             self._station_config_ready.set()
-
             self.logger.info(
-                "sys.sync.weighing_stations.completed",
-                synced_count=len(retrieved_stations),
-                deleted_count=deleted_count,
+                "sys.sync.settings.completed", stations=len(snapshot.stations),
+                rfids=len(snapshot.rfid_map),
             )
             return True
-
-        except httpx2.HTTPStatusError as e:
-            if e.response.status_code in (401, 403):
-                self.logger.error("net.api.sync_stations.auth_rejected", status=e.response.status_code)
-                raise AuthDegradedError("Sync stations auth failed")
-            self.network_failures.failure(
-                "net.api.sync_stations.server_error", e, traceback=False, status=e.response.status_code,
-            )
-        except httpx2.RequestError as e:
-            self.network_failures.failure(
-                "net.api.sync_stations.network_error", e, level=logging.WARNING, traceback=False,
-            )
-        except Exception as e:
-            self.network_failures.failure("sys.sync.weighing_stations.fatal_error", e)
-        return False
-    
-    async def sync_market_data(self) -> bool:
-        self.log_step("sys.sync.market_data.started")
-        try:
-            species_data = await self.api_client.fetch_species(self.access_token)
-            producers_data = await self.api_client.fetch_producers(self.access_token)
-            rfid_cards_data = await self.api_client.fetch_rfid_cards(self.access_token)
-
-            async with in_transaction():
-                await RFIDCard.all().delete()
-                await Producer.all().delete()
-                await Species.all().delete()
-
-                await Species.bulk_create([Species(**s) for s in species_data])
-                await Producer.bulk_create([Producer(**p) for p in producers_data])
-                
-                rfid_cards = []
-                for data in rfid_cards_data:
-                    rfid_cards.append(RFIDCard(
-                        id=data["id"],
-                        uuid=data["uuid"],
-                        uid=data["uid"],
-                        producer_id=data["producer"],
-                        species_id=data["species"],
-                        is_active=data["is_active"],
-                        issued_at=data["issued_at"],
-                        last_used_at=data.get("last_used_at")
-                    ))
-                await RFIDCard.bulk_create(rfid_cards)
-
-            self.logger.info(
-                "sys.sync.market_data.completed", 
-                species=len(species_data), 
-                producers=len(producers_data), 
-                rfids=len(rfid_cards_data)
-            )
-            return True
-
-        except httpx2.HTTPStatusError as e:
-            if e.response.status_code in (401, 403):
-                self.logger.error("net.api.sync_market.auth_rejected", status=e.response.status_code)
-                raise AuthDegradedError("Sync market data auth failed")
-            self.network_failures.failure(
-                "net.api.sync_market.server_error", e, traceback=False, status=e.response.status_code,
-            )
-        except httpx2.RequestError as e:
-            self.network_failures.failure(
-                "net.api.sync_market.network_error", e, level=logging.WARNING, traceback=False,
-            )
-        except Exception as e:
-            self.network_failures.failure("sys.sync.market_data.fatal_error", e)
         return False
 
     async def refresh_market_cache(self):
@@ -353,11 +326,8 @@ class HeadlessClient:
                     species_name=card.species.name
                 )
             
-            self.market_cache.update_rfid_data(rfid_cache_data)
-
-            if self._gateway_data is None:
-                gateway = await Gateway.get(id=self.gateway_id)
-                self.market_cache.gateway_name = gateway.name
+            gateway = await Gateway.get(id=self.gateway_id)
+            self.market_cache.replace(rfid_cache_data, gateway.name)
 
             self.logger.info("sys.cache.refresh.completed", cached_rfid_count=len(rfid_cache_data))
             
@@ -464,6 +434,7 @@ class HeadlessClient:
             access_token=self.access_token,
         )
         async with asyncio.TaskGroup() as tg:
+            tg.create_task(self.run_settings_sync_worker())
             tg.create_task(self.run_active_ws_loop())
             tg.create_task(heartbeat_worker.run())
             tg.create_task(upload_worker.run())
@@ -493,21 +464,19 @@ class HeadlessClient:
                 break
             await asyncio.sleep(self.retry_interval)
 
+        # REST can be reachable even when the control socket is unavailable.
+        self.request_settings_sync()
         target_ws_url = f"{self.ws_url}/ws/devices/gateways/{self.gateway_id}/"
         self.log_step("net.ws.active.connecting", url=target_ws_url)
 
         async for ws in websockets.connect(target_ws_url, **self.ws_kwargs):
             self.log_step("net.ws.active.connected")
             try:
-                if await self.bootstrap() and await self.sync_market_data():
-                    await self.refresh_market_cache()
-                    if await self.sync_weighing_stations():
-                        # Fully synchronized: the server failures, if any, have ended.
-                        self.network_failures.success()
-                        await self.listen_active_ws(ws)
+                self.request_settings_sync()
+                await self.listen_active_ws(ws)
             except ConnectionClosed:
                 self.logger.warning("net.ws.active.disconnected")
-            # Also reconnect on normal closes and retry an incomplete sync.
+            # Reconnect on normal closes as well; settings retries stay independent.
             await asyncio.sleep(self.retry_interval)
     
     async def listen_active_ws(self, ws):
@@ -519,17 +488,16 @@ class HeadlessClient:
                 match message_type:
                     case "scan.peripherals":
                         self.logger.info("biz.active.scan_peripherals.executing")
-                        peripherals = scan_peripherals()
+                        peripherals = await asyncio.to_thread(scan_peripherals)
                         await ws.send(json.dumps({
                             "type": "peripherals.scanned",
                             "payload": peripherals,
                         }))
                         self.logger.info("biz.active.scan_peripherals.completed", count=len(peripherals))
 
-                    case "sync.weighing_stations":
-                        self.logger.info("biz.active.sync_stations.executing")
-                        if not await self.sync_weighing_stations():
-                            return
+                    case "sync.market_data" | "sync.gateway" | "sync.weighing_stations":
+                        self.logger.info("biz.active.settings_sync.requested", type=message_type)
+                        self.request_settings_sync()
 
                     case _:
                         self.logger.debug("net.ws.message.ignored", type=message_type)

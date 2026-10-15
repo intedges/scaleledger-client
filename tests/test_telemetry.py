@@ -765,29 +765,47 @@ class PublisherStartupTests(unittest.IsolatedAsyncioTestCase):
             publisher.run.assert_awaited_once()
         self.assertEqual(client._live_weight_stop_code, 4409)
 
-    async def test_control_and_ownership_refresh_serialize_station_sync(self):
+    async def test_control_and_ownership_refresh_share_serialized_snapshots(self):
         client = self.client()
         del client.sync_weighing_stations
-        client._station_sync_lock = asyncio.Lock()
+        client._settings_sync_requested = asyncio.Event()
+        client._settings_sync_pending = None
+        client.network_failures = Mock()
+        client.retry_interval = 0.001
         entered = asyncio.Queue()
-        release = asyncio.Event()
+        release = asyncio.Queue()
 
         async def synchronize():
             entered.put_nowait(None)
-            await release.wait()
+            await release.get()
             return True
 
-        client._sync_weighing_stations = AsyncMock(side_effect=synchronize)
+        client.sync_settings = AsyncMock(side_effect=synchronize)
         first = asyncio.create_task(client.sync_weighing_stations())
-        second = asyncio.create_task(client.sync_weighing_stations())
+        first_control = client.request_settings_sync()
+        await asyncio.sleep(0)
+        worker = asyncio.create_task(client.run_settings_sync_worker())
+        second = None
         try:
             await asyncio.wait_for(entered.get(), 1)
+            second = asyncio.create_task(client.sync_weighing_stations())
+            second_control = client.request_settings_sync()
             await asyncio.sleep(0)
             self.assertTrue(entered.empty())
-            self.assertEqual(client._sync_weighing_stations.await_count, 1)
-            release.set()
-            self.assertEqual(await asyncio.gather(first, second), [True, True])
-            self.assertEqual(client._sync_weighing_stations.await_count, 2)
+            self.assertEqual(client.sync_settings.await_count, 1)
+            self.assertFalse(first.done())
+            self.assertFalse(second.done())
+            release.put_nowait(None)
+            self.assertEqual(await asyncio.wait_for(asyncio.gather(first, first_control), 1), [True, True])
+            await asyncio.wait_for(entered.get(), 1)
+            self.assertFalse(second.done())
+            self.assertFalse(second_control.done())
+            release.put_nowait(None)
+            self.assertEqual(await asyncio.wait_for(asyncio.gather(second, second_control), 1), [True, True])
+            self.assertEqual(client.sync_settings.await_count, 2)
         finally:
-            release.set()
-            await asyncio.gather(first, second, return_exceptions=True)
+            worker.cancel()
+            first.cancel()
+            if second is not None:
+                second.cancel()
+            await asyncio.gather(worker, first, *([second] if second is not None else []), return_exceptions=True)

@@ -75,13 +75,14 @@ class WeighingStationManager:
             return info.is_active
 
         def build_receipt(event: WeighingCompletedEvent) -> bytes | None:
-            info = self.market_cache.get_rfid_info(event.rfid_card_uid)
+            snapshot = self.market_cache.snapshot
+            info = snapshot.get_rfid_info(event.rfid_card_uid)
             if not info:
                 return None
                 
             receipt = Receipt(
                 record_uuid=event.uuid,
-                gateway_name=self.market_cache.gateway_name,
+                gateway_name=snapshot.gateway_name,
                 station_name=runtime.station_name,
                 rfid_card_uid=event.rfid_card_uid,
                 producer_name=info.producer_name,
