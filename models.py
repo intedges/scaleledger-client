@@ -79,7 +79,6 @@ class RFIDCard(Model):
     species = fields.ForeignKeyField("models.Species", related_name="rfid_cards")
     is_active = fields.BooleanField(default=True)
     issued_at = fields.DatetimeField()
-    last_used_at = fields.DatetimeField(null=True)
 
     class Meta:
         table = "rfid_card"

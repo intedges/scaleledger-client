@@ -60,8 +60,12 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.tasks = []
         self.now = datetime(2026, 10, 10, tzinfo=UTC)
         self.started = asyncio.Event()
+        self.settings_synced = asyncio.Event()
         self.manager = Mock()
-        self.manager.sync.side_effect = lambda stations: self.started.set() if stations else None
+        loop = asyncio.get_running_loop()
+        self.manager.sync.side_effect = (
+            lambda stations: loop.call_soon_threadsafe(self.started.set) if stations else None
+        )
         self.api = Mock(spec=APIClient)
         self.api.close = AsyncMock()
         for name in (
@@ -90,6 +94,10 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.client = HeadlessClient(base_url="http://127.0.0.1:8000")
+        self.client.logger.info.side_effect = (
+            lambda event, **kwargs: self.settings_synced.set()
+            if event == "sys.sync.settings.completed" else None
+        )
         self.client.setup = AsyncMock()
         self.client.retry_interval = 0.001
 
@@ -152,7 +160,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "fetch_rfid_cards": [{
                 "id": 1, "uuid": str(self.card.uuid), "uid": "12345678",
                 "producer": 1, "species": 1, "is_active": True,
-                "issued_at": self.now.isoformat(), "last_used_at": None,
+                "issued_at": self.now.isoformat(),
             }],
             "send_heartbeat": {},
             "create_record": {},
@@ -274,12 +282,13 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.api.retrieve_gateway_self.side_effect = unavailable_gateway
         self.start(self.client.run())
         await self.wait_for(sync_attempted.wait())
-        self.assertFalse(failed_sync.listening.is_set())
+        self.assertTrue(failed_sync.listening.is_set())
         self.assertEqual(self.client.market_cache.gateway_name, "Cached gateway")
 
         self.online_responses()
         self.connections.resume.set()
         await self.wait_for(connected.listening.wait())
+        await self.wait_for(self.settings_synced.wait())
 
         self.assertEqual(self.client.market_cache.gateway_name, "Server gateway")
         info = self.client.market_cache.get_rfid_info("12345678")
@@ -368,7 +377,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.client.access_token = "cached-token"
         self.client.gateway_id = 1
 
-        await self.client.sync_weighing_stations()
+        self.assertFalse(await self.client.sync_settings())
 
         station = await WeighingStation.get(id=1)
         self.assertEqual(station.name, "Cached station")
@@ -387,7 +396,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await self.client.bootstrap())
         self.api.list_gateway_stations.side_effect = httpx2.ConnectError("offline")
-        self.assertFalse(await self.client.sync_weighing_stations())
+        self.assertFalse(await self.client.sync_settings())
 
         restarted = HeadlessClient(base_url="http://127.0.0.1:8000")
         await restarted.restore_local_state()
@@ -419,7 +428,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         }))
 
         self.assertTrue(await self.client.bootstrap())
-        self.assertFalse(await self.client.sync_weighing_stations())
+        self.assertFalse(await self.client.sync_settings())
 
         restarted = HeadlessClient(base_url="http://127.0.0.1:8000")
         await restarted.restore_local_state()
@@ -441,7 +450,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         }))
         self.assertTrue(await self.client.bootstrap())
         self.api.list_gateway_stations.side_effect = httpx2.ConnectError("offline")
-        self.assertFalse(await self.client.sync_weighing_stations())
+        self.assertFalse(await self.client.sync_settings())
 
         restarted = HeadlessClient(base_url="http://127.0.0.1:8000")
         restarted.retry_interval = 0.001
@@ -465,6 +474,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.api.retrieve_gateway_self.side_effect = None
             self.api.list_gateway_stations.side_effect = None
             await self.wait_for(connected.listening.wait())
+            await self.wait_for(self.settings_synced.wait())
             connect.assert_called_once_with("ws://127.0.0.1:8000/ws/devices/gateways/2/")
 
         restarted.run_provisioning_loop.assert_not_awaited()
@@ -490,14 +500,14 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await Gateway.all().values_list("id", flat=True), [1])
 
         self.api.list_gateway_stations.side_effect = httpx2.ConnectError("offline")
-        self.assertFalse(await self.client.sync_weighing_stations())
+        self.assertFalse(await self.client.sync_settings())
         self.assertEqual(await Gateway.all().values_list("id", flat=True), [1])
         self.assertEqual((await WeighingStation.get(id=1)).serial_port, "mock-port")
         self.manager.sync.assert_not_called()
 
         self.api.list_gateway_stations.side_effect = None
         self.api.list_gateway_stations.return_value = [replacement, {"id": 3, "gateway": 2}]
-        self.assertFalse(await self.client.sync_weighing_stations())
+        self.assertFalse(await self.client.sync_settings())
         self.assertEqual(await Gateway.all().values_list("id", flat=True), [1])
         self.assertEqual((await Gateway.get(id=1)).access_token, "new-token")
         self.assertEqual(await WeighingStation.all().values_list("id", flat=True), [1])
@@ -505,7 +515,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.manager.sync.assert_not_called()
 
         self.api.list_gateway_stations.return_value = [replacement]
-        self.assertTrue(await self.client.sync_weighing_stations())
+        self.assertTrue(await self.client.sync_settings())
         self.assertEqual(await Gateway.all().values_list("id", flat=True), [2])
         self.assertEqual((await Gateway.get(id=2)).access_token, "new-token")
         self.assertEqual(await WeighingStation.all().values_list("id", flat=True), [2])
@@ -513,7 +523,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((station.gateway_id, station.serial_port), (2, "replacement-port"))
         self.assertEqual(self.manager.sync.call_args.args[0][0].id, 2)
 
-    async def test_failed_station_notification_reconnects_and_applies_updated_configuration(self):
+    async def test_failed_station_notification_retries_on_same_socket_and_applies_configuration(self):
         await self.cached_setup()
         self.online_responses()
         current = self.api.list_gateway_stations.return_value
@@ -522,18 +532,23 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             current, httpx2.ConnectError("temporary outage"), updated,
         ]
         notifying = StubWebSocket(
+            hold=asyncio.Event(),
             messages=[json.dumps({"type": "sync.weighing_stations"})],
             after_messages=asyncio.Event(),
         )
         connected = StubWebSocket(hold=asyncio.Event())
         self.connections.sockets = [notifying, connected]
         self.start(self.client.run())
-        await self.wait_for(connected.listening.wait())
+        await self.wait_for(self.settings_synced.wait())
+        self.settings_synced.clear()
+        notifying.hold.set()
+        await self.wait_for(self.settings_synced.wait())
 
         station = await WeighingStation.get(id=1)
         self.assertEqual((station.name, station.serial_port), ("Updated station", "updated-port"))
-        self.assertEqual(self.connections.opened.qsize(), 2)
+        self.assertEqual(self.connections.opened.qsize(), 1)
         self.assertEqual(self.api.list_gateway_stations.await_count, 3)
+        self.assertFalse(connected.listening.is_set())
         self.assertFalse(notifying.after_messages.is_set())
         self.assertEqual(self.manager.sync.call_args.args[0][0].serial_port, "updated-port")
         self.manager.stop_all.assert_not_called()
@@ -579,6 +594,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.online_responses()
         await self.wait_for(connected.listening.wait())
+        await self.wait_for(self.settings_synced.wait())
         recovered = [c for c in logger.info.call_args_list if c.args[0] == "net.server.recovered"]
         self.assertEqual(len(recovered), 1)
         self.assertGreaterEqual(recovered[0].kwargs["total_failures"], 20)
