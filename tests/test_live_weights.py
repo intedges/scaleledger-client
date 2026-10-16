@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -82,6 +83,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         self.assertEqual(self.worker.get_live_weight().sample_seq, 3)
         completed = WeighingCompletedEvent(rfid_card_uid="12345678", weight=3)
         self.worker.last_event = completed
+        self.worker._saved_event_uuid = completed.uuid
         self.worker.print()
 
         sample = self.worker.get_live_weight()
@@ -227,7 +229,12 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         self.worker.on_live_weight = Mock(side_effect=RuntimeError("Callback failed"))
         self.worker.live_weight_failures.logger = Mock()
         events = []
-        self.worker.on_event = events.append
+
+        def submit(event):
+            events.append(event)
+            return Future()
+
+        self.worker.on_event = submit
         self.serial.send_and_receive.return_value = ResponsePacket(
             weight_value=Decimal("23"), rfid_card_uid="12345678",
         )

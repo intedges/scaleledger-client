@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from concurrent.futures import Future
 from contextlib import suppress
 import json
 import logging
@@ -11,6 +12,7 @@ from urllib.parse import urlsplit
 import httpx2
 from structlog.stdlib import get_logger
 from tortoise import Tortoise
+from tortoise.exceptions import IntegrityError
 from websockets.exceptions import ConnectionClosed
 import websockets
 
@@ -67,7 +69,7 @@ class HeadlessClient:
 
         self.market_cache = MarketDataCache()
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
-        self.event_queue: asyncio.Queue[BaseEvent] = asyncio.Queue()
+        self.event_queue: asyncio.Queue[tuple[BaseEvent, Future[None]]] = asyncio.Queue()
         self.live_weight_updates = LatestWeightBuffer()
         self.station_manager = WeighingStationManager(
             on_event=self.handle_hardware_event,
@@ -83,40 +85,55 @@ class HeadlessClient:
         log = self.logger.debug if self.network_failures.failing else self.logger.info
         log(event, **kw)
 
-    def handle_hardware_event(self, event: BaseEvent):
-        self.main_loop.call_soon_threadsafe(self.event_queue.put_nowait, event)
+    def handle_hardware_event(self, event: BaseEvent) -> Future[None]:
+        result: Future[None] = Future()
+        # A station stopping must not cancel a write already handed to the queue.
+        result.set_running_or_notify_cancel()
+        self.main_loop.call_soon_threadsafe(self.event_queue.put_nowait, (event, result))
+        return result
     
     async def event_consumer_worker(self):
         self.logger.info("sys.worker.event_consumer.started")
         while True:
-            event = await self.event_queue.get()
+            event, result = await self.event_queue.get()
             try:
                 if isinstance(event, WeighingCompletedEvent):
-                    self.logger.info(
-                        "biz.weighing.completed", 
-                        event_id=event.uuid,
-                        rfid=event.rfid_card_uid, 
-                        weight=event.weight
-                    )
-
-                    record = await Record.create(
-                        uuid=event.uuid,
-                        rfid_card_uid=event.rfid_card_uid,
-                        weight=event.weight,
-                        measured_at=event.timestamp,
-                    )
-
-                    self.logger.info("biz.record.created", uuid=str(record.uuid), weight=event.weight)
-
-                    await self.upload_queue.put(str(event.uuid))
-
-                    self.logger.debug("biz.record.queued_for_upload", queue_size=self.upload_queue.qsize())
-
-            except Exception:
-                event_id = getattr(event, 'uuid', 'unknown')
-                self.logger.exception("biz.record.local_save_failed", event_id=event_id)
+                    await self.save_record(event)
+            except Exception as exc:
+                result.set_exception(exc)
+                self.logger.exception(
+                    "biz.record.local_save_failed", event_id=event.uuid,
+                    action="check_local_storage_before_retrying_same_measurement",
+                )
+            else:
+                # No await between commit, upload handoff and acknowledgement.
+                # Upload may subsequently purge the row; the acknowledgement stays valid.
+                if isinstance(event, WeighingCompletedEvent):
+                    self.upload_queue.put_nowait(event.uuid)
+                result.set_result(None)
+                if isinstance(event, WeighingCompletedEvent):
+                    self.logger.info("biz.record.saved", uuid=event.uuid, weight=event.weight)
             finally:
                 self.event_queue.task_done()
+
+    async def save_record(self, event: WeighingCompletedEvent):
+        try:
+            await Record.create(
+                uuid=event.uuid,
+                rfid_card_uid=event.rfid_card_uid,
+                weight=event.weight,
+                measured_at=event.timestamp,
+            )
+        except IntegrityError:
+            # A previous attempt may have committed before reporting an error.
+            # Reuse only that exact original, never overwrite a UUID collision.
+            record = await Record.get_or_none(uuid=event.uuid)
+            if record is None or (
+                record.rfid_card_uid != event.rfid_card_uid
+                or record.weight != event.weight
+                or record.measured_at != event.timestamp
+            ):
+                raise
 
     async def close(self):
         if self.api_client is not None:

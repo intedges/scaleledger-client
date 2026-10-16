@@ -228,7 +228,7 @@ class CooperativeShutdownTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(uuid=event.uuid, weight=event.weight)
 
         async def restore():
-            client.event_queue.put_nowait(event)
+            client.handle_hardware_event(event)
             await write_started.wait()
 
         join_records = client.event_queue.join
