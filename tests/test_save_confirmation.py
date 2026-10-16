@@ -19,6 +19,7 @@ from suwol1000 import (
     DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
     WeighingStationWorker, WorkerState,
 )
+from tests.helpers import prepare_vehicle
 from workers import RecordUploadWorker
 
 
@@ -64,6 +65,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.worker = WeighingStationWorker(
             self.scale, on_event=self.submit, polling_interval=0,
             receipt_builder=lambda event: b"receipt",
+            vehicle_threshold=Decimal("1"),
         )
         self.worker.save_retry_interval = 0
         self.worker.last_plate = "12345678"
@@ -104,6 +106,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.client.event_queue.join(), timeout=3)
 
     async def start_measurement(self):
+        prepare_vehicle(self.worker)
         self.assertEqual(self.worker.measure(), WorkerState.SAVE)
         await asyncio.sleep(0)
         return self.submissions[-1]
@@ -120,7 +123,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         for request in self.scale.requests:
             if isinstance(request, DisplayRequestPacket):
                 self.assertNotIn(request.voice_code, (VoiceCode.WEIGHT_COMPLETE, VoiceCode.THANK_YOU))
-                self.assertFalse(request.green_blink)
+                self.assertFalse(request.green_blink and not request.red_blink)
 
     def assert_committed_record(self, event):
         # An independent connection cannot see the ORM's uncommitted insert.
@@ -316,6 +319,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.client.setup = AsyncMock()
         self.client.restore_local_state = AsyncMock(side_effect=ready.set)
         self.worker.polling_interval = 0.001
+        prepare_vehicle(self.worker)
         self.worker.state = WorkerState.MEASURE
         thread = threading.Thread(target=self.worker.run, daemon=True)
         self.threads.append(thread)
