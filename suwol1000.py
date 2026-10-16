@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass
 import dataclasses
 from datetime import UTC, datetime
@@ -324,6 +325,8 @@ class WorkerState(Enum):
     IDLE = auto()
     VERIFY = auto()
     MEASURE = auto()
+    SAVE = auto()
+    COMPLETE = auto()
     PRINT = auto()
     RECOVER = auto()
 
@@ -345,7 +348,7 @@ class WeighingStationWorker:
     def __init__(
         self,
         serial_client: SerialClient,
-        on_event: Callable[[BaseEvent], None] | None = None,
+        on_event: Callable[[BaseEvent], Future[None] | None] | None = None,
         rfid_validator: Callable[[RFIDTaggedEvent], bool] | None = None,
         receipt_builder: Callable[[WeighingCompletedEvent], bytes | None] | None = None,
         polling_interval: float = 0.1,
@@ -365,6 +368,14 @@ class WeighingStationWorker:
         self.last_weight = Decimal("0")
         self.last_plate = ""
         self.last_event: BaseEvent | None = None
+        self._pending_save: WeighingCompletedEvent | None = None
+        self._save_result: Future[None] | None = None
+        self._saved_event_uuid: str | None = None
+        self.save_retry_interval = 5.0
+        self.save_warning_interval = 5.0
+        self._save_retry_at = 0.0
+        self._save_started_at = 0.0
+        self._save_delay_reported = False
         self.stop_event = threading.Event()
         self._snapshot_lock = threading.Lock()
         self._live_weight = LiveWeightSnapshot()
@@ -427,6 +438,10 @@ class WeighingStationWorker:
                         self.state = self.verify()
                     case WorkerState.MEASURE:
                         self.state = self.measure()
+                    case WorkerState.SAVE:
+                        self.state = self.save()
+                    case WorkerState.COMPLETE:
+                        self.state = self.complete()
                     case WorkerState.PRINT:
                         self.state = self.print()
                     case WorkerState.RECOVER:
@@ -435,7 +450,7 @@ class WeighingStationWorker:
             except ValueError as e:
                 self.record_failure("hw.protocol.parse_error", e)
                 self.stop_event.wait(self.polling_interval)
-                self.state = WorkerState.IDLE
+                self.state = WorkerState.SAVE if self._pending_save is not None else WorkerState.IDLE
 
             except serial.SerialTimeoutException as e:
                 self.record_failure("hw.serial.timeout", e)
@@ -449,6 +464,12 @@ class WeighingStationWorker:
                 self.record_failure("sys.worker.unexpected_error", e)
                 self.state = WorkerState.RECOVER
 
+        if self._pending_save is not None:
+            self.logger.warning(
+                "biz.weighing.stopped_before_save_confirmation",
+                event_id=self._pending_save.uuid,
+                action="check_local_save_result_before_reweighing",
+            )
         self.client.disconnect()
         self._set_connection_status("disconnected")
         self.logger.info("sys.worker.terminated")
@@ -458,7 +479,10 @@ class WeighingStationWorker:
         if self.stop_event.is_set():
             return
         self._set_connection_status("disconnected" if isinstance(exc, serial.SerialException) else "error")
-        if self.state in (WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.PRINT):
+        if self.state in (
+            WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.SAVE,
+            WorkerState.COMPLETE, WorkerState.PRINT,
+        ):
             # An interrupted weighing must stay traceable to its card and receipt.
             context = {"rfid_card_uid": self.last_plate}
             if isinstance(self.last_event, WeighingCompletedEvent):
@@ -553,7 +577,7 @@ class WeighingStationWorker:
         # Reconnects repeat with every retry while failing; the failure summary covers them.
         log = self.logger.debug if self.failures.failing else self.logger.info
         log("hw.serial.connected", next_state="IDLE")
-        return WorkerState.IDLE
+        return WorkerState.SAVE if self._pending_save is not None else WorkerState.IDLE
 
     def idle(self) -> WorkerState:
         request = DisplayRequestPacket(display_weight=self.last_weight)
@@ -605,9 +629,82 @@ class WeighingStationWorker:
         return WorkerState.MEASURE
     
     def measure(self) -> WorkerState:
+        if self.stop_event.is_set():
+            return WorkerState.IDLE
         self.logger.info("hw.weighing.started")
-        self.last_event = WeighingCompletedEvent(rfid_card_uid=self.last_plate, weight=int(self.last_weight))
-        self.on_event(self.last_event)
+        if self._pending_save is None:
+            self._pending_save = WeighingCompletedEvent(
+                rfid_card_uid=self.last_plate, weight=int(self.last_weight),
+            )
+            self.last_event = self._pending_save
+            self._saved_event_uuid = None
+            self._submit_save()
+        return WorkerState.SAVE
+
+    def _submit_save(self):
+        self._save_started_at = time.monotonic()
+        self._save_delay_reported = False
+        try:
+            result = self.on_event(self._pending_save)
+            if not isinstance(result, Future):
+                raise RuntimeError("Local storage did not return a save acknowledgement")
+            self._save_result = result
+        except Exception as exc:
+            self._save_failed(exc)
+
+    def _save_failed(self, exc: Exception):
+        self._save_result = None
+        self._save_retry_at = time.monotonic() + self.save_retry_interval
+        self.logger.critical(
+            "biz.weighing.local_save_failed", event_id=self._pending_save.uuid,
+            rfid_card_uid=self._pending_save.rfid_card_uid, error=repr(exc),
+            retry_in=self.save_retry_interval,
+            action="check_local_storage_do_not_reweigh",
+        )
+
+    def save(self) -> WorkerState:
+        if self.stop_event.is_set():
+            return WorkerState.SAVE
+        if self._save_result is None and time.monotonic() >= self._save_retry_at:
+            self._submit_save()
+        if self._save_result is not None:
+            if self._save_result.done():
+                try:
+                    self._save_result.result()
+                except Exception as exc:
+                    self._save_failed(exc)
+                else:
+                    self._saved_event_uuid = self._pending_save.uuid
+                    self._pending_save = None
+                    self._save_result = None
+                    return WorkerState.COMPLETE
+            elif not self._save_delay_reported and (
+                time.monotonic() - self._save_started_at >= self.save_warning_interval
+            ):
+                self._save_delay_reported = True
+                self.logger.warning(
+                    "biz.weighing.local_save_pending", event_id=self._pending_save.uuid,
+                    action="check_local_storage_do_not_reweigh",
+                )
+
+        # Keep receiving live weight, but ignore new cards while this original is pending.
+        # A delay is not a failed write: never cancel or resubmit its in-flight Future.
+        response = self.exchange(DisplayRequestPacket(
+            display_weight=self.last_weight, display_plate=self.last_plate,
+        ))
+        self.last_weight = response.weight_value
+        self.stop_event.wait(self.polling_interval)
+        return WorkerState.SAVE
+
+    def _has_saved_measurement(self) -> bool:
+        return (
+            isinstance(self.last_event, WeighingCompletedEvent)
+            and self._saved_event_uuid == self.last_event.uuid
+        )
+
+    def complete(self) -> WorkerState:
+        if self.stop_event.is_set() or not self._has_saved_measurement():
+            return WorkerState.IDLE
         self.logger.info("hw.weighing.completed", next_state="PRINT")
 
         request = DisplayRequestPacket(
@@ -620,6 +717,8 @@ class WeighingStationWorker:
         return WorkerState.PRINT
     
     def print(self) -> WorkerState:
+        if self.stop_event.is_set() or not self._has_saved_measurement():
+            return WorkerState.IDLE
         receipt_bytes = None
         if self.receipt_builder is not None and isinstance(self.last_event, WeighingCompletedEvent):
             receipt_bytes = self.receipt_builder(self.last_event)
@@ -641,6 +740,7 @@ class WeighingStationWorker:
 
         self.last_plate = ""
         self.last_event = None
+        self._saved_event_uuid = None
         return WorkerState.IDLE
 
     def recover(self) -> WorkerState:

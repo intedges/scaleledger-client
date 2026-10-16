@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass
 import threading
 
@@ -22,7 +23,7 @@ class StationRuntime:
 class WeighingStationManager:
     def __init__(
         self,
-        on_event: Callable[[BaseEvent], None],
+        on_event: Callable[[BaseEvent], Future[None] | None],
         market_cache: MarketDataCache,
         *,
         on_live_weight: Callable[[int, LiveWeightSnapshot], None] | None = None,

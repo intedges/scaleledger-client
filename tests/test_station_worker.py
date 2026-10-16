@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from decimal import Decimal
 import threading
 import unittest
@@ -127,9 +128,16 @@ class PoweredOffStationTests(unittest.TestCase):
 
     def test_failed_print_during_a_failure_episode_is_logged_with_its_card(self):
         events = []
+
+        def saved(event):
+            events.append(event)
+            result = Future()
+            result.set_result(None)
+            return result
+
         logger = self.run_worker(
             WeighingScale(noise=3, fail_print=True, answers_before_stop=40),
-            on_event=events.append,
+            on_event=saved,
             receipt_builder=lambda event: b"receipt",
         )
 
