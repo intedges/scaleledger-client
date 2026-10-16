@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
 import logging
+import math
 from typing import ClassVar, Literal, Self
 
 import threading
@@ -18,6 +19,7 @@ from structlog.stdlib import get_logger
 
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog
+from weighing_cycle import CycleState, WeighingCycle
 
 
 STX = 2
@@ -319,6 +321,10 @@ class SerialClient:
         return ResponsePacket.from_bytes(response)
 
 
+class VoiceTimeoutError(TimeoutError):
+    """The device did not acknowledge and finish a requested announcement."""
+
+
 class WorkerState(Enum):
     INITIALIZE = auto()
     CONNECT = auto()
@@ -355,6 +361,9 @@ class WeighingStationWorker:
         retry_interval: float = 1.0,
         initial_sample_seq: int = 0,
         on_live_weight: Callable[[LiveWeightSnapshot], None] | None = None,
+        vehicle_threshold: Decimal = Decimal("100"),
+        vehicle_confirm_seconds: float = 3.0,
+        voice_timeout: float = 15.0,
     ):
         self.client = serial_client
         self.on_event = on_event or print
@@ -363,6 +372,22 @@ class WeighingStationWorker:
         self.polling_interval = polling_interval
         self.retry_interval = retry_interval
         self.on_live_weight = on_live_weight
+        self.cycle = WeighingCycle(
+            vehicle_threshold, vehicle_confirm_seconds, vehicle_confirm_seconds,
+        )
+        if (
+            isinstance(voice_timeout, bool) or not isinstance(voice_timeout, (int, float))
+            or not math.isfinite(voice_timeout) or voice_timeout <= 0
+        ):
+            raise ValueError("voice_timeout must be finite and positive")
+        self.voice_timeout = voice_timeout
+        self._processing = False
+        self._indicator_fault = False
+        self._save_fault = False
+        self._ready_announced = 0
+        self._next_rejected_announcement = 0.0
+        self._next_save_announcement = 0.0
+        self._visit_saved = False
 
         self.state = WorkerState.INITIALIZE
         self.last_weight = Decimal("0")
@@ -447,20 +472,34 @@ class WeighingStationWorker:
                     case WorkerState.RECOVER:
                         self.state = self.recover()
             
+            except VoiceTimeoutError as e:
+                self.record_failure("hw.speaker.timeout", e)
+                self.cycle.invalidate()
+                self._indicator_fault = True
+                self.state = self._resume_state()
+
             except ValueError as e:
+                self.cycle.invalidate()
+                self._indicator_fault = True
                 self.record_failure("hw.protocol.parse_error", e)
                 self.stop_event.wait(self.polling_interval)
-                self.state = WorkerState.SAVE if self._pending_save is not None else WorkerState.IDLE
+                self.state = self._resume_state()
 
             except serial.SerialTimeoutException as e:
+                self.cycle.invalidate()
+                self._indicator_fault = True
                 self.record_failure("hw.serial.timeout", e)
                 self.state = WorkerState.RECOVER
 
             except serial.SerialException as e:
+                self.cycle.invalidate()
+                self._indicator_fault = True
                 self.record_failure("hw.serial.connection_lost", e)
                 self.state = WorkerState.RECOVER
 
             except Exception as e:
+                self.cycle.invalidate()
+                self._indicator_fault = True
                 self.record_failure("sys.worker.unexpected_error", e)
                 self.state = WorkerState.RECOVER
 
@@ -495,10 +534,28 @@ class WeighingStationWorker:
         try:
             response = self.client.send_and_receive(request)
         except Exception as exc:
+            self.cycle.invalidate()
+            self._indicator_fault = True
             # Voice polling handles parse errors locally, so capture failures here too.
             if not self.stop_event.is_set():
                 self._set_connection_status("disconnected" if isinstance(exc, serial.SerialException) else "error")
             raise
+        if not self.stop_event.is_set():
+            if self._valid_weighing_response(response):
+                previous_state = self.cycle.state
+                self.last_weight = response.weight_value
+                self.cycle.observe(response.weight_value, now=time.monotonic())
+                self._indicator_fault = False
+                if previous_state == CycleState.LOCKED and self.cycle.state == CycleState.WAIT_ENTRY:
+                    self._visit_saved = False
+                if previous_state != self.cycle.state:
+                    self.logger.info(
+                        "biz.weighing.vehicle_state", previous_state=previous_state.name,
+                        vehicle_state=self.cycle.state.name, weight=str(response.weight_value),
+                    )
+            else:
+                self.cycle.invalidate()
+                self._indicator_fault = True
         with self._snapshot_lock:
             if not self.stop_event.is_set():
                 if self._valid_live_response(response):
@@ -539,30 +596,93 @@ class WeighingStationWorker:
             and len(response.weight_unit) <= 8
         )
     
-    def poll_until_voice_ends(self, base_request: DisplayRequestPacket) -> ResponsePacket | None:
+    @classmethod
+    def _valid_weighing_response(cls, response: ResponsePacket) -> bool:
+        return (
+            cls._valid_live_response(response)
+            and response.weight_unit.strip().lower() == "kg"
+            and response.weight_status in (WeightStatus.STABLE, WeightStatus.UNSTABLE)
+            and response.weight_type in (WeightType.NET, WeightType.GROSS)
+        )
+
+    def _display_request(
+        self, *, voice_code: VoiceCode = VoiceCode.NONE, error: bool = False,
+    ) -> DisplayRequestPacket:
+        # Green alone always means a card may be accepted. Both lamps mean busy.
+        fault = error or self._indicator_fault or self._save_fault
+        busy = self._processing or self._pending_save is not None
+        return DisplayRequestPacket(
+            display_weight=self.last_weight, display_plate=self.last_plate,
+            green_blink=not fault and (busy or self.cycle.state == CycleState.READY),
+            red_blink=fault or busy,
+            voice_code=voice_code,
+        )
+
+    def _accept_card(self, response: ResponsePacket) -> bool:
+        if (
+            response.rfid_card_uid == "00000000" or self._processing
+            or self._pending_save is not None or self.stop_event.is_set()
+            or not self.cycle.reserve(now=time.monotonic())
+        ):
+            return False
+        self._processing = True
+        self.last_plate = response.rfid_card_uid
+        self.last_event = RFIDTaggedEvent(rfid_card_uid=response.rfid_card_uid)
+        self._saved_event_uuid = None
+        self.logger.info("hw.rfid.detected", rfid_card_uid=self.last_plate, next_state="VERIFY")
+        self.on_event(self.last_event)
+        return True
+
+    def _resume_state(self) -> WorkerState:
+        if self._pending_save is not None:
+            self._processing = True
+            return WorkerState.SAVE
+        self._processing = False
+        # Never resume a card interrupted by an I/O fault, or recreate a saved record.
+        if self.cycle.state == CycleState.RESERVED:
+            self.cycle.invalidate()
+        if not self._has_saved_measurement():
+            self.last_plate = ""
+            self.last_event = None
+        return WorkerState.IDLE
+
+    def poll_until_voice_ends(
+        self, base_request: DisplayRequestPacket, *, accept_card: bool = False,
+    ) -> ResponsePacket | None:
         response = None
-
-        if base_request.voice_code != VoiceCode.NONE:
-            self.logger.info("hw.speaker.on", voice_code=base_request.voice_code.name)
-
-        voice_sent = False
-        is_speaker_busy = True
-        while (is_speaker_busy or not voice_sent) and not self.stop_event.is_set():
-            request = dataclasses.replace(
-                base_request,
-                display_weight=self.last_weight,
-                voice_code=VoiceCode.NONE if voice_sent else base_request.voice_code,
+        voice = base_request.voice_code
+        if voice != VoiceCode.NONE:
+            self.logger.info("hw.speaker.on", voice_code=voice.name)
+        deadline = time.monotonic() + self.voice_timeout
+        sent = False
+        acknowledged = voice == VoiceCode.NONE
+        while not self.stop_event.is_set():
+            if time.monotonic() >= deadline:
+                raise VoiceTimeoutError(f"Voice {voice.name} did not finish within {self.voice_timeout}s")
+            # Send the command only once, even when its acknowledgement is lost.
+            # Recompute lamps so a card accepted during TAG_CARD immediately means busy.
+            request = self._display_request(
+                voice_code=VoiceCode.NONE if sent else voice,
+                error=base_request.red_blink and not base_request.green_blink,
             )
+            if not accept_card and request.green_blink and not request.red_blink:
+                # A new vehicle can arrive during a rejection announcement.
+                # Only advertise readiness when this loop actually accepts cards.
+                request = dataclasses.replace(request, green_blink=False)
+            sent = True
             try:
                 response = self.exchange(request)
-                self.last_weight = response.weight_value
-                is_speaker_busy = response.voice_code != VoiceCode.NONE
-                voice_sent |= response.voice_code == base_request.voice_code
-            except ValueError as e:
+            except ValueError as exc:
                 if not self.stop_event.is_set():
                     self.failures.failure(
-                        "hw.protocol.parse_error", e, level=logging.WARNING, action="ignore_and_continue",
+                        "hw.protocol.parse_error", exc, level=logging.WARNING, action="ignore_and_continue",
                     )
+            else:
+                if accept_card:
+                    self._accept_card(response)
+                acknowledged |= response.voice_code == voice
+                if acknowledged and response.voice_code == VoiceCode.NONE:
+                    return response
             self.stop_event.wait(self.polling_interval)
         return response
 
@@ -577,52 +697,52 @@ class WeighingStationWorker:
         # Reconnects repeat with every retry while failing; the failure summary covers them.
         log = self.logger.debug if self.failures.failing else self.logger.info
         log("hw.serial.connected", next_state="IDLE")
-        return WorkerState.SAVE if self._pending_save is not None else WorkerState.IDLE
+        return self._resume_state()
 
     def idle(self) -> WorkerState:
-        request = DisplayRequestPacket(display_weight=self.last_weight)
-        response = self.exchange(request)
-        self.last_weight = response.weight_value
-
-        if response.rfid_card_uid != "00000000":
-            self.last_plate = response.rfid_card_uid
-            self.logger.info(
-                "hw.rfid.detected",
-                rfid_card_uid=response.rfid_card_uid,
-                next_state="MEASURE",
-            )
-            self.last_event = RFIDTaggedEvent(rfid_card_uid=response.rfid_card_uid)
-            self.on_event(self.last_event)
+        response = self.exchange(self._display_request())
+        if self._accept_card(response):
             return WorkerState.VERIFY
+
+        if self.cycle.state == CycleState.READY and self._ready_announced != self.cycle.ready_sequence:
+            self._ready_announced = self.cycle.ready_sequence
+            self.poll_until_voice_ends(
+                self._display_request(voice_code=VoiceCode.TAG_CARD), accept_card=True,
+            )
+            if self._processing and self.cycle.state == CycleState.RESERVED:
+                return WorkerState.VERIFY
+            if self._processing:
+                self._processing = False
+                self.last_plate = ""
+                self.last_event = None
+        elif response.rfid_card_uid != "00000000" and time.monotonic() >= self._next_rejected_announcement:
+            self._next_rejected_announcement = time.monotonic() + 10.0
+            voice = VoiceCode.WEIGHT_COMPLETE if self._visit_saved else VoiceCode.STAND_BY
+            self.poll_until_voice_ends(self._display_request(voice_code=voice))
 
         self.stop_event.wait(self.polling_interval)
         return WorkerState.IDLE
-    
+
     def verify(self) -> WorkerState:
         self.logger.info("biz.rfid_card.verifying", rfid_card_uid=self.last_plate)
-        request = DisplayRequestPacket(
-            display_weight=self.last_weight,
-            display_plate=self.last_plate,
-            voice_code=VoiceCode.PLEASE_WAIT,
-        )
+        request = self._display_request(voice_code=VoiceCode.PLEASE_WAIT)
         response = self.poll_until_voice_ends(request)
         if self.stop_event.is_set():
             return WorkerState.IDLE
         
-        if not isinstance(self.last_event, RFIDTaggedEvent):
-            self.logger.error("sys.worker.invalid_event_type")
-            return WorkerState.IDLE
+        if not isinstance(self.last_event, RFIDTaggedEvent) or self.cycle.state != CycleState.RESERVED:
+            self.logger.warning("biz.weighing.card_cancelled", reason="vehicle_no_longer_ready")
+            return self._resume_state()
 
         is_valid = self.rfid_validator(self.last_event)
         if not is_valid:
             self.logger.info("biz.rfid_card.unregistered", next_state="IDLE")
-            request = DisplayRequestPacket(
-                display_weight=self.last_weight,
-                display_plate=self.last_plate,
-                red_blink=True,
-                voice_code=VoiceCode.UNREGISTERED_CARD,
-            )
-            response = self.poll_until_voice_ends(request)
+            request = self._display_request(voice_code=VoiceCode.UNREGISTERED_CARD, error=True)
+            self.poll_until_voice_ends(request)
+            self.cycle.release()
+            self._processing = False
+            self.last_plate = ""
+            self.last_event = None
             return WorkerState.IDLE
 
         self.logger.info("biz.rfid_card.verified", next_state="MEASURE")
@@ -633,6 +753,11 @@ class WeighingStationWorker:
             return WorkerState.IDLE
         self.logger.info("hw.weighing.started")
         if self._pending_save is None:
+            if not self.cycle.consume(now=time.monotonic()):
+                self.logger.warning("biz.weighing.card_cancelled", reason="vehicle_no_longer_ready")
+                return self._resume_state()
+            self._processing = True
+            self._visit_saved = False
             self._pending_save = WeighingCompletedEvent(
                 rfid_card_uid=self.last_plate, weight=int(self.last_weight),
             )
@@ -653,6 +778,7 @@ class WeighingStationWorker:
             self._save_failed(exc)
 
     def _save_failed(self, exc: Exception):
+        self._save_fault = True
         self._save_result = None
         self._save_retry_at = time.monotonic() + self.save_retry_interval
         self.logger.critical(
@@ -675,6 +801,8 @@ class WeighingStationWorker:
                     self._save_failed(exc)
                 else:
                     self._saved_event_uuid = self._pending_save.uuid
+                    self._save_fault = False
+                    self._visit_saved = self.cycle.state == CycleState.LOCKED
                     self._pending_save = None
                     self._save_result = None
                     return WorkerState.COMPLETE
@@ -689,10 +817,11 @@ class WeighingStationWorker:
 
         # Keep receiving live weight, but ignore new cards while this original is pending.
         # A delay is not a failed write: never cancel or resubmit its in-flight Future.
-        response = self.exchange(DisplayRequestPacket(
-            display_weight=self.last_weight, display_plate=self.last_plate,
-        ))
-        self.last_weight = response.weight_value
+        if self._save_fault and time.monotonic() >= self._next_save_announcement:
+            self._next_save_announcement = time.monotonic() + 30.0
+            self.poll_until_voice_ends(self._display_request(voice_code=VoiceCode.CHECK_ADMIN, error=True))
+        else:
+            self.exchange(self._display_request())
         self.stop_event.wait(self.polling_interval)
         return WorkerState.SAVE
 
@@ -707,12 +836,7 @@ class WeighingStationWorker:
             return WorkerState.IDLE
         self.logger.info("hw.weighing.completed", next_state="PRINT")
 
-        request = DisplayRequestPacket(
-            display_weight=self.last_weight,
-            display_plate=self.last_plate,
-            green_blink=True,
-            voice_code=VoiceCode.WEIGHT_COMPLETE,
-        )
+        request = self._display_request(voice_code=VoiceCode.WEIGHT_COMPLETE)
         response = self.poll_until_voice_ends(request)
         return WorkerState.PRINT
     
@@ -726,22 +850,19 @@ class WeighingStationWorker:
         if receipt_bytes:
             self.logger.info("hw.printer.command.sending", payload_length = len(receipt_bytes))
             request = PrinterRequestPacket(document_bytes=receipt_bytes)
-            response = self.exchange(request)
-            self.last_weight = response.weight_value
+            self.exchange(request)
 
-
-        request = DisplayRequestPacket(
-            display_weight=self.last_weight,
-            display_plate=self.last_plate,
-            green_blink=True,
-            voice_code=VoiceCode.THANK_YOU,
-        )
+        request = self._display_request(voice_code=VoiceCode.THANK_YOU)
         response = self.poll_until_voice_ends(request)
 
         self.last_plate = ""
         self.last_event = None
         self._saved_event_uuid = None
-        return WorkerState.IDLE
+        self._processing = False
+        # A subsequent vehicle may already be ready after departure was observed
+        # during output. If we show green, accept its card in this response too.
+        response = self.exchange(self._display_request())
+        return WorkerState.VERIFY if self._accept_card(response) else WorkerState.IDLE
 
     def recover(self) -> WorkerState:
         self.logger.debug("sys.worker.recovery_scheduled", retry_in=self.retry_interval, next_state="CONNECT")

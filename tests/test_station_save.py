@@ -11,6 +11,7 @@ from suwol1000 import (
     DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
     WeighingStationWorker, WorkerState,
 )
+from tests.helpers import prepare_vehicle
 
 
 class StationSaveTests(unittest.TestCase):
@@ -39,6 +40,7 @@ class StationSaveTests(unittest.TestCase):
         )
 
     def begin_measurement(self):
+        prepare_vehicle(self.worker)
         self.assertEqual(self.worker.measure(), WorkerState.SAVE)
         event = self.on_event.call_args.args[0]
         self.assertIsInstance(event, WeighingCompletedEvent)
@@ -49,7 +51,7 @@ class StationSaveTests(unittest.TestCase):
         self.assertFalse(any(isinstance(request, PrinterRequestPacket) for request in self.requests))
         self.assertFalse(any(
             request.voice_code in (VoiceCode.WEIGHT_COMPLETE, VoiceCode.THANK_YOU)
-            or request.green_blink
+            or (request.green_blink and not request.red_blink)
             for request in self.requests if isinstance(request, DisplayRequestPacket)
         ))
         self.receipt_builder.assert_not_called()

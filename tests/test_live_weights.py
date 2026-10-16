@@ -14,6 +14,7 @@ from suwol1000 import (
     DisplayRequestPacket, LiveWeightSnapshot, PrinterRequestPacket, ResponsePacket,
     VoiceCode, WeighingStationWorker, WeightStatus, WeightType,
 )
+from tests.helpers import prepare_vehicle
 
 
 def response_bytes(weight: bytes) -> bytes:
@@ -30,6 +31,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         self.worker = WeighingStationWorker(
             self.serial, polling_interval=0, receipt_builder=lambda event: b"receipt",
             on_live_weight=self.samples.append,
+            vehicle_threshold=Decimal("1"),
         )
         self.worker.logger = Mock()
         self.worker.failures.logger = self.worker.logger
@@ -76,6 +78,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
             ResponsePacket(weight_value=Decimal("4")),
             ResponsePacket(weight_value=Decimal("5"), voice_code=VoiceCode.THANK_YOU),
             ResponsePacket(weight_value=Decimal("6")),
+            ResponsePacket(weight_value=Decimal("7")),
         ]
         self.worker.idle()
         self.assertEqual(self.worker.get_live_weight().sample_seq, 1)
@@ -87,13 +90,15 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         self.worker.print()
 
         sample = self.worker.get_live_weight()
-        self.assertEqual(sample.weight, Decimal("6"))
-        self.assertEqual(sample.sample_seq, 6)
+        self.assertEqual(sample.weight, Decimal("7"))
+        self.assertEqual(sample.sample_seq, 7)
         self.assertEqual(sample.connection_status, "connected")
         self.assertTrue(sample.sample_valid)
         self.assertEqual(completed.weight, 3)
-        self.assertEqual([snapshot.sample_seq for snapshot in self.samples], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([snapshot.sample_seq for snapshot in self.samples], [1, 2, 3, 4, 5, 6, 7])
         self.assertIsInstance(self.serial.send_and_receive.call_args_list[3].args[0], PrinterRequestPacket)
+        cleared_lights = self.serial.send_and_receive.call_args.args[0]
+        self.assertFalse(cleared_lights.green_blink or cleared_lights.red_blink)
 
     def test_same_weight_is_published_for_every_new_response(self):
         self.serial.send_and_receive.return_value = ResponsePacket(weight_value=Decimal("12.5"))
@@ -241,6 +246,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
 
         for _ in range(3):
             self.worker.exchange(DisplayRequestPacket())
+        prepare_vehicle(self.worker, reserve=False)
         self.worker.idle()
         self.worker.poll_until_voice_ends = Mock()
         self.worker.measure()

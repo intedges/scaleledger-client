@@ -52,19 +52,22 @@ class WeighingScale(ScriptedSerialClient):
         super().__init__(failed_exchanges=noise, **kwargs)
         self.fail_print = fail_print
         self.card_pending = True
+        self.clock = 0.0
 
     def send_and_receive(self, request):
+        self.clock += 1
         if self.failed_exchanges:
             return super().send_and_receive(request)
         if isinstance(request, PrinterRequestPacket) and self.fail_print:
             raise ValueError("Invalid response packet length: 3 bytes")
         rfid = "00000000"
-        if self.card_pending and request.voice_code == VoiceCode.NONE and not request.display_plate:
+        if self.card_pending and request.green_blink and not request.red_blink:
             self.card_pending = False
             rfid = "12345678"
         voice = getattr(request, "voice_code", VoiceCode.NONE)
         super().send_and_receive(request)
-        return ResponsePacket(rfid_card_uid=rfid, voice_code=voice, weight_value=Decimal("120"))
+        weight = Decimal("0") if self.clock <= 8 else Decimal("120")
+        return ResponsePacket(rfid_card_uid=rfid, voice_code=voice, weight_value=weight)
 
 
 class BlockingSerialClient(ScriptedSerialClient):
@@ -96,8 +99,13 @@ class PoweredOffStationTests(unittest.TestCase):
         client.stop_event = worker.stop_event
 
         thread = threading.Thread(target=worker.run)
-        thread.start()
-        thread.join(timeout=10)
+        if isinstance(client, WeighingScale):
+            with patch("suwol1000.time.monotonic", side_effect=lambda: client.clock):
+                thread.start()
+                thread.join(timeout=10)
+        else:
+            thread.start()
+            thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
         return logger
 
