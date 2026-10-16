@@ -77,31 +77,3 @@ class RecordUploadWorker:
     async def _wait_before_retry(self, record_uuid: str):
         self.logger.info("sys.worker.record_upload.requeue", uuid=record_uuid, delay=self.retry_delay)
         await asyncio.sleep(self.retry_delay)
-
-
-class HeartbeatWorker:
-    def __init__(self, api_client: APIClient, access_token: str, interval: float = 30.0):
-        self.api_client = api_client
-        self.access_token = access_token
-        self.logger = get_logger()
-        self.interval = interval
-
-    async def run(self):
-        self.logger.info("sys.worker.heartbeat.started", interval=self.interval)
-
-        while True:
-            try:
-                self.logger.debug("net.api.heartbeat.sending")
-                await self.api_client.send_heartbeat(self.access_token)
-                self.logger.debug("net.api.heartbeat.success")
-
-            except httpx2.HTTPStatusError as e:
-                if e.response.status_code in (401, 403):
-                    self.logger.error("net.api.heartbeat.auth_rejected", status=e.response.status_code)
-                    raise AuthDegradedError("Token expired during heartbeat")
-                self.logger.error("net.api.heartbeat.server_error", status=e.response.status_code)
-
-            except httpx2.RequestError as e:
-                self.logger.warning("net.api.heartbeat.network_error", error=repr(e))
-
-            await asyncio.sleep(self.interval)
