@@ -214,7 +214,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for(self.client.upload_queue.join())
 
         self.assertEqual(self.connections.opened.qsize(), 3)
-        self.api.send_heartbeat.assert_awaited()
+        self.api.send_heartbeat.assert_not_awaited()
         self.assertEqual(str(self.api.create_record.call_args.kwargs["record"].uuid), event.uuid)
         self.assertFalse(await Record.filter(uuid=event.uuid).exists())
         self.manager.stop_all.assert_not_called()
@@ -461,21 +461,32 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         heartbeat_sent = asyncio.Event()
         self.api.send_heartbeat.side_effect = lambda token: heartbeat_sent.set()
-        self.api.retrieve_gateway_self.side_effect = httpx2.ConnectError("offline")
+        resolution_attempted = asyncio.Event()
+
+        async def unavailable_gateway(token):
+            resolution_attempted.set()
+            raise httpx2.ConnectError("offline")
+
+        self.api.retrieve_gateway_self.side_effect = unavailable_gateway
         restarted.run_provisioning_loop = AsyncMock()
-        connected = StubWebSocket(hold=asyncio.Event())
+        connected = StubWebSocket(
+            messages=[json.dumps({"type": "heartbeat.request"})],
+            after_messages=asyncio.Event(),
+        )
         self.connections.sockets = [connected]
         with patch("main.websockets.connect", return_value=self.connections) as connect:
             self.start(restarted.run_network_loop())
-            await self.wait_for(heartbeat_sent.wait())
+            await self.wait_for(resolution_attempted.wait())
             connect.assert_not_called()
-            self.api.send_heartbeat.assert_awaited_with("new-token")
+            self.api.send_heartbeat.assert_not_awaited()
 
             self.api.retrieve_gateway_self.side_effect = None
             self.api.list_gateway_stations.side_effect = None
             await self.wait_for(connected.listening.wait())
+            await self.wait_for(heartbeat_sent.wait())
             await self.wait_for(self.settings_synced.wait())
             connect.assert_called_once_with("ws://127.0.0.1:8000/ws/devices/gateways/2/")
+            self.api.send_heartbeat.assert_awaited_once_with("new-token")
 
         restarted.run_provisioning_loop.assert_not_awaited()
         self.assertEqual(restarted.gateway_id, 2)

@@ -25,7 +25,7 @@ from models import Gateway, Record, WeighingStation, RFIDCard
 from settings_sync import SettingsSnapshot
 from telemetry import LatestWeightBuffer, LiveWeightPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, get_mac_address, scan_peripherals
-from workers import HeartbeatWorker, RecordUploadWorker
+from workers import RecordUploadWorker
 from windows_runtime import WindowsStopEvent, request_stop
 
 
@@ -424,10 +424,6 @@ class HeadlessClient:
             self.logger.error("net.ws.message.invalid_json", message=message)
     
     async def run_active_loop(self):
-        heartbeat_worker = HeartbeatWorker(
-            api_client=self.api_client,
-            access_token=self.access_token,
-        )
         upload_worker = RecordUploadWorker(
             api_client=self.api_client,
             upload_queue=self.upload_queue,
@@ -436,7 +432,6 @@ class HeadlessClient:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self.run_settings_sync_worker())
             tg.create_task(self.run_active_ws_loop())
-            tg.create_task(heartbeat_worker.run())
             tg.create_task(upload_worker.run())
             tg.create_task(self.run_live_weights_loop())
 
@@ -474,36 +469,60 @@ class HeadlessClient:
             try:
                 self.request_settings_sync()
                 await self.listen_active_ws(ws)
-            except ConnectionClosed:
+            except* ConnectionClosed:
                 self.logger.warning("net.ws.active.disconnected")
             # Reconnect on normal closes as well; settings retries stay independent.
             await asyncio.sleep(self.retry_interval)
     
     async def listen_active_ws(self, ws):
-        async for message in ws:
+        # Heartbeat calls belong to this connection and must not survive reconnects.
+        async with asyncio.TaskGroup() as tasks:
+            heartbeat_task = None
             try:
-                data = json.loads(message)
-                message_type = data["type"]
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        message_type = data["type"]
 
-                match message_type:
-                    case "scan.peripherals":
-                        self.logger.info("biz.active.scan_peripherals.executing")
-                        peripherals = await asyncio.to_thread(scan_peripherals)
-                        await ws.send(json.dumps({
-                            "type": "peripherals.scanned",
-                            "payload": peripherals,
-                        }))
-                        self.logger.info("biz.active.scan_peripherals.completed", count=len(peripherals))
+                        match message_type:
+                            case "heartbeat.request":
+                                if heartbeat_task is None or heartbeat_task.done():
+                                    heartbeat_task = tasks.create_task(self.send_heartbeat())
 
-                    case "sync.market_data" | "sync.gateway" | "sync.weighing_stations":
-                        self.logger.info("biz.active.settings_sync.requested", type=message_type)
-                        self.request_settings_sync()
+                            case "scan.peripherals":
+                                self.logger.info("biz.active.scan_peripherals.executing")
+                                peripherals = await asyncio.to_thread(scan_peripherals)
+                                await ws.send(json.dumps({
+                                    "type": "peripherals.scanned",
+                                    "payload": peripherals,
+                                }))
+                                self.logger.info("biz.active.scan_peripherals.completed", count=len(peripherals))
 
-                    case _:
-                        self.logger.debug("net.ws.message.ignored", type=message_type)
+                            case "sync.market_data" | "sync.gateway" | "sync.weighing_stations":
+                                self.logger.info("biz.active.settings_sync.requested", type=message_type)
+                                self.request_settings_sync()
 
-            except json.JSONDecodeError:
-                self.logger.error("net.ws.message.invalid_json")
+                            case _:
+                                self.logger.debug("net.ws.message.ignored", type=message_type)
+
+                    except json.JSONDecodeError:
+                        self.logger.error("net.ws.message.invalid_json")
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+
+    async def send_heartbeat(self):
+        try:
+            self.logger.debug("net.api.heartbeat.sending")
+            await self.api_client.send_heartbeat(self.access_token)
+            self.logger.debug("net.api.heartbeat.success")
+        except httpx2.HTTPStatusError as e:
+            if e.response.status_code in (401, 403):
+                self.logger.error("net.api.heartbeat.auth_rejected", status=e.response.status_code)
+                raise AuthDegradedError("Token expired during heartbeat") from e
+            self.logger.error("net.api.heartbeat.server_error", status=e.response.status_code)
+        except httpx2.RequestError as e:
+            self.logger.warning("net.api.heartbeat.network_error", error=repr(e))
 
 
 async def run_client(
