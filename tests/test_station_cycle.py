@@ -93,7 +93,7 @@ class StationCycleTests(unittest.TestCase):
         self.worker = WeighingStationWorker(
             self.scale, on_event=self.submit, rfid_validator=self.validator,
             receipt_builder=lambda event: b"receipt", polling_interval=0,
-            retry_interval=0, vehicle_threshold=Decimal("100"),
+            retry_interval=0,
             vehicle_confirm_seconds=3, voice_timeout=1,
         )
 
@@ -157,13 +157,13 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(self.lights(), (False, False))
         self.assertFalse(self.events)
 
-        self.sustain("100")
+        self.sustain("50")
         self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
-        self.sustain("100")
+        self.sustain("50")
         self.scale.card = FIRST_CARD
         self.assertEqual(self.invoke("idle"), WorkerState.IDLE)
         self.assertFalse(self.events)
-        self.sustain("100.1")
+        self.sustain("50.1")
         self.accept()
 
     def test_entry_needs_three_seconds_and_the_ready_prompt_is_not_repeated(self):
@@ -233,7 +233,7 @@ class StationCycleTests(unittest.TestCase):
         self.ready()
         self.scale.queue()
         self.scale.queue(card=FIRST_CARD, voice=VoiceCode.TAG_CARD)
-        self.scale.queue(weight="100", voice=VoiceCode.TAG_CARD, advance=0.1)
+        self.scale.queue(weight="50", voice=VoiceCode.TAG_CARD, advance=0.1)
         self.scale.queue(weight="120", advance=0.1)
 
         self.assertEqual(self.invoke("idle"), WorkerState.IDLE)
@@ -277,9 +277,9 @@ class StationCycleTests(unittest.TestCase):
 
         start = self.clock.now + 1
         for offset in (0, 1, 2, 2.99):
-            self.observe("100", start + offset)
+            self.observe("50", start + offset)
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
-        self.observe("100", start + 3)
+        self.observe("50", start + 3)
         self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
         self.sustain("120")
         self.accept(SECOND_CARD)

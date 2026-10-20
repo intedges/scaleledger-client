@@ -51,7 +51,7 @@ class ScheduledTraffic:
     """A physical timeline independent of the worker's internal state.
 
     Each vehicle stays for 24 seconds, followed by six seconds at or below
-    100 kg. Every exchange consumes 0.5 virtual seconds. A vehicle present
+    50 kg. Every exchange consumes 0.5 virtual seconds. A vehicle present
     during startup must leave before the counted visits begin.
     """
 
@@ -160,10 +160,10 @@ class ScheduledTraffic:
             weight, card = 180, "12345678"
         if vehicle is not None:
             profile = vehicle % 8
-            # Both 0 and the exact 100 kg boundary must qualify as empty.
-            weight = 100 if int(age * 2) % 2 else 0
+            # Both 0 and the exact 50 kg boundary must qualify as empty.
+            weight = 50 if int(age * 2) % 2 else 0
             if age < self.occupied_seconds:
-                weight = 120 + (vehicle % 5) * 10
+                weight = 70 + (vehicle % 5) * 10
                 unstable = profile == 1
                 if age >= 4:
                     # Keep tagging alternate cards after acceptance and completion.
@@ -214,7 +214,7 @@ class StationSoakTests(unittest.TestCase):
             with self.subTest(vehicle=vehicle, profile=vehicle % 8):
                 self.assertEqual(len(traffic.saved[vehicle]), 1)
                 event = traffic.saved[vehicle][0]
-                self.assertEqual(event.weight, 120 + (vehicle % 5) * 10)
+                self.assertEqual(event.weight, 70 + (vehicle % 5) * 10)
                 self.assertNotEqual(event.rfid_card_uid, INVALID_CARD)
                 self.assertEqual(traffic.prints[vehicle], [event.uuid.encode("ascii")])
                 self.assertEqual({attempt.uuid for attempt in traffic.submissions[vehicle]}, {event.uuid})

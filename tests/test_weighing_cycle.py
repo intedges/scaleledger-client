@@ -6,7 +6,7 @@ from weighing_cycle import CycleState, WeighingCycle
 
 class WeighingCycleTests(unittest.TestCase):
     def setUp(self):
-        self.cycle = WeighingCycle(Decimal("100"), ready_seconds=1, empty_seconds=2)
+        self.cycle = WeighingCycle(Decimal("50"), ready_seconds=1, empty_seconds=2)
 
     def observe(self, weight, now):
         self.cycle.observe(None if weight is None else Decimal(weight), now=now)
@@ -42,14 +42,14 @@ class WeighingCycleTests(unittest.TestCase):
         self.assertEqual(self.cycle.ready_sequence, 1)
 
     def test_exact_threshold_is_empty_and_cannot_authorize_measurement(self):
-        self.observe("100", 0)
-        self.observe("100", 2)
+        self.observe("50", 0)
+        self.observe("50", 2)
         self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
         for now in (3, 4, 5):
-            self.observe("100", now)
+            self.observe("50", now)
             self.assertFalse(self.cycle.reserve(now=now))
-        self.observe("100.01", 6)
-        self.observe("100.01", 7)
+        self.observe("50.01", 6)
+        self.observe("50.01", 7)
         self.assertTrue(self.cycle.reserve(now=7))
 
     def test_brief_entry_below_duration_does_not_accept_card(self):
@@ -92,7 +92,7 @@ class WeighingCycleTests(unittest.TestCase):
 
     def test_ready_visit_must_qualify_again_after_a_low_sample(self):
         self.ready()
-        self.observe("100", 5)
+        self.observe("50", 5)
         self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
         self.observe("120", 5.1)
         self.assertFalse(self.cycle.reserve(now=5.1))
@@ -209,7 +209,7 @@ class WeighingCycleTests(unittest.TestCase):
         self.assertFalse(self.cycle.consume(now=3))
 
     def test_independent_stations_do_not_share_cycle_state(self):
-        other = WeighingCycle(Decimal("100"), ready_seconds=1, empty_seconds=2)
+        other = WeighingCycle(Decimal("50"), ready_seconds=1, empty_seconds=2)
         self.lock()
         other.observe(Decimal("0"), now=0)
         other.observe(Decimal("0"), now=2)
@@ -227,7 +227,7 @@ class WeighingCycleTests(unittest.TestCase):
                 arguments = {"ready_seconds": 1, "empty_seconds": 2, "max_sample_gap": 2}
                 arguments[name] = invalid
                 with self.subTest(setting=name, value=invalid), self.assertRaises(ValueError):
-                    WeighingCycle(Decimal("100"), **arguments)
+                    WeighingCycle(Decimal("50"), **arguments)
 
     def test_nonfinite_clock_values_are_rejected(self):
         for invalid in (float("nan"), float("inf"), float("-inf"), True, "1"):
