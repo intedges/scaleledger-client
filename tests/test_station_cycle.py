@@ -9,7 +9,7 @@ import serial
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from suwol1000 import (
     DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
-    VoiceTimeoutError, WeighingStationWorker, WorkerState,
+    WeighingStationWorker, WorkerState,
 )
 from weighing_cycle import CycleState
 
@@ -241,6 +241,33 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(self.invoke("measure"), WorkerState.IDLE)
         self.assertFalse(self.measurements())
 
+    def test_next_vehicle_card_is_not_lost_during_previous_ready_voice(self):
+        self.ready()
+        self.worker.voice_timeout = 20
+        self.scale.step = 0.25
+        self.scale.fixed_voice = VoiceCode.TAG_CARD
+        original_sequence = self.worker.cycle.ready_sequence
+        self.scale.queue()
+        self.scale.queue(voice=VoiceCode.TAG_CARD)
+        for _ in range(4):
+            self.scale.queue(weight="0", voice=VoiceCode.TAG_CARD, advance=1)
+        for _ in range(4):
+            self.scale.queue(weight="120", voice=VoiceCode.TAG_CARD, advance=1)
+        self.scale.tag_when_ready = SECOND_CARD
+
+        self.assertEqual(self.invoke("idle"), WorkerState.IDLE)
+
+        self.assertGreater(self.worker.cycle.ready_sequence, original_sequence)
+        self.assertEqual(self.worker.cycle.state, CycleState.READY)
+        self.assertEqual(self.scale.tag_when_ready, SECOND_CARD)
+        self.assertFalse(self.events)
+        self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 1)
+
+        self.assertEqual(self.invoke("idle"), WorkerState.VERIFY)
+        self.assertEqual(self.worker.last_plate, SECOND_CARD)
+        self.assertEqual(self.scale.tag_when_ready, NO_CARD)
+        self.assertEqual(len(self.events), 1)
+
     def test_unregistered_card_shows_red_and_releases_the_same_vehicle_for_retry(self):
         self.ready()
         self.accept()
@@ -330,31 +357,41 @@ class StationCycleTests(unittest.TestCase):
         self.assertFalse(self.voices(VoiceCode.WEIGHT_COMPLETE))
         self.assertFalse(any(isinstance(request, PrinterRequestPacket) for request in self.scale.requests))
 
-    def test_unacknowledged_voice_has_a_deadline_and_is_sent_only_once(self):
+    def test_unobserved_voice_has_a_deadline_without_invalidating_weight(self):
         self.scale.fixed_voice = VoiceCode.NONE
         self.scale.step = 0.25
 
-        with self.assertRaises(VoiceTimeoutError):
-            self.worker.poll_until_voice_ends(DisplayRequestPacket(voice_code=VoiceCode.TAG_CARD))
+        self.worker.poll_until_voice_ends(DisplayRequestPacket(voice_code=VoiceCode.TAG_CARD))
 
         self.assertLessEqual(self.clock.now, 1.5)
         self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 1)
         self.assertLessEqual(len(self.scale.requests), 6)
-        self.assertTrue(all(request.voice_code == VoiceCode.NONE
-                            for request in self.scale.requests[1:]))
+        sample = self.worker.get_live_weight()
+        self.assertTrue(sample.sample_valid)
+        self.assertEqual(sample.connection_status, "connected")
+        self.assertFalse(self.worker._indicator_fault)
+        self.worker.logger.warning.assert_called_once_with(
+            "hw.speaker.timeout", voice_code="TAG_CARD", reason="start_unobserved",
+            action="continue_weighing_suppress_voice_until_busy_then_idle",
+        )
 
     def test_lost_initial_voice_response_does_not_resend_the_command(self):
+        self.worker.exchange(DisplayRequestPacket())
         self.scale.responses.append((0, ValueError("truncated response")))
         self.scale.fixed_voice = VoiceCode.NONE
         self.scale.step = 0.25
 
-        with self.assertRaises(VoiceTimeoutError):
+        # A corrupt packet remains a protocol fault, not a voice-only timeout.
+        with self.assertRaises(ValueError):
             self.worker.poll_until_voice_ends(DisplayRequestPacket(voice_code=VoiceCode.TAG_CARD))
 
+        self.assertTrue(self.worker._indicator_fault)
+        self.worker.poll_until_voice_ends(DisplayRequestPacket(voice_code=VoiceCode.PLEASE_WAIT))
         self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 1)
+        self.assertFalse(self.voices(VoiceCode.PLEASE_WAIT))
         self.assertLessEqual(self.clock.now, 1.5)
 
-    def test_busy_voice_timeout_preserves_consumed_vehicle_and_saved_event(self):
+    def test_busy_voice_timeout_preserves_saved_event_and_advances_to_print(self):
         self.ready()
         self.accept()
         self.measure()
@@ -364,14 +401,35 @@ class StationCycleTests(unittest.TestCase):
         self.scale.step = 0.25
         started = self.clock.now
 
-        with self.assertRaises(VoiceTimeoutError):
-            self.invoke("complete")
+        self.assertEqual(self.invoke("complete"), WorkerState.PRINT)
 
         self.assertLessEqual(self.clock.now - started, 1.5)
         self.assertEqual(len(self.voices(VoiceCode.WEIGHT_COMPLETE)), 1)
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
         self.assertEqual(self.measurements(), [original])
         self.assertFalse(any(isinstance(request, PrinterRequestPacket) for request in self.scale.requests))
+        self.assertEqual(self.invoke("print"), WorkerState.IDLE)
+        self.assertEqual(sum(isinstance(request, PrinterRequestPacket) for request in self.scale.requests), 1)
+        self.assertFalse(self.voices(VoiceCode.THANK_YOU))
+
+    def test_saved_vehicle_departure_skips_stale_guidance_but_prints_original(self):
+        self.ready()
+        self.accept()
+        self.result = Future()
+        self.measure()
+        original = self.measurements()[0]
+        self.sustain("0")
+        self.sustain("120")
+        self.result.set_result(None)
+
+        self.assertEqual(self.invoke("save"), WorkerState.COMPLETE)
+        self.assertEqual(self.invoke("complete"), WorkerState.PRINT)
+        self.assertEqual(self.invoke("print"), WorkerState.IDLE)
+
+        self.assertEqual(self.measurements(), [original])
+        self.assertFalse(self.voices(VoiceCode.WEIGHT_COMPLETE))
+        self.assertFalse(self.voices(VoiceCode.THANK_YOU))
+        self.assertEqual(sum(isinstance(request, PrinterRequestPacket) for request in self.scale.requests), 1)
 
     def test_serial_reconnect_does_not_unlock_a_consumed_vehicle(self):
         self.ready()
