@@ -87,6 +87,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         completed = WeighingCompletedEvent(rfid_card_uid="12345678", weight=3)
         self.worker.last_event = completed
         self.worker._saved_event_uuid = completed.uuid
+        self.worker._visit_saved = True
         self.worker.print()
 
         sample = self.worker.get_live_weight()

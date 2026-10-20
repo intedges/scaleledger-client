@@ -6,7 +6,6 @@ import dataclasses
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
-import logging
 import math
 from typing import ClassVar, Literal, Self
 
@@ -321,10 +320,6 @@ class SerialClient:
         return ResponsePacket.from_bytes(response)
 
 
-class VoiceTimeoutError(TimeoutError):
-    """The device did not acknowledge and finish a requested announcement."""
-
-
 class WorkerState(Enum):
     INITIALIZE = auto()
     CONNECT = auto()
@@ -381,6 +376,10 @@ class WeighingStationWorker:
         ):
             raise ValueError("voice_timeout must be finite and positive")
         self.voice_timeout = voice_timeout
+        self._voice_status: VoiceCode | None = None
+        self._pending_voice: VoiceCode | None = None
+        self._voice_started = False
+        self._voice_fault_reported = False
         self._processing = False
         self._indicator_fault = False
         self._save_fault = False
@@ -472,12 +471,6 @@ class WeighingStationWorker:
                     case WorkerState.RECOVER:
                         self.state = self.recover()
             
-            except VoiceTimeoutError as e:
-                self.record_failure("hw.speaker.timeout", e)
-                self.cycle.invalidate()
-                self._indicator_fault = True
-                self.state = self._resume_state()
-
             except ValueError as e:
                 self.cycle.invalidate()
                 self._indicator_fault = True
@@ -531,16 +524,30 @@ class WeighingStationWorker:
             self.failures.failure(event, exc)
 
     def exchange(self, request: RequestPacket) -> ResponsePacket:
+        voice = getattr(request, "voice_code", VoiceCode.NONE)
+        if voice != VoiceCode.NONE:
+            # Remember the command before I/O: a lost response does not prove
+            # that the device failed to receive or start it.
+            self._pending_voice = voice
+            self._voice_started = False
+            self._voice_fault_reported = False
         try:
             response = self.client.send_and_receive(request)
         except Exception as exc:
+            self._voice_status = None
             self.cycle.invalidate()
             self._indicator_fault = True
-            # Voice polling handles parse errors locally, so capture failures here too.
             if not self.stop_event.is_set():
                 self._set_connection_status("disconnected" if isinstance(exc, serial.SerialException) else "error")
+                if self._pending_voice is not None and not self._voice_fault_reported:
+                    self._voice_fault_reported = True
+                    self.logger.warning(
+                        "hw.speaker.playback_uncertain", voice_code=self._pending_voice.name,
+                        reason="response_lost", action="suppress_voice_until_busy_then_idle",
+                    )
             raise
         if not self.stop_event.is_set():
+            self._observe_voice(response.voice_code)
             if self._valid_weighing_response(response):
                 previous_state = self.cycle.state
                 self.last_weight = response.weight_value
@@ -580,6 +587,19 @@ class WeighingStationWorker:
                     self._notify_live_weight()
         self.failures.success()
         return response
+
+    def _observe_voice(self, voice: VoiceCode):
+        self._voice_status = voice
+        if self._pending_voice is None:
+            return
+        if voice == self._pending_voice:
+            self._voice_started = True
+        elif voice == VoiceCode.NONE and self._voice_started:
+            if self._voice_fault_reported:
+                self.logger.info("hw.speaker.recovered", voice_code=self._pending_voice.name)
+            self._pending_voice = None
+            self._voice_started = False
+            self._voice_fault_reported = False
 
     @staticmethod
     def _valid_live_response(response: ResponsePacket) -> bool:
@@ -648,42 +668,61 @@ class WeighingStationWorker:
 
     def poll_until_voice_ends(
         self, base_request: DisplayRequestPacket, *, accept_card: bool = False,
+        is_current: Callable[[], bool] | None = None,
     ) -> ResponsePacket | None:
+        """Wait for normal guidance, but never cancel a weighing for voice alone.
+
+        An unobserved start is ambiguous: 00 can precede delayed playback.
+        Retain that outstanding command until its Busy -> 00 is observed, even
+        across reconnects. There is no documented stop or maximum start delay.
+        Subsequent guidance is skipped, not queued for a later vehicle.
+        """
         response = None
         voice = base_request.voice_code
-        if voice != VoiceCode.NONE:
-            self.logger.info("hw.speaker.on", voice_code=voice.name)
-        deadline = time.monotonic() + self.voice_timeout
-        sent = False
-        acknowledged = voice == VoiceCode.NONE
-        while not self.stop_event.is_set():
-            if time.monotonic() >= deadline:
-                raise VoiceTimeoutError(f"Voice {voice.name} did not finish within {self.voice_timeout}s")
-            # Send the command only once, even when its acknowledgement is lost.
-            # Recompute lamps so a card accepted during TAG_CARD immediately means busy.
+        ready_sequence = self.cycle.ready_sequence
+
+        def poll(code: VoiceCode) -> ResponsePacket:
+            can_accept_card = accept_card and self.cycle.ready_sequence == ready_sequence
             request = self._display_request(
-                voice_code=VoiceCode.NONE if sent else voice,
+                voice_code=code,
                 error=base_request.red_blink and not base_request.green_blink,
             )
-            if not accept_card and request.green_blink and not request.red_blink:
-                # A new vehicle can arrive during a rejection announcement.
-                # Only advertise readiness when this loop actually accepts cards.
+            if not can_accept_card and request.green_blink and not request.red_blink:
                 request = dataclasses.replace(request, green_blink=False)
-            sent = True
-            try:
-                response = self.exchange(request)
-            except ValueError as exc:
-                if not self.stop_event.is_set():
-                    self.failures.failure(
-                        "hw.protocol.parse_error", exc, level=logging.WARNING, action="ignore_and_continue",
-                    )
-            else:
-                if accept_card:
-                    self._accept_card(response)
-                acknowledged |= response.voice_code == voice
-                if acknowledged and response.voice_code == VoiceCode.NONE:
-                    return response
+            response = self.exchange(request)
+            if can_accept_card and self.cycle.ready_sequence == ready_sequence:
+                self._accept_card(response)
+            return response
+
+        if self.stop_event.is_set() or (is_current is not None and not is_current()):
+            return None
+        if voice == VoiceCode.NONE:
+            return poll(VoiceCode.NONE)
+        if self._voice_status != VoiceCode.NONE or self._pending_voice is not None:
+            # Refresh unknown/busy status without issuing a voice command. Do
+            # not spend another timeout on every subsequent business stage.
+            response = poll(VoiceCode.NONE)
+        if self.stop_event.is_set() or (is_current is not None and not is_current()):
+            return response
+        if self._voice_status != VoiceCode.NONE or self._pending_voice is not None:
+            self.logger.debug("hw.speaker.skipped", voice_code=voice.name, reason="previous_voice_unfinished")
+            return response
+
+        self.logger.info("hw.speaker.on", voice_code=voice.name)
+        deadline = time.monotonic() + self.voice_timeout
+        response = poll(voice)
+        while not self.stop_event.is_set() and self._pending_voice is not None:
+            if time.monotonic() >= deadline:
+                self._voice_fault_reported = True
+                self.logger.warning(
+                    "hw.speaker.timeout", voice_code=voice.name,
+                    reason="still_busy" if self._voice_started else "start_unobserved",
+                    action="continue_weighing_suppress_voice_until_busy_then_idle",
+                )
+                return response
             self.stop_event.wait(self.polling_interval)
+            if not self.stop_event.is_set():
+                response = poll(VoiceCode.NONE)
         return response
 
     def initialize(self) -> WorkerState:
@@ -691,6 +730,8 @@ class WeighingStationWorker:
         return WorkerState.CONNECT
 
     def connect(self) -> WorkerState:
+        # Reopening a serial port neither stops playback nor cancels a command.
+        self._voice_status = None
         self.logger.debug("hw.serial.connecting")
         self.client.connect()
         self._set_connection_status("connected")
@@ -705,9 +746,11 @@ class WeighingStationWorker:
             return WorkerState.VERIFY
 
         if self.cycle.state == CycleState.READY and self._ready_announced != self.cycle.ready_sequence:
-            self._ready_announced = self.cycle.ready_sequence
+            sequence = self._ready_announced = self.cycle.ready_sequence
             self.poll_until_voice_ends(
                 self._display_request(voice_code=VoiceCode.TAG_CARD), accept_card=True,
+                is_current=lambda: self.cycle.ready_sequence == sequence
+                and self.cycle.state == CycleState.READY and not self._processing,
             )
             if self._processing and self.cycle.state == CycleState.RESERVED:
                 return WorkerState.VERIFY
@@ -718,7 +761,14 @@ class WeighingStationWorker:
         elif response.rfid_card_uid != "00000000" and time.monotonic() >= self._next_rejected_announcement:
             self._next_rejected_announcement = time.monotonic() + 10.0
             voice = VoiceCode.WEIGHT_COMPLETE if self._visit_saved else VoiceCode.STAND_BY
-            self.poll_until_voice_ends(self._display_request(voice_code=voice))
+            sequence = self.cycle.ready_sequence
+            self.poll_until_voice_ends(
+                self._display_request(voice_code=voice),
+                is_current=lambda: self.cycle.ready_sequence == sequence and (
+                    self._visit_saved if voice == VoiceCode.WEIGHT_COMPLETE
+                    else self.cycle.state in (CycleState.WAIT_EMPTY, CycleState.WAIT_ENTRY)
+                ),
+            )
 
         self.stop_event.wait(self.polling_interval)
         return WorkerState.IDLE
@@ -726,7 +776,11 @@ class WeighingStationWorker:
     def verify(self) -> WorkerState:
         self.logger.info("biz.rfid_card.verifying", rfid_card_uid=self.last_plate)
         request = self._display_request(voice_code=VoiceCode.PLEASE_WAIT)
-        response = self.poll_until_voice_ends(request)
+        sequence = self.cycle.ready_sequence
+        card_is_current = lambda: (
+            self.cycle.state == CycleState.RESERVED and self.cycle.ready_sequence == sequence
+        )
+        response = self.poll_until_voice_ends(request, is_current=card_is_current)
         if self.stop_event.is_set():
             return WorkerState.IDLE
         
@@ -738,7 +792,7 @@ class WeighingStationWorker:
         if not is_valid:
             self.logger.info("biz.rfid_card.unregistered", next_state="IDLE")
             request = self._display_request(voice_code=VoiceCode.UNREGISTERED_CARD, error=True)
-            self.poll_until_voice_ends(request)
+            self.poll_until_voice_ends(request, is_current=card_is_current)
             self.cycle.release()
             self._processing = False
             self.last_plate = ""
@@ -837,7 +891,7 @@ class WeighingStationWorker:
         self.logger.info("hw.weighing.completed", next_state="PRINT")
 
         request = self._display_request(voice_code=VoiceCode.WEIGHT_COMPLETE)
-        response = self.poll_until_voice_ends(request)
+        response = self.poll_until_voice_ends(request, is_current=lambda: self._visit_saved)
         return WorkerState.PRINT
     
     def print(self) -> WorkerState:
@@ -853,7 +907,7 @@ class WeighingStationWorker:
             self.exchange(request)
 
         request = self._display_request(voice_code=VoiceCode.THANK_YOU)
-        response = self.poll_until_voice_ends(request)
+        response = self.poll_until_voice_ends(request, is_current=lambda: self._visit_saved)
 
         self.last_plate = ""
         self.last_event = None
