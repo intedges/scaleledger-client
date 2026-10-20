@@ -361,7 +361,7 @@ class WeighingStationWorker:
         retry_interval: float = 1.0,
         initial_sample_seq: int = 0,
         on_live_weight: Callable[[LiveWeightSnapshot], None] | None = None,
-        vehicle_threshold: Decimal = Decimal("100"),
+        vehicle_threshold: Decimal = Decimal("50"),
         vehicle_confirm_seconds: float = 3.0,
         voice_timeout: float = 15.0,
     ):

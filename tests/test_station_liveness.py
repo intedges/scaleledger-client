@@ -105,7 +105,7 @@ class ContinuousScale:
         )
         weight = Decimal("120") if visit else Decimal("0")
         if self.jitter and 9.0 <= self.clock.now < 10.0:
-            weight = Decimal("100")
+            weight = Decimal("50")
         # A driver tags whenever the reader advertises readiness, then repeats
         # the tag through processing/exit. The worker, not this device, decides
         # which tags to consume. Distinct visit IDs expose delayed-card mistakes.
@@ -177,7 +177,7 @@ class StationLivenessTests(unittest.TestCase):
                 scale, on_event=on_event, rfid_validator=validator,
                 receipt_builder=lambda event: event.uuid.encode(),
                 polling_interval=0.1, retry_interval=0.2,
-                vehicle_threshold=Decimal("100"), vehicle_confirm_seconds=3,
+                vehicle_confirm_seconds=3,
                 voice_timeout=2,
             )
             worker.stop_event = BoundedSimulationStop(clock, 88)
