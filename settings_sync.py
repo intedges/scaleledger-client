@@ -65,26 +65,12 @@ class SettingsSnapshot:
         return self._gateway.name
 
     @classmethod
-    def from_responses(
-        cls, gateway, stations, species, producers, rfid_cards, *, mac_address, access_token,
-    ):
+    def from_responses(cls, gateway, stations, species, producers, rfid_cards):
         if not isinstance(gateway, dict):
             raise ValueError("Gateway must be an object")
-        if gateway["mac_address"] != mac_address:
-            raise ValueError("Gateway does not belong to this client")
-        if not isinstance(access_token, str) or not access_token:
-            raise ValueError("Validated gateway credentials are required")
+        # The credential selects the Gateway; keep only what offline restarts need.
         gateway_model = _validate(Gateway,
-            id=_identifier(gateway["id"], "Gateway ID"),
-            mac_address=gateway["mac_address"],
-            hostname=gateway["hostname"],
-            ip_address=gateway["ip_address"],
-            name=gateway["name"],
-            description=gateway["description"],
-            access_token=access_token,
-            last_heartbeat=gateway.get("last_heartbeat"),
-            created_at=gateway["created_at"],
-            updated_at=gateway["updated_at"],
+            id=_identifier(gateway["id"], "Gateway ID"), name=gateway["name"],
         )
 
         station_models = []

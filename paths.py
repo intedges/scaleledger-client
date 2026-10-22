@@ -29,6 +29,10 @@ class AppPaths:
         return self.data_dir / "db.sqlite3"
 
     @property
+    def credential_file(self) -> Path:
+        return self.data_dir / "credential.json"
+
+    @property
     def lock_file(self) -> Path:
         return self.data_dir / "client.lock"
 

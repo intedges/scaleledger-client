@@ -1,12 +1,13 @@
 import asyncio
 from contextlib import suppress
+from http import HTTPStatus
 import json
 import unittest
 from unittest.mock import AsyncMock, Mock
 
 import websockets
-from websockets.protocol import State
 
+from api import AuthDegradedError
 from logconfig import RepeatedFailureLog
 from main import HeadlessClient
 
@@ -16,13 +17,11 @@ class WebSocketReconnectionTests(unittest.IsolatedAsyncioTestCase):
     def make_client(base_url):
         client = object.__new__(HeadlessClient)
         client.ws_url = base_url
-        client.provisioning_url = f"{base_url}/ws/devices/gateways/provisioning/"
         client.ws_kwargs = {}
         client.retry_interval = 0.01
         client.gateway_id = 1
         client._gateway_data = {"id": 1}
         client.access_token = "test-token"
-        client.mac_address = "00:11:22:33:44:55"
         client.hostname = "test-gateway"
         client.server_host = "127.0.0.1"
         client.logger = Mock()
@@ -66,38 +65,36 @@ class WebSocketReconnectionTests(unittest.IsolatedAsyncioTestCase):
                         with suppress(asyncio.CancelledError):
                             await task
 
-    async def test_provisioning_reconnects_and_closes_before_registration_handover(self):
-        connections = []
-        identities = []
+    async def test_control_socket_presents_the_credential(self):
+        authorizations = []
+        received = asyncio.Event()
 
         async def handler(ws):
-            connections.append(ws)
-            await ws.send(json.dumps({"type": "identify"}))
-            identities.append(json.loads(await ws.recv()))
-            if len(connections) == 1:
-                await ws.close(code=1000)
-            else:
-                await ws.send(json.dumps({
-                    "type": "gateway.registered",
-                    "payload": {"access_token": "new-test-token"},
-                }))
-                await ws.wait_closed()
+            authorizations.append(ws.request.headers["Authorization"])
+            received.set()
+            await ws.wait_closed()
 
         async with websockets.serve(handler, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             client = self.make_client(f"ws://127.0.0.1:{port}")
-            client.access_token = None
-            await asyncio.wait_for(client.run_provisioning_loop(), timeout=2)
+            task = asyncio.create_task(client.run_active_ws_loop())
+            try:
+                await asyncio.wait_for(received.wait(), timeout=2)
+            finally:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
-            self.assertEqual(len(connections), 2)
-            self.assertEqual(identities, [{
-                "type": "identity",
-                "payload": {
-                    "mac_address": "00:11:22:33:44:55",
-                    "hostname": "test-gateway",
-                    "ip_address": "127.0.0.1",
-                },
-            }] * 2)
-            self.assertEqual(client.access_token, "new-test-token")
-            self.assertIsNone(client.gateway_id)
-            self.assertIs(connections[-1].state, State.CLOSED)
+        self.assertEqual(authorizations, ["Gateway test-token"])
+
+    async def test_rejected_control_handshake_returns_to_the_enrollment_check(self):
+        for status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+            with self.subTest(status=status):
+                async def reject(connection, request):
+                    return connection.respond(status, "Rejected")
+
+                async with websockets.serve(AsyncMock(), "127.0.0.1", 0, process_request=reject) as server:
+                    port = server.sockets[0].getsockname()[1]
+                    client = self.make_client(f"ws://127.0.0.1:{port}")
+                    with self.assertRaises(AuthDegradedError):
+                        await asyncio.wait_for(client.run_active_ws_loop(), timeout=2)

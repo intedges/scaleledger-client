@@ -207,16 +207,17 @@ class CooperativeShutdownTests(unittest.IsolatedAsyncioTestCase):
         stop_observed = asyncio.Event()
         order = []
         consumers = []
-        failure = RuntimeError("auth reset database unavailable")
+        failure = RuntimeError("auth reset failed")
         client = main.HeadlessClient(None, Path("unused.sqlite3"))
         client.logger = Mock()
         client.setup = AsyncMock()
         client.api_client = Mock()
-        client.access_token = "cached"
+        client.prepare_credential = AsyncMock(return_value=True)
+        client.wait_for_approval = AsyncMock()
         client.gateway_id = 1
         client.bootstrap = AsyncMock(return_value=True)
         client.run_active_loop = AsyncMock(side_effect=AuthDegradedError("token rejected"))
-        client.wipe_local_auth = AsyncMock(side_effect=failure)
+        client.forget_server_session = Mock(side_effect=failure)
         client.station_manager.stop_all = Mock()
         event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=41)
 
@@ -263,7 +264,7 @@ class CooperativeShutdownTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(consumers[0].cancelled())
                 await asyncio.wait_for(join_records(), timeout=1)
                 client.close.assert_awaited_once()
-                client.wipe_local_auth.assert_awaited_once()
+                client.forget_server_session.assert_called_once()
             finally:
                 finish_write.set()
                 task.cancel()

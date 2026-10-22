@@ -19,7 +19,6 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         await Tortoise.init(db_url="sqlite://:memory:", modules={"models": ["models"]})
         await Tortoise.generate_schemas()
         self.now = datetime(2026, 10, 15, 12, tzinfo=UTC)
-        self.mac_address = "00:11:22:33:44:55"
         self.responses = self.make_responses(1, "Cached")
         await self.snapshot().persist()
         self.record = await Record.create(
@@ -33,10 +32,8 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
     def make_responses(self, identifier, label):
         return {
             "gateway": {
-                "id": identifier, "mac_address": self.mac_address,
-                "hostname": "test-gateway", "ip_address": "127.0.0.1",
-                "name": f"{label} gateway", "description": "",
-                "access_token": "untrusted-response-token", "last_heartbeat": None,
+                "id": identifier, "name": f"{label} gateway", "description": "",
+                "hostname": "test-gateway", "ip_address": "127.0.0.1", "last_heartbeat": None,
                 "created_at": self.now.isoformat(), "updated_at": self.now.isoformat(),
             },
             "stations": [{
@@ -58,10 +55,7 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         }
 
     def snapshot(self, responses=None):
-        return SettingsSnapshot.from_responses(
-            **(responses if responses is not None else self.responses),
-            mac_address=self.mac_address, access_token="verified-token",
-        )
+        return SettingsSnapshot.from_responses(**(responses if responses is not None else self.responses))
 
     async def stored_state(self):
         return {
@@ -84,7 +78,7 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         await snapshot.persist()
 
         self.assertEqual(await Gateway.all().values_list("id", flat=True), [2])
-        self.assertEqual((await Gateway.get(id=2)).access_token, "verified-token")
+        self.assertEqual(await Gateway.all().values(), [{"id": 2, "name": "Updated gateway"}])
         self.assertEqual(await WeighingStation.all().values_list("id", flat=True), [2])
         self.assertEqual((await WeighingStation.get(id=2)).gateway_id, 2)
         self.assertEqual(await Species.all().values_list("id", flat=True), [2])
@@ -122,6 +116,11 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         await self.snapshot().persist()
         self.assertEqual((await RFIDCard.get(id=2)).uid, "card-2")
 
+    async def test_gateway_needs_only_its_id_and_name(self):
+        self.responses["gateway"] = {"id": 2, "name": "Updated gateway"}
+        await self.snapshot().persist()
+        self.assertEqual(await Gateway.all().values(), [{"id": 2, "name": "Updated gateway"}])
+
     async def test_inactive_cards_stay_in_cache_with_inactive_flag(self):
         self.responses["rfid_cards"][0]["is_active"] = False
         snapshot = self.snapshot()
@@ -147,7 +146,8 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
             row = data[section] if section == "gateway" else data[section][0]
             del row[key]
             cases.append((f"missing {section}.{key}", data))
-        malformed("gateway", "mac_address", "AA:BB:CC:DD:EE:FF")
+        malformed("gateway", "id", "2")
+        malformed("gateway", "name", "X" * 101)
         malformed("stations", "gateway", 99)
         malformed("rfid_cards", "producer", 99)
         malformed("rfid_cards", "species", 99)
@@ -159,7 +159,6 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         malformed("species", "name", None)
         malformed("stations", "serial_port", "X" * 101)
         malformed("rfid_cards", "uuid", "not-a-uuid")
-        malformed("gateway", "created_at", "not-a-date")
         malformed("stations", "serial_port", {"port": "COM2"})
         malformed("species", "name", [])
         malformed("gateway", "name", 123)
@@ -168,7 +167,6 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         malformed("rfid_cards", "uuid", 123)
         malformed("producers", "uuid", {"uuid": str(uuid.uuid4())})
         malformed("producers", "created_at", 12345678)
-        malformed("gateway", "last_heartbeat", False)
         malformed("rfid_cards", "issued_at", [self.now.isoformat()])
         for section in ("stations", "species", "producers", "rfid_cards"):
             for value in (None, {}, {"results": []}, [None]):

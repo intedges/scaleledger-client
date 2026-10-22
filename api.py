@@ -26,6 +26,22 @@ class APIClient:
     async def close(self):
         await self.client.aclose()
 
+    async def request_enrollment(self, access_token: str, hostname: str, ip_address: str) -> str:
+        headers = {"Authorization": f"Gateway {access_token}"}
+        payload = {"hostname": hostname, "ip_address": ip_address}
+        response = await self.client.post("devices/api/gateways/enrollment/", json=payload, headers=headers)
+        # A revoked credential is an answer, not a failure: the caller replaces it.
+        expected = {200: "approved", 202: "pending", 403: "revoked"}.get(response.status_code)
+        if expected is not None:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if isinstance(body, dict) and body.get("status") == expected:
+                return expected
+        response.raise_for_status()
+        raise ValueError(f"Unexpected enrollment response: HTTP {response.status_code}")
+
     async def retrieve_gateway_self(self, access_token: str) -> dict[str, Any]:
         headers = {"Authorization": f"Gateway {access_token}"}
         response = await self.client.get("devices/api/gateways/self/", headers=headers)

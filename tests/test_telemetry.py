@@ -765,6 +765,20 @@ class PublisherStartupTests(unittest.IsolatedAsyncioTestCase):
             publisher.run.assert_awaited_once()
         self.assertEqual(client._live_weight_stop_code, 4409)
 
+    async def test_rejected_credential_lets_a_renewed_approval_publish_again(self):
+        client = self.client()
+        client.logger = Mock()
+        client._station_config_ready.set()
+        publisher = Mock(run=AsyncMock(return_value=401))
+        with patch("main.LiveWeightPublisher", return_value=publisher) as constructor:
+            await client.run_live_weights_loop()
+            client.forget_server_session()
+            # The next approval completes a station sync before publishing again.
+            client._station_config_ready.set()
+            await client.run_live_weights_loop()
+        self.assertEqual(constructor.call_count, 2)
+        self.assertEqual(client._live_weight_stop_code, 401)
+
     async def test_control_and_ownership_refresh_share_serialized_snapshots(self):
         client = self.client()
         del client.sync_weighing_stations

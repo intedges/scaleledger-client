@@ -140,7 +140,7 @@ class WebsocketUrlTests(unittest.TestCase):
         self.assertEqual(websocket_url("http://http-server:8000"), "ws://http-server:8000")
 
     def test_http_and_websocket_use_the_same_encoded_path(self):
-        endpoint = "/ws/devices/gateways/provisioning/"
+        endpoint = "/ws/devices/gateways/1/"
         for prefix, expected in (
             ("my prefix", "/my%20prefix"),
             ("한글", "/%ED%95%9C%EA%B8%80"),
@@ -167,6 +167,7 @@ class AppPathsTests(unittest.TestCase):
         paths = AppPaths(root)
         self.assertEqual(paths.config_file, root / "config.toml")
         self.assertEqual(paths.db_file, root / "data" / "db.sqlite3")
+        self.assertEqual(paths.credential_file, root / "data" / "credential.json")
         self.assertEqual(paths.lock_file, root / "data" / "client.lock")
         self.assertEqual(paths.log_dir, root / "logs")
 
