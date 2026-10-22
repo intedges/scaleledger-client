@@ -2,7 +2,6 @@ from pathlib import Path
 import socket
 import sys
 from typing import Any, BinaryIO
-import uuid
 
 import serial.tools.list_ports
 
@@ -10,10 +9,6 @@ if sys.platform == "win32":
     import msvcrt
 else:
     import fcntl
-
-
-def get_mac_address() -> str:
-    return uuid.getnode().to_bytes(6).hex(":")
 
 
 def get_ip_address(server_host: str) -> str:
