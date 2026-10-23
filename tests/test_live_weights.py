@@ -1,7 +1,7 @@
 from concurrent.futures import Future
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -158,10 +158,11 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         )
         self.assertEqual([sample.sample_valid for sample in self.samples], [True, False, False, False, True, False])
 
-    def test_non_numeric_overload_preserves_parser_failure_with_no_false_measurement(self):
+    def test_non_numeric_overload_reports_error_with_no_false_measurement(self):
         self.serial.send_and_receive.side_effect = lambda request: ResponsePacket.from_bytes(response_bytes(b"     OL"))
-        with self.assertRaises(InvalidOperation):
-            self.worker.exchange(DisplayRequestPacket())
+        response = self.worker.exchange(DisplayRequestPacket())
+        self.assertIsNone(response.weight_value)
+        self.assertEqual(response.invalid_fields, ("weight_value",))
         sample = self.worker.get_live_weight()
         self.assertIsNone(sample.weight)
         self.assertEqual(sample.connection_status, "error")
@@ -181,7 +182,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
                 self.assertIsNotNone(current.sampled_at)
         self.assertEqual(self.worker.get_live_weight().sample_seq, 2)
 
-    def test_nonfinite_value_is_not_published_and_business_response_is_unchanged(self):
+    def test_nan_text_is_not_published_and_business_response_is_unchanged(self):
         self.serial.send_and_receive.return_value = ResponsePacket(weight_value=Decimal("2"))
         self.worker.exchange(DisplayRequestPacket())
         previous = self.worker.get_live_weight()
@@ -192,7 +193,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         current = self.worker.get_live_weight()
 
         self.assertIs(response, invalid)
-        self.assertTrue(response.weight_value.is_nan())
+        self.assertIsNone(response.weight_value)
         self.assertEqual(current.weight, Decimal("2"))
         self.assertEqual(current.sample_seq, previous.sample_seq)
         self.assertEqual(current.sampled_at, previous.sampled_at)
