@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
 import math
+import re
 from typing import ClassVar, Literal, Self
 
 import threading
@@ -23,6 +24,10 @@ from weighing_cycle import CycleState, WeighingCycle
 
 STX = 2
 ETX = 3
+RESPONSE_LENGTH = 53
+NO_CARD = "00000000"
+# Sign and six significant digits fill the 8-byte weight display of a request.
+DISPLAY_WEIGHT_FORMAT = "=+8.6"
 
 
 class CommandCode(StrEnum):
@@ -116,7 +121,7 @@ class DisplayRequestPacket(RequestPacket):
         # display_weight_bytes = f"{sign}{abs_weight:>7.7}".encode()  # 8 bytes
 
         # 아래 유효숫자 기반 표현형이 깔끔하지만 절대값이 999999보다 커지면 exponent 포함되며 8바이트 초과되니 주의
-        display_weight_bytes = f"{self.display_weight:=+8.6}".encode()  # 8 bytes
+        display_weight_bytes = format(self.display_weight, DISPLAY_WEIGHT_FORMAT).encode()  # 8 bytes
         display_plate_bytes = f"{self.display_plate[-6:]:>6}".encode()  # 6 bytes
 
         reserved1_bytes = b"000000"  # 6 bytes
@@ -186,101 +191,118 @@ class PrinterRequestPacket(RequestPacket):
 # TODO(donghyeon): Define communication packets for fan/heater settings
 
 
+# The indicator firmware cannot be changed, and a unit in the field sent NUL
+# bytes instead of digits. An unreadable field parses as None so that one value
+# no longer discards the whole response.
+_INTEGER = re.compile(r" *[+-]? *[0-9]+ *")
+_DECIMAL = re.compile(r" *[+-]? *[0-9]+(?:\.[0-9]*)? *")
+
+
+def _integer(text: str) -> int | None:
+    return int(text.replace(" ", "")) if _INTEGER.fullmatch(text) else None
+
+
+def _decimal(text: str) -> Decimal | None:
+    return Decimal(text.replace(" ", "")) if _DECIMAL.fullmatch(text) else None
+
+
+def _printable(text: str) -> str | None:
+    return text if text.isascii() and text.isprintable() else None
+
+
+def _card(text: str) -> str | None:
+    # Blank or control characters are not a tag; never announce them as a card.
+    return text if _printable(text) and text.strip() else None
+
+
+def _member[E: Enum](enum_type: type[E], value: object) -> E | None:
+    try:
+        return enum_type(value)
+    except ValueError:
+        return None
+
+
+def _relay(text: str) -> RelayCode | None:
+    # *주의* hex 표현 아님: 0, 1, ..., 9, A, B, C, D, E, F
+    # ascii 코드 순서 형태: 0, 1, ..., 9, :, ;, <, =, >, ?
+    if not all("0" <= char <= "?" for char in text):
+        return None
+    return RelayCode(((ord(text[0]) - ord("0")) << 4) | (ord(text[1]) - ord("0")))
+
+
 @dataclass(frozen=True)
 class ResponsePacket:
-    device_id: int = 0
-    command_code: CommandCode = CommandCode.DISPLAY
-    rfid_card_uid: str = "00000000"
-    user_command_code: InputCode = InputCode.NONE
+    device_id: int | None = 0
+    command_code: CommandCode | None = CommandCode.DISPLAY
+    rfid_card_uid: str | None = NO_CARD
+    user_command_code: InputCode | None = InputCode.NONE
     user_input: str = "000000"
-    green_blink: bool = False
-    red_blink: bool = False
-    fan_on: bool = False
-    heater_on: bool = False
+    green_blink: bool | None = False
+    red_blink: bool | None = False
+    fan_on: bool | None = False
+    heater_on: bool | None = False
     unknown_input: str = "00"
-    voice_code: VoiceCode = VoiceCode.NONE
-    inner_temperature: int = 0
-    fan_trigger_temp: int = 30
-    heater_trigger_temp: int = 5
-    printer_status: PrinterStatus = PrinterStatus.NORMAL
+    voice_code: VoiceCode | None = VoiceCode.NONE
+    inner_temperature: int | None = 0
+    fan_trigger_temp: int | None = 30
+    heater_trigger_temp: int | None = 5
+    printer_status: PrinterStatus | None = PrinterStatus.NORMAL
     reserved: str = "0000"
-    weight_status: WeightStatus = WeightStatus.STABLE
-    weight_type: WeightType = WeightType.NET
-    weight_value: Decimal = Decimal("0")
-    weight_unit: str = "kg"
+    weight_status: WeightStatus | None = WeightStatus.STABLE
+    weight_type: WeightType | None = WeightType.NET
+    weight_value: Decimal | None = Decimal("0")
+    weight_unit: str | None = "kg"
+    # Fields above that could not be read; the worker uses the remaining ones.
+    invalid_fields: tuple[str, ...] = ()
+    raw: bytes = dataclasses.field(default=b"", repr=False)
+
+    @property
+    def has_card(self) -> bool:
+        return self.rfid_card_uid not in (None, NO_CARD)
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> Self:
-        if len(raw) != 53:
-            raise ValueError(f"Invalid response packet length: {len(raw)} bytes")
+        # Only the frame is mandatory: without it no field can be located.
+        if len(raw) != RESPONSE_LENGTH:
+            raise ValueError(f"Invalid response packet length: {len(raw)} bytes {raw.hex(' ')}".rstrip())
         if raw[0] != STX or raw[-1] != ETX:
-            raise ValueError("Invalid STX/ETX")
+            raise ValueError(f"Invalid STX/ETX: {raw.hex(' ')}")
 
-        data = raw.decode(errors="replace")
+        # Latin-1 maps each byte to one character, so offsets never shift.
+        data = raw.decode("latin-1")
+        relay_code = _relay(data[18:20])
 
-        device_id = int(data[1])
+        def relay(flag: RelayCode) -> bool | None:
+            return None if relay_code is None else flag in relay_code
 
-        command_code = CommandCode(data[2])
-
-        rfid_card_uid = data[3:11]
-
-        user_command_code = InputCode(data[11])
-        user_input = data[12:18]
-
-        # *주의* hex 표현 아님: 0, 1, ..., 9, A, B, C, D, E, F
-        # ascii 코드 순서 형태: 0, 1, ..., 9, :, ;, <, =, >, ?
-        relay_str = data[18:20]
-        high_nibble = ord(relay_str[0]) - ord("0")
-        low_nibble  = ord(relay_str[1]) - ord("0")
-        relay_value = (high_nibble << 4) | low_nibble
-        relay_code = RelayCode(relay_value)
-
-        green_blink = RelayCode.GREEN in relay_code
-        red_blink = RelayCode.RED in relay_code
-        fan_on = RelayCode.FAN in relay_code
-        heater_on = RelayCode.HEATER in relay_code
-
-        unknown_input = data[20:22]
-
-        voice_code = VoiceCode(int(data[22:24]))
-
-        inner_temperature = int(data[24:27])
-        fan_trigger_temp = int(data[27:29])
-        heater_trigger_temp = int(data[29:31])
-
-        printer_status = PrinterStatus(int(data[31]))
-
-        reserved = data[32:36]
-
-        weight_status = WeightStatus(data[36:38])
-        # assert data[38] == ","
-        weight_type = WeightType(data[39:41])
-        # assert data[41] == ","
-        sign = data[42]
-        abs_weight = data[43:50].strip()
-        weight_value = Decimal(f"{sign}{abs_weight}")
-        weight_unit = data[50:52]
-
+        fields = dict(
+            device_id=_integer(data[1]),
+            command_code=_member(CommandCode, data[2]),
+            rfid_card_uid=_card(data[3:11]),
+            user_command_code=_member(InputCode, data[11]),
+            user_input=data[12:18],
+            green_blink=relay(RelayCode.GREEN),
+            red_blink=relay(RelayCode.RED),
+            fan_on=relay(RelayCode.FAN),
+            heater_on=relay(RelayCode.HEATER),
+            unknown_input=data[20:22],
+            voice_code=_member(VoiceCode, _integer(data[22:24])),
+            # The temperature carries a sign, e.g. "+28".
+            inner_temperature=_integer(data[24:27]),
+            fan_trigger_temp=_integer(data[27:29]),
+            heater_trigger_temp=_integer(data[29:31]),
+            printer_status=_member(PrinterStatus, _integer(data[31])),
+            reserved=data[32:36],
+            # "ST,NT,+12345.6kg"; the device fills it with "0" without indicator data.
+            weight_status=_member(WeightStatus, data[36:38]),
+            weight_type=_member(WeightType, data[39:41]),
+            weight_value=_decimal(data[42:50]),
+            weight_unit=_printable(data[50:52]),
+        )
         return cls(
-            device_id=device_id,
-            command_code=command_code,
-            rfid_card_uid=rfid_card_uid,
-            user_command_code=user_command_code,
-            user_input=user_input,
-            green_blink=green_blink,
-            red_blink=red_blink,
-            fan_on=fan_on,
-            heater_on=heater_on,
-            unknown_input=unknown_input,
-            voice_code=voice_code,
-            inner_temperature=inner_temperature,
-            fan_trigger_temp=fan_trigger_temp,
-            heater_trigger_temp=heater_trigger_temp,
-            printer_status=printer_status,
-            weight_status=weight_status,
-            weight_type=weight_type,
-            weight_value=weight_value,
-            weight_unit=weight_unit,
+            **fields,
+            invalid_fields=tuple(name for name, value in fields.items() if value is None),
+            raw=raw,
         )
 
 
@@ -315,8 +337,11 @@ class SerialClient:
         if self.serial is None or not self.serial.is_open:
             raise serial.SerialException("Serial port is not connected")
         
+        # Drop late or stray bytes so an earlier fault cannot shift this frame,
+        # and read the fixed length: a field byte may itself equal ETX.
+        self.serial.reset_input_buffer()
         self.serial.write(request.to_bytes())
-        response = self.serial.read_until(expected=bytes([ETX]))
+        response = self.serial.read(RESPONSE_LENGTH)
         return ResponsePacket.from_bytes(response)
 
 
@@ -387,6 +412,7 @@ class WeighingStationWorker:
         self._next_rejected_announcement = 0.0
         self._next_save_announcement = 0.0
         self._visit_saved = False
+        self._reported_invalid_fields: set[str] = set()
 
         self.state = WorkerState.INITIALIZE
         self.last_weight = Decimal("0")
@@ -548,6 +574,7 @@ class WeighingStationWorker:
             raise
         if not self.stop_event.is_set():
             self._observe_voice(response.voice_code)
+            self._report_invalid_fields(response)
             if self._valid_weighing_response(response):
                 previous_state = self.cycle.state
                 self.last_weight = response.weight_value
@@ -601,25 +628,42 @@ class WeighingStationWorker:
             self._voice_started = False
             self._voice_fault_reported = False
 
+    def _report_invalid_fields(self, response: ResponsePacket):
+        # Unreadable weight pauses weighing, voice skips guidance and a card is
+        # ignored; other fields are unused. Report each field once per worker.
+        new_fields = set(response.invalid_fields) - self._reported_invalid_fields
+        if new_fields:
+            self._reported_invalid_fields |= new_fields
+            self.logger.warning(
+                "hw.protocol.field_invalid", fields=list(response.invalid_fields),
+                raw=response.raw.hex(" "),
+            )
+
     @staticmethod
     def _valid_live_response(response: ResponsePacket) -> bool:
         # Keep the business parser unchanged while obeying the live API bounds.
         # Check the exponent before formatting so malformed tiny values cannot
         # allocate arbitrarily long fixed-point strings.
         weight = response.weight_value
+        unit = response.weight_unit
         return (
-            weight.is_finite()
+            weight is not None and unit is not None
+            and response.weight_status is not None and response.weight_type is not None
+            and weight.is_finite()
             and weight.copy_abs() <= Decimal("1000000000")
             and weight.as_tuple().exponent >= -30
             and len(format(weight, "f")) <= 32
-            and bool(response.weight_unit.strip())
-            and len(response.weight_unit) <= 8
+            and bool(unit.strip())
+            and len(unit) <= 8
         )
     
     @classmethod
     def _valid_weighing_response(cls, response: ResponsePacket) -> bool:
         return (
             cls._valid_live_response(response)
+            # Every request repeats the last weight; a larger value would need an
+            # exponent and break the fixed 32-byte request until restart.
+            and len(format(response.weight_value, DISPLAY_WEIGHT_FORMAT)) == 8
             and response.weight_unit.strip().lower() == "kg"
             and response.weight_status in (WeightStatus.STABLE, WeightStatus.UNSTABLE)
             and response.weight_type in (WeightType.NET, WeightType.GROSS)
@@ -640,7 +684,7 @@ class WeighingStationWorker:
 
     def _accept_card(self, response: ResponsePacket) -> bool:
         if (
-            response.rfid_card_uid == "00000000" or self._processing
+            not response.has_card or self._processing
             or self._pending_save is not None or self.stop_event.is_set()
             or not self.cycle.reserve(now=time.monotonic())
         ):
@@ -758,7 +802,7 @@ class WeighingStationWorker:
                 self._processing = False
                 self.last_plate = ""
                 self.last_event = None
-        elif response.rfid_card_uid != "00000000" and time.monotonic() >= self._next_rejected_announcement:
+        elif response.has_card and time.monotonic() >= self._next_rejected_announcement:
             self._next_rejected_announcement = time.monotonic() + 10.0
             voice = VoiceCode.WEIGHT_COMPLETE if self._visit_saved else VoiceCode.STAND_BY
             sequence = self.cycle.ready_sequence
