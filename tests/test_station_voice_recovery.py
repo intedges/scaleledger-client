@@ -14,8 +14,11 @@ from suwol1000 import (
     DisplayRequestPacket, PrinterRequestPacket, VoiceCode, WeighingStationWorker,
 )
 from tests.test_station_liveness import (
-    BoundedSimulationStop, ContinuousScale, SimulatedClock,
+    BoundedSimulationStop, ContinuousScale, SimulatedClock, simulated_wait,
 )
+
+
+VISIT_STARTS = {1: 6, 2: 46}
 
 
 class VoiceProtocolScale(ContinuousScale):
@@ -29,9 +32,11 @@ class VoiceProtocolScale(ContinuousScale):
 
     def __init__(self, clock, *, missing_voices=(), long_voice=None,
                  long_seconds=20.0, long_once=False, first_start_delay=0.0,
-                 tag_while_playing=False, fault=None, response_filter=None,
-                 initial_busy_until=0.0):
+                 tag_while_playing=False, tag_after=0.0, blind_tags=False, fault=None,
+                 response_filter=None, initial_busy_until=0.0):
         super().__init__(clock, repeat_tags=False, fault=fault)
+        # A driver who taps on every poll of a visit, whatever the lamps show.
+        self.blind_tags = blind_tags
         self.hidden_voices = set(missing_voices)
         self.long_voice = long_voice
         self.long_seconds = long_seconds
@@ -39,6 +44,7 @@ class VoiceProtocolScale(ContinuousScale):
         self.long_played = False
         self.first_start_delay = first_start_delay
         self.tag_while_playing = tag_while_playing
+        self.tag_after = tag_after
         self.response_filter = response_filter
         self.playing = VoiceCode.THANK_YOU if initial_busy_until else VoiceCode.NONE
         self.starts_at = 0.0
@@ -84,10 +90,15 @@ class VoiceProtocolScale(ContinuousScale):
             else VoiceCode.NONE
         )
         card = response.rfid_card_uid
-        if self.tag_while_playing and card != "00000000" and not (
-            voice == VoiceCode.NONE and current_voice == VoiceCode.TAG_CARD
+        visit = self.visit_at()
+        if self.blind_tags and visit:
+            card = "12345678" if visit == 1 else "87654321"
+        if card != "00000000" and (
+            at - VISIT_STARTS.get(visit, 0) < self.tag_after
+            or self.tag_while_playing
+            and not (voice == VoiceCode.NONE and current_voice == VoiceCode.TAG_CARD)
         ):
-            self.tagged_visits.discard(self.visit_at())
+            self.tagged_visits.discard(visit)
             card = "00000000"
         response = replace(response, voice_code=current_voice, rfid_card_uid=card)
         if self.response_filter is not None:
@@ -119,13 +130,12 @@ class StationVoiceRecoveryTests(unittest.TestCase):
 
         with patch("suwol1000.time.monotonic", clock), patch(
             "suwol1000.get_logger", return_value=logger,
-        ):
+        ), patch("suwol1000.wait", side_effect=simulated_wait(clock)):
             worker = WeighingStationWorker(
                 scale, station_id=7, on_event=on_event, rfid_validator=lambda event: True,
                 receipt_builder=lambda event: event.uuid.encode("ascii"),
                 on_live_weight=scale.live_snapshots.append,
                 polling_interval=0.1, retry_interval=0.2,
-                vehicle_confirm_seconds=3,
             )
             worker.stop_event = BoundedSimulationStop(clock, 88)
             scale.worker = worker
@@ -165,22 +175,70 @@ class StationVoiceRecoveryTests(unittest.TestCase):
             for _, _, _, request in scale.requests
         ), "a voice-only failure must not advertise a weighing/connection fault")
 
-    def test_normal_playback_preserves_guidance_and_print_order(self):
+    @staticmethod
+    def guidance(scale):
+        """Voices and receipts of each visit, including the thanks after it leaves."""
+        actions = {1: [], 2: []}
+        for at, _, _, request in scale.requests:
+            if at < VISIT_STARTS[1]:
+                continue
+            visit = 1 if at < VISIT_STARTS[2] else 2
+            if isinstance(request, PrinterRequestPacket):
+                actions[visit].append("print")
+            elif request.voice_code != VoiceCode.NONE:
+                actions[visit].append(request.voice_code)
+        return actions
+
+    @staticmethod
+    def voice_times(scale, voice, visit):
+        return [at for at, command_visit, code in scale.voice_commands
+                if code == voice and command_visit == visit]
+
+    def test_normal_guidance_prompts_prints_then_repeats_completion_until_departure(self):
         scale, submissions, accepted = self.simulate()
         self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
+        for visit, actions in self.guidance(scale).items():
+            with self.subTest(visit=visit):
+                self.assertEqual(actions[:3], [VoiceCode.TAG_CARD, "print", VoiceCode.WEIGHT_COMPLETE])
+                self.assertEqual(set(actions[2:-1]), {VoiceCode.WEIGHT_COMPLETE})
+                self.assertGreaterEqual(len(actions[2:-1]), 6)
+                self.assertEqual(actions[-1], VoiceCode.THANK_YOU)
+                completions = self.voice_times(scale, VoiceCode.WEIGHT_COMPLETE, visit)
+                gaps = [later - earlier for earlier, later in zip(completions, completions[1:])]
+                self.assertTrue(all(4.99 <= gap <= 5.25 for gap in gaps), gaps)
+        departures = [40, 80]
+        farewells = [at for at, _, voice in scale.voice_commands if voice == VoiceCode.THANK_YOU]
+        self.assertEqual(len(farewells), 2)
+        for departure, farewell in zip(departures, farewells):
+            self.assertTrue(departure <= farewell < departure + 1, farewells)
+
+    def test_card_prompt_repeats_every_five_seconds_until_the_card_is_tagged(self):
+        scale, submissions, accepted = self.simulate(tag_after=12)
+        self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
         for visit in (1, 2):
-            actions = []
-            for _, request_visit, _, request in scale.requests:
-                if request_visit != visit:
-                    continue
-                if isinstance(request, PrinterRequestPacket):
-                    actions.append("print")
-                elif request.voice_code != VoiceCode.NONE:
-                    actions.append(request.voice_code)
-            self.assertEqual(actions, [
-                VoiceCode.TAG_CARD, VoiceCode.PLEASE_WAIT,
-                VoiceCode.WEIGHT_COMPLETE, "print", VoiceCode.THANK_YOU,
-            ])
+            with self.subTest(visit=visit):
+                tagged_at = next(at for at, accepted_visit, _ in accepted if accepted_visit == visit)
+                self.assertGreaterEqual(tagged_at, VISIT_STARTS[visit] + 12)
+                prompts = self.voice_times(scale, VoiceCode.TAG_CARD, visit)
+                self.assertEqual(len(prompts), 3)
+                self.assertTrue(all(at < tagged_at for at in prompts))
+                gaps = [later - earlier for earlier, later in zip(prompts, prompts[1:])]
+                self.assertTrue(all(4.99 <= gap <= 5.25 for gap in gaps), gaps)
+                printed_at = next(
+                    at for at, request_visit, _, request in scale.requests
+                    if request_visit == visit and isinstance(request, PrinterRequestPacket)
+                )
+                self.assertLess(printed_at - tagged_at, 0.25)
+
+    def test_card_prompt_stops_when_the_vehicle_leaves_without_a_card(self):
+        scale, submissions, accepted = self.simulate(tag_after=float("inf"))
+        self.assertEqual((accepted, submissions, scale.printed), ([], [], []))
+        for visit, departure in ((1, 40), (2, 80)):
+            prompts = self.voice_times(scale, VoiceCode.TAG_CARD, visit)
+            self.assertGreaterEqual(len(prompts), 6)
+            self.assertTrue(all(at < departure for at in prompts))
+        self.assertFalse([at for at, visit, _ in scale.voice_commands if visit == 0])
+        self.assertEqual({voice for _, _, voice in scale.voice_commands}, {VoiceCode.TAG_CARD})
 
     def test_single_card_during_ready_guidance_is_preserved(self):
         scale, submissions, accepted = self.simulate(tag_while_playing=True)
@@ -198,7 +256,7 @@ class StationVoiceRecoveryTests(unittest.TestCase):
 
     def test_unobserved_voice_start_does_not_cancel_cards_or_skip_printing(self):
         for missing_voice in (
-            VoiceCode.TAG_CARD, VoiceCode.PLEASE_WAIT, VoiceCode.WEIGHT_COMPLETE,
+            VoiceCode.TAG_CARD, VoiceCode.WEIGHT_COMPLETE, VoiceCode.THANK_YOU,
         ):
             with self.subTest(missing_voice=missing_voice):
                 scale, submissions, accepted = self.simulate(missing_voices={missing_voice})
@@ -211,14 +269,18 @@ class StationVoiceRecoveryTests(unittest.TestCase):
     def test_twenty_second_busy_keeps_work_moving_without_another_voice(self):
         scale, submissions, accepted = self.simulate(long_voice=VoiceCode.TAG_CARD)
         self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
-        first_started, _, first_ended, _ = scale.playbacks[0]
+        first_sent, _, first_ended, _ = scale.playbacks[0]
         first_saved_at = next(at for at, visit, _ in submissions if visit == 1)
-        self.assertLess(first_saved_at, first_ended)
-        self.assertGreaterEqual(first_saved_at - first_started, 15)
+        self.assertLess(first_saved_at - first_sent, 0.25)
         self.assertFalse(any(
-            first_started < at < first_ended
+            first_sent < at < first_ended
             for at, _, _ in scale.voice_commands
         ))
+        # The vehicle is still on the platform, so completion follows the long prompt.
+        self.assertEqual(
+            next(voice for at, _, voice in scale.voice_commands if at >= first_ended),
+            VoiceCode.WEIGHT_COMPLETE,
+        )
 
     def test_permanent_busy_does_not_block_either_vehicle_or_send_more_voices(self):
         scale, submissions, accepted = self.simulate(
@@ -228,36 +290,39 @@ class StationVoiceRecoveryTests(unittest.TestCase):
         self.assertEqual([voice for _, _, voice in scale.voice_commands], [VoiceCode.TAG_CARD])
         self.assert_voice_only_failure_keeps_station_healthy(scale)
 
-    def test_completion_voice_timeout_still_prints_the_saved_record(self):
+    def test_endless_completion_voice_still_prints_the_next_vehicle(self):
         scale, submissions, accepted = self.simulate(
             long_voice=VoiceCode.WEIGHT_COMPLETE, long_seconds=float("inf"),
         )
         self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
         self.assertEqual([voice for _, _, voice in scale.voice_commands], [
-            VoiceCode.TAG_CARD, VoiceCode.PLEASE_WAIT, VoiceCode.WEIGHT_COMPLETE,
+            VoiceCode.TAG_CARD, VoiceCode.WEIGHT_COMPLETE,
         ])
         first_print_at = next(
             at for at, visit, _, request in scale.requests
             if visit == 1 and isinstance(request, PrinterRequestPacket)
         )
-        complete_at = scale.voice_commands[-1][0]
-        self.assertGreaterEqual(first_print_at - complete_at, 15)
+        self.assertLess(first_print_at, scale.voice_commands[-1][0])
+        self.assert_voice_only_failure_keeps_station_healthy(scale)
 
-    def test_busy_recovery_does_not_replay_guidance_from_the_previous_visit(self):
+    def test_busy_farewell_does_not_replay_guidance_from_the_previous_visit(self):
         scale, submissions, accepted = self.simulate(
-            long_voice=VoiceCode.WEIGHT_COMPLETE, long_seconds=20, long_once=True,
+            long_voice=VoiceCode.THANK_YOU, long_seconds=20, long_once=True,
         )
         self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
-        first_voices = [voice for _, visit, voice in scale.voice_commands if visit == 1]
-        second_voices = [voice for _, visit, voice in scale.voice_commands if visit == 2]
-        self.assertEqual(first_voices, [
-            VoiceCode.TAG_CARD, VoiceCode.PLEASE_WAIT, VoiceCode.WEIGHT_COMPLETE,
-        ])
-        self.assertEqual(second_voices, [
-            VoiceCode.TAG_CARD, VoiceCode.PLEASE_WAIT, VoiceCode.WEIGHT_COMPLETE,
-            VoiceCode.THANK_YOU,
-        ])
-        self.assertFalse(any(visit == 0 for _, visit, _ in scale.voice_commands))
+        _, _, farewell_ended, _ = next(
+            playback for playback in scale.playbacks if playback[3] == VoiceCode.THANK_YOU
+        )
+        second_print_at = next(
+            at for at, visit, _, request in scale.requests
+            if visit == 2 and isinstance(request, PrinterRequestPacket)
+        )
+        self.assertLess(second_print_at, farewell_ended)
+        # The next vehicle tagged during the long thanks; only its own completion follows.
+        after = [voice for at, _, voice in scale.voice_commands if at >= farewell_ended]
+        self.assertEqual(after[0], VoiceCode.WEIGHT_COMPLETE)
+        self.assertNotIn(VoiceCode.TAG_CARD, after)
+        self.assertEqual(after[-1], VoiceCode.THANK_YOU)
 
     def test_delayed_start_00_is_not_permission_for_a_second_voice(self):
         scale, submissions, accepted = self.simulate(first_start_delay=20)
@@ -272,45 +337,39 @@ class StationVoiceRecoveryTests(unittest.TestCase):
         self.assertFalse(any(
             first_sent < at < first_ended for at, _, _ in scale.voice_commands
         ))
-        self.assertEqual(
-            [voice for _, visit, voice in scale.voice_commands if visit == 1],
-            [VoiceCode.TAG_CARD],
-        )
-        self.assertEqual(
-            [voice for _, visit, voice in scale.voice_commands if visit == 2],
-            [VoiceCode.TAG_CARD, VoiceCode.PLEASE_WAIT,
-             VoiceCode.WEIGHT_COMPLETE, VoiceCode.THANK_YOU],
-        )
+        # Guidance resumes for the weighed vehicle once its playback is seen to end.
+        resumed = [voice for at, _, voice in scale.voice_commands if first_ended <= at < 40]
+        self.assertTrue(resumed)
+        self.assertEqual(set(resumed), {VoiceCode.WEIGHT_COMPLETE})
 
-    def test_voice_failure_does_not_bypass_invalid_weight_departure_or_connection_loss(self):
-        for condition in ("invalid_weight", "departure", "connection_loss"):
+    def test_suppressed_guidance_does_not_admit_cards_without_a_valid_vehicle(self):
+        for condition in ("invalid_weight", "empty_platform"):
             with self.subTest(condition=condition):
                 def filter_response(at, response):
-                    if 12 <= at < 40 and condition != "connection_loss":
+                    if at >= VISIT_STARTS[2]:
                         weight = Decimal("NaN") if condition == "invalid_weight" else Decimal("0")
                         return replace(response, weight_value=weight)
                     return response
 
-                def fault(request, scale):
-                    return condition == "connection_loss" and scale.clock.now >= 12
-
+                # The first completion notice is never seen to play, so guidance stays
+                # suppressed while the second visit's tags keep arriving.
                 scale, submissions, accepted = self.simulate(
-                    missing_voices={VoiceCode.TAG_CARD},
-                    response_filter=filter_response, fault=fault,
+                    missing_voices={VoiceCode.WEIGHT_COMPLETE}, blind_tags=True,
+                    response_filter=filter_response,
                 )
-                self.assertEqual(Counter(visit for _, visit, _ in accepted), {1: 1, 2: 1})
-                self.assertEqual(len(submissions), 1)
-                _, visit, event = submissions[0]
-                self.assertEqual(visit, 2)
-                self.assertEqual(event.rfid_card_uid, "87654321")
-                self.assertEqual(event.weight, 120)
-                self.assertEqual(scale.printed, [(2, event.uuid.encode("ascii"))])
-                self.assertEqual(
-                    [voice for _, _, voice in scale.voice_commands], [VoiceCode.TAG_CARD],
-                )
-                if condition == "connection_loss":
-                    self.assertTrue(scale.fault_used)
-                    self.assertEqual(scale.connect_calls, 2)
+                self.assertEqual([voice for _, _, voice in scale.voice_commands], [
+                    VoiceCode.WEIGHT_COMPLETE,
+                ])
+                self.assertGreater(len([at for at, visit, _ in scale.tag_requests if visit == 2]), 100)
+                self.assertEqual(Counter(visit for _, visit, _ in accepted), {1: 1})
+                self.assertEqual(Counter(visit for _, visit, _ in submissions), {1: 1})
+                self.assertEqual([visit for visit, _ in scale.printed], [1])
+                faults = [
+                    request for at, _, _, request in scale.requests
+                    if at >= VISIT_STARTS[2] + 1 and isinstance(request, DisplayRequestPacket)
+                    and request.red_blink and not request.green_blink
+                ]
+                self.assertEqual(bool(faults), condition == "invalid_weight")
 
     def test_reconnect_keeps_unobserved_voice_pending_and_saved_receipt_unchanged(self):
         scale, submissions, accepted = self.simulate(

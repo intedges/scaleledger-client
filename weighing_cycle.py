@@ -29,6 +29,8 @@ class WeighingCycle:
         self.max_sample_gap = self._positive_seconds(max_sample_gap, "max_sample_gap")
         self.state = CycleState.WAIT_EMPTY
         self.ready_sequence = 0
+        # Breaks in observation; a vehicle seen before one may have left since.
+        self.invalidations = 0
         self._high_since: float | None = None
         self._empty_since: float | None = None
         self._last_sample_at: float | None = None
@@ -55,6 +57,7 @@ class WeighingCycle:
 
     def invalidate(self):
         """Discard observation continuity without unlocking a consumed visit."""
+        self.invalidations += 1
         self._high_since = None
         self._empty_since = None
         self._last_sample_at = None

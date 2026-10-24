@@ -102,7 +102,7 @@ class StationSaveTests(unittest.TestCase):
         self.assert_no_completion()
 
         retry_result.set_result(None)
-        self.assertEqual(self.worker.save(), WorkerState.COMPLETE)
+        self.assertEqual(self.worker.save(), WorkerState.PRINT)
         self.assertIs(self.worker.last_event, event)
 
     def test_missing_acknowledgement_blocks_completion_and_retries_same_event(self):
@@ -120,7 +120,6 @@ class StationSaveTests(unittest.TestCase):
         self.on_event.assert_called_once_with(event)
         self.worker.logger.critical.assert_called_once()
         self.assert_no_completion()
-        self.assertEqual(self.worker.complete(), WorkerState.IDLE)
         self.assertEqual(self.worker.print(), WorkerState.IDLE)
         self.assert_no_completion()
 
@@ -129,52 +128,48 @@ class StationSaveTests(unittest.TestCase):
         self.assertEqual(self.on_event.call_count, 2)
         self.assertIs(self.on_event.call_args.args[0], event)
         self.result.set_result(None)
-        self.assertEqual(self.worker.save(), WorkerState.COMPLETE)
+        self.assertEqual(self.worker.save(), WorkerState.PRINT)
 
-    def test_success_announces_completion_then_prints_the_saved_original_once(self):
+    def test_success_prints_the_saved_original_once_then_announces_completion(self):
         event = self.begin_measurement()
         self.assert_no_completion()
         self.result.set_result(None)
 
-        self.assertEqual(self.worker.save(), WorkerState.COMPLETE)
+        self.assertEqual(self.worker.save(), WorkerState.PRINT)
         self.assert_no_completion()
-        self.assertEqual(self.worker.complete(), WorkerState.PRINT)
-        self.assertFalse(any(isinstance(request, PrinterRequestPacket) for request in self.requests))
         self.assertEqual(self.worker.print(), WorkerState.IDLE)
+        self.assertEqual(self.worker.idle(), WorkerState.IDLE)
 
         actions = [
             "print" if isinstance(request, PrinterRequestPacket) else request.voice_code.name
             for request in self.requests
             if isinstance(request, PrinterRequestPacket) or request.voice_code != VoiceCode.NONE
         ]
-        self.assertEqual(actions, ["WEIGHT_COMPLETE", "print", "THANK_YOU"])
+        self.assertEqual(actions, ["print", "WEIGHT_COMPLETE"])
         self.receipt_builder.assert_called_once_with(event)
         self.on_event.assert_called_once_with(event)
         self.assertIsNone(self.worker.last_event)
         self.assertEqual(self.worker.last_plate, "")
         request_count = len(self.requests)
-        self.assertEqual(self.worker.complete(), WorkerState.IDLE)
         self.assertEqual(self.worker.print(), WorkerState.IDLE)
         self.assertEqual(len(self.requests), request_count)
 
-    def test_direct_completion_and_print_cannot_bypass_a_pending_or_failed_save(self):
+    def test_direct_print_cannot_bypass_a_pending_or_failed_save(self):
         self.begin_measurement()
         for failed in (False, True):
             with self.subTest(failed=failed):
                 if failed:
                     self.result.set_exception(OSError("disk full"))
                     self.assertEqual(self.worker.save(), WorkerState.SAVE)
-                self.assertEqual(self.worker.complete(), WorkerState.IDLE)
                 self.assertEqual(self.worker.print(), WorkerState.IDLE)
                 self.assert_no_completion()
 
     def test_a_save_acknowledgement_does_not_authorize_another_event(self):
         self.begin_measurement()
         self.result.set_result(None)
-        self.assertEqual(self.worker.save(), WorkerState.COMPLETE)
+        self.assertEqual(self.worker.save(), WorkerState.PRINT)
         self.worker.last_event = WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=120)
 
-        self.assertEqual(self.worker.complete(), WorkerState.IDLE)
         self.assertEqual(self.worker.print(), WorkerState.IDLE)
         self.assert_no_completion()
 
@@ -187,18 +182,16 @@ class StationSaveTests(unittest.TestCase):
         self.assertIs(self.worker.last_event, event)
         self.result.set_result(None)
         self.assertEqual(self.worker.save(), WorkerState.SAVE)
-        self.assertEqual(self.worker.complete(), WorkerState.IDLE)
         self.assertEqual(self.worker.print(), WorkerState.IDLE)
         self.assert_no_completion()
         self.on_event.assert_called_once_with(event)
 
-    def test_stop_after_confirmation_prevents_completion_and_print(self):
+    def test_stop_after_confirmation_prevents_print(self):
         self.begin_measurement()
         self.result.set_result(None)
-        self.assertEqual(self.worker.save(), WorkerState.COMPLETE)
+        self.assertEqual(self.worker.save(), WorkerState.PRINT)
         self.worker.stop()
 
-        self.assertEqual(self.worker.complete(), WorkerState.IDLE)
         self.assertEqual(self.worker.print(), WorkerState.IDLE)
         self.assert_no_completion()
 

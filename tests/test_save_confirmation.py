@@ -139,8 +139,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(10):
             state = self.worker.save()
             await self.drain()
-            if state == WorkerState.COMPLETE:
-                self.assertEqual(self.worker.complete(), WorkerState.PRINT)
+            if state == WorkerState.PRINT:
                 return
             self.assertEqual(state, WorkerState.SAVE)
         self.fail("저장 확인 후 출력 상태로 전환하지 않았습니다.")
@@ -173,10 +172,12 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assert_committed_record(event)
         await self.finish_save()
         self.worker.print()
+        self.worker.idle()
 
         self.assertEqual(len(self.submissions), 1)
         self.assertEqual(sum(isinstance(request, PrinterRequestPacket) for request in self.scale.requests), 1)
         self.assertEqual(sum(getattr(request, "voice_code", None) == VoiceCode.WEIGHT_COMPLETE for request in self.scale.requests), 1)
+        self.assertIsInstance(self.scale.requests[-2], PrinterRequestPacket)
 
     async def test_sqlite_lock_failure_retries_the_original_event(self):
         self.start_consumer()

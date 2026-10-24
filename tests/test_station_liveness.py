@@ -1,7 +1,7 @@
 """Run the real station loop against a time-driven, multi-vehicle device.
 
 These scenarios deliberately do not prime the cycle or call state methods by
-hand: polling, voice waits, exceptions and reconnects all use run(). The fake
+hand: polling, guidance, exceptions and reconnects all use run(). The fake
 clock replaces waiting only, leaving the worker's transitions untouched.
 """
 
@@ -45,6 +45,16 @@ class BoundedSimulationStop:
     def wait(self, seconds):
         self.clock.advance(max(seconds, 0.01))
         return self.is_set()
+
+
+def simulated_wait(clock):
+    """Stand in for waiting on a save acknowledgement, which only exchanges complete."""
+
+    def wait(futures, timeout):
+        if not all(future.done() for future in futures):
+            clock.advance(timeout)
+
+    return wait
 
 
 class ContinuousScale:
@@ -104,7 +114,7 @@ class ContinuousScale:
             else VoiceCode.NONE
         )
         weight = Decimal("120") if visit else Decimal("0")
-        if self.jitter and 9.0 <= self.clock.now < 10.0:
+        if self.jitter and 6.5 <= self.clock.now < 7.5:
             weight = Decimal("50")
         # A driver tags whenever the reader advertises readiness, then repeats
         # the tag through processing/exit. The worker, not this device, decides
@@ -172,12 +182,11 @@ class StationLivenessTests(unittest.TestCase):
 
         with patch("suwol1000.time.monotonic", clock), patch(
             "suwol1000.get_logger", return_value=Mock(),
-        ):
+        ), patch("suwol1000.wait", side_effect=simulated_wait(clock)):
             worker = WeighingStationWorker(
                 scale, station_id=7, on_event=on_event, rfid_validator=validator,
                 receipt_builder=lambda event: event.uuid.encode(),
                 polling_interval=0.1, retry_interval=0.2,
-                vehicle_confirm_seconds=3,
                 voice_timeout=2,
             )
             worker.stop_event = BoundedSimulationStop(clock, 88)
@@ -219,7 +228,8 @@ class StationLivenessTests(unittest.TestCase):
     def test_ready_weight_jitter_requalifies_without_a_permanent_block(self):
         scale, submissions, _ = self.simulate(jitter=True)
         self.assert_two_visits_once(submissions)
-        self.assertGreaterEqual(submissions[0][0], 13)
+        # The weight dips during the first second, so readiness counts again from 7.5.
+        self.assertGreaterEqual(submissions[0][0], 8.5)
         self.assertEqual(len(scale.printed), 2)
 
     def test_ready_disconnect_requalifies_without_a_permanent_block(self):
@@ -249,14 +259,15 @@ class StationLivenessTests(unittest.TestCase):
         self.assertEqual(len(accepted), 3)
         self.assertEqual(len(scale.printed), 2)
 
-    def test_complete_disconnect_preserves_one_record_and_next_vehicle_progress(self):
+    def test_completion_voice_disconnect_preserves_one_record_and_next_vehicle_progress(self):
         def fault(request, scale):
             return getattr(request, "voice_code", None) == VoiceCode.WEIGHT_COMPLETE
 
         scale, submissions, _ = self.simulate(fault=fault)
         self.assertTrue(scale.fault_used)
         self.assert_two_visits_once(submissions)
-        self.assertEqual(len(scale.printed), 1)
+        # Completion is announced after the receipt, so both vehicles were printed.
+        self.assertEqual([visit for visit, _ in scale.printed], [1, 2])
 
     def test_printer_disconnect_preserves_one_record_and_next_vehicle_progress(self):
         scale, submissions, _ = self.simulate(
@@ -274,8 +285,8 @@ class StationLivenessTests(unittest.TestCase):
                             for _, _, _, request in scale.requests))
         self.assert_two_visits_once(submissions)
 
-    def test_missing_wait_voice_start_does_not_permanently_block_valid_cards(self):
-        _, submissions, _ = self.simulate(missing_voices={VoiceCode.PLEASE_WAIT})
+    def test_missing_completion_voice_start_does_not_permanently_block_valid_cards(self):
+        _, submissions, _ = self.simulate(missing_voices={VoiceCode.WEIGHT_COMPLETE})
         self.assert_two_visits_once(submissions)
 
     def test_unobserved_short_voices_do_not_permanently_block_valid_cards(self):
