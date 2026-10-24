@@ -26,7 +26,7 @@ class StationSaveTests(unittest.TestCase):
         with patch("suwol1000.get_logger") as get_logger:
             get_logger.return_value.bind.return_value = logger
             self.worker = WeighingStationWorker(
-                self.client, on_event=self.on_event, receipt_builder=self.receipt_builder,
+                self.client, station_id=7, on_event=self.on_event, receipt_builder=self.receipt_builder,
                 polling_interval=0, retry_interval=0,
             )
         self.worker.last_plate = "12345678"
@@ -45,6 +45,7 @@ class StationSaveTests(unittest.TestCase):
         event = self.on_event.call_args.args[0]
         self.assertIsInstance(event, WeighingCompletedEvent)
         self.assertEqual((event.rfid_card_uid, event.weight), ("12345678", 120))
+        self.assertEqual(event.station_id, 7)
         return event
 
     def assert_no_completion(self):
@@ -85,6 +86,8 @@ class StationSaveTests(unittest.TestCase):
             event = self.begin_measurement()
             self.result.set_exception(OSError("database or disk is full"))
             self.assertEqual(self.worker.save(), WorkerState.SAVE)
+        # Retry must use the confirmed event even if the worker's current ID changes.
+        self.worker.station_id = 11
         with patch("suwol1000.time.monotonic", return_value=14.9):
             self.assertEqual(self.worker.save(), WorkerState.SAVE)
         self.on_event.assert_called_once_with(event)
@@ -95,6 +98,7 @@ class StationSaveTests(unittest.TestCase):
         self.assertEqual(self.on_event.call_count, 2)
         self.assertTrue(all(call.args[0] is event for call in self.on_event.call_args_list))
         self.assertEqual(event.weight, 120)
+        self.assertEqual(event.station_id, 7)
         self.assert_no_completion()
 
         retry_result.set_result(None)
@@ -168,7 +172,7 @@ class StationSaveTests(unittest.TestCase):
         self.begin_measurement()
         self.result.set_result(None)
         self.assertEqual(self.worker.save(), WorkerState.COMPLETE)
-        self.worker.last_event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=120)
+        self.worker.last_event = WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=120)
 
         self.assertEqual(self.worker.complete(), WorkerState.IDLE)
         self.assertEqual(self.worker.print(), WorkerState.IDLE)

@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -7,7 +8,7 @@ import uuid
 
 import httpx2
 
-from api import AuthDegradedError
+from api import APIClient, AuthDegradedError
 from workers import RecordUploadWorker
 
 
@@ -16,6 +17,7 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.record = SimpleNamespace(
             uuid=uuid.uuid4(),
             rfid_card_uid="test-card",
+            station_id=7,
             weight=125,
             measured_at=datetime.now(UTC),
             delete=AsyncMock(),
@@ -128,6 +130,46 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
         task = await self.start_worker()
         await asyncio.wait_for(self.queue.join(), timeout=1)
         self.assertEqual(self.api.create_record.await_count, 3)
+        for call in self.api.create_record.await_args_list:
+            self.assertEqual(call.kwargs["record"].station_id, self.record.station_id)
+        self.record.delete.assert_awaited_once()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(self.queue.empty())
+
+    async def test_lost_response_retries_saved_record_before_duplicate_ack_purges(self):
+        payloads = []
+        original = {
+            "uuid": self.record_uuid,
+            "rfid_card_uid": self.record.rfid_card_uid,
+            "station_id": self.record.station_id,
+            "weight": self.record.weight,
+            "measured_at": self.record.measured_at.isoformat(),
+        }
+
+        def respond(request):
+            payloads.append(json.loads(request.content))
+            self.record.delete.assert_not_awaited()
+            if len(payloads) == 1:
+                raise httpx2.ReadTimeout("Response lost after server save", request=request)
+            return httpx2.Response(200, json={
+                key: value for key, value in original.items() if key != "rfid_card_uid"
+            })
+
+        async_client = httpx2.AsyncClient
+        with patch(
+            "api.httpx2.AsyncClient",
+            side_effect=lambda **kwargs: async_client(**kwargs, transport=httpx2.MockTransport(respond)),
+        ):
+            api = APIClient("http://server/")
+        self.addAsyncCleanup(api.close)
+        self.worker.api_client = api
+        self.worker.retry_delay = 0
+
+        task = await self.start_worker()
+        await asyncio.wait_for(self.queue.join(), timeout=1)
+        self.assertEqual(payloads, [original, original])
         self.record.delete.assert_awaited_once()
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
@@ -141,6 +183,10 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
                 task = await self.start_worker()
                 await asyncio.wait_for(self.queue.join(), timeout=1)
                 self.record.delete.assert_not_awaited()
+                self.assertEqual(
+                    self.api.create_record.await_args.kwargs["record"].station_id,
+                    self.record.station_id,
+                )
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task

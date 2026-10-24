@@ -91,7 +91,7 @@ class StationCycleTests(unittest.TestCase):
         self.result.set_result(None)
         self.validator = Mock(return_value=True)
         self.worker = WeighingStationWorker(
-            self.scale, on_event=self.submit, rfid_validator=self.validator,
+            self.scale, station_id=7, on_event=self.submit, rfid_validator=self.validator,
             receipt_builder=lambda event: b"receipt", polling_interval=0,
             retry_interval=0,
             vehicle_confirm_seconds=3, voice_timeout=1,

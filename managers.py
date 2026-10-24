@@ -98,6 +98,7 @@ class WeighingStationManager:
 
         worker = WeighingStationWorker(
             serial_client=SerialClient(port=station.serial_port),
+            station_id=station.id,
             on_event=self.on_event,
             rfid_validator=validate_rfid,
             receipt_builder=build_receipt,

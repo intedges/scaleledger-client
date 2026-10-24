@@ -219,7 +219,7 @@ class CooperativeShutdownTests(unittest.IsolatedAsyncioTestCase):
         client.run_active_loop = AsyncMock(side_effect=AuthDegradedError("token rejected"))
         client.forget_server_session = Mock(side_effect=failure)
         client.station_manager.stop_all = Mock()
-        event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=41)
+        event = WeighingCompletedEvent(rfid_card_uid="12345678", station_id=7, weight=41)
 
         async def save_record(**kwargs):
             consumers.append(asyncio.current_task())

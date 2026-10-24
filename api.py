@@ -10,6 +10,7 @@ import httpx2
 class RecordCreateDTO:
     uuid: uuid.UUID
     rfid_card_uid: str
+    station_id: int
     weight: int
     measured_at: datetime
 
@@ -65,6 +66,7 @@ class APIClient:
         payload = {
             "uuid": str(record.uuid),
             "rfid_card_uid": record.rfid_card_uid,
+            "station_id": record.station_id,
             "weight": record.weight,
             "measured_at": record.measured_at.isoformat(),
         }

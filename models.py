@@ -35,6 +35,8 @@ class WeighingStation(Model):
 class Record(Model):
     uuid = fields.UUIDField(primary_key=True)
     rfid_card_uid = fields.CharField(max_length=20)
+    # Keep the server ID independent of the settings cache replaced during sync.
+    station_id = fields.IntField()
     weight = fields.IntField()
     measured_at = fields.DatetimeField()
 

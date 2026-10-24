@@ -126,6 +126,7 @@ class HeadlessClient:
             await Record.create(
                 uuid=event.uuid,
                 rfid_card_uid=event.rfid_card_uid,
+                station_id=event.station_id,
                 weight=event.weight,
                 measured_at=event.timestamp,
             )
@@ -135,6 +136,7 @@ class HeadlessClient:
             record = await Record.get_or_none(uuid=event.uuid)
             if record is None or (
                 record.rfid_card_uid != event.rfid_card_uid
+                or record.station_id != event.station_id
                 or record.weight != event.weight
                 or record.measured_at != event.timestamp
             ):
