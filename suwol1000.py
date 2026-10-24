@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import argparse
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -384,8 +385,11 @@ class WeighingStationWorker:
         vehicle_threshold: Decimal = Decimal("50"),
         vehicle_confirm_seconds: float = 3.0,
         voice_timeout: float = 15.0,
+        *,
+        station_id: int,
     ):
         self.client = serial_client
+        self.station_id = station_id
         self.on_event = on_event or print
         self.rfid_validator = rfid_validator or (lambda _: True)
         self.receipt_builder = receipt_builder
@@ -858,6 +862,7 @@ class WeighingStationWorker:
             self._visit_saved = False
             self._pending_save = WeighingCompletedEvent(
                 rfid_card_uid=self.last_plate, weight=int(self.last_weight),
+                station_id=self.station_id,
             )
             self.last_event = self._pending_save
             self._saved_event_uuid = None
@@ -971,10 +976,14 @@ class WeighingStationWorker:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="계량대 장비 통신 점검")
+    parser.add_argument("--station-id", type=int, required=True, help="서버 기준정보의 계량대 ID")
+    args = parser.parse_args()
     logger = get_logger()
 
     worker = WeighingStationWorker(
         serial_client=SerialClient(port="COM3"),
+        station_id=args.station_id,
     )
     worker_thread = threading.Thread(target=worker.run)
     worker_thread.start()

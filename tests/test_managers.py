@@ -1,4 +1,6 @@
+from concurrent.futures import Future
 from datetime import UTC, datetime
+from decimal import Decimal
 import unittest
 from unittest.mock import Mock, patch
 
@@ -6,7 +8,8 @@ from cache import MarketDataCache, RFIDInfo
 from events import WeighingCompletedEvent
 from managers import StationRuntime, WeighingStationManager
 from models import WeighingStation
-from suwol1000 import DisplayRequestPacket, LiveWeightSnapshot, ResponsePacket
+from suwol1000 import DisplayRequestPacket, LiveWeightSnapshot, ResponsePacket, WorkerState
+from tests.helpers import prepare_vehicle
 
 
 class WeighingStationManagerTests(unittest.TestCase):
@@ -14,11 +17,31 @@ class WeighingStationManagerTests(unittest.TestCase):
         self.manager = WeighingStationManager(Mock(), MarketDataCache())
         self.manager.logger = Mock()
 
+    def test_each_worker_records_the_station_id_from_server_settings(self):
+        stations = [
+            WeighingStation(id=7, name="Station A", serial_port="first-port"),
+            WeighingStation(id=11, name="Station B", serial_port="second-port"),
+        ]
+        self.manager.on_event.side_effect = lambda event: Future()
+
+        with patch("managers.threading.Thread"), patch("suwol1000.get_logger", return_value=Mock()):
+            self.manager.sync(stations)
+            for station in stations:
+                worker = self.manager.workers[station.id].worker
+                worker.last_plate = "12345678"
+                worker.last_weight = Decimal("120")
+                prepare_vehicle(worker)
+                self.assertEqual(worker.measure(), WorkerState.SAVE)
+
+        events = [call.args[0] for call in self.manager.on_event.call_args_list]
+        self.assertEqual([event.station_id for event in events], [7, 11])
+        self.assertEqual(len({event.uuid for event in events}), 2)
+
     def test_station_rename_updates_receipts_without_restarting_worker(self):
         self.manager.market_cache.update_rfid_data({
             "12345678": RFIDInfo(True, "Producer", "Species"),
         })
-        event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=23)
+        event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=23)
         cached = WeighingStation(id=1, name="Cached station", serial_port="test-port")
         updated = WeighingStation(id=1, name="Updated station", serial_port="test-port")
 
@@ -44,7 +67,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         self.manager.market_cache.update_rfid_data({
             "12345678": RFIDInfo(True, "Producer", "Species"),
         })
-        event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=23)
+        event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=23)
         cached = WeighingStation(id=1, name="Cached station", serial_port="old-port")
         updated = WeighingStation(id=1, name="Updated station", serial_port="new-port")
         workers = [Mock(), Mock()]
@@ -65,12 +88,14 @@ class WeighingStationManagerTests(unittest.TestCase):
         self.assertEqual(self.manager.workers[1].port, "new-port")
         self.assertIn(b"Updated station", receipt)
         self.assertEqual(worker.call_args.kwargs["initial_sample_seq"], 12)
+        self.assertEqual(worker.call_args.kwargs["station_id"], 1)
 
     def test_receipt_prints_the_measurement_time_in_local_time(self):
         self.manager.market_cache.update_rfid_data({
             "12345678": RFIDInfo(True, "Producer", "Species"),
         })
         event = WeighingCompletedEvent(
+            station_id=1,
             rfid_card_uid="12345678", weight=23,
             timestamp=datetime(2026, 10, 11, 5, 0, tzinfo=UTC),
         )

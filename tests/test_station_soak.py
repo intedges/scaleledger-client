@@ -192,7 +192,7 @@ class StationSoakTests(unittest.TestCase):
         logger = CountingLogger()
         with patch("suwol1000.time.monotonic", clock), patch("suwol1000.get_logger", return_value=logger):
             worker = WeighingStationWorker(
-                traffic, on_event=traffic.submit, rfid_validator=traffic.validate,
+                traffic, station_id=7, on_event=traffic.submit, rfid_validator=traffic.validate,
                 receipt_builder=lambda event: event.uuid.encode("ascii"),
                 polling_interval=0, retry_interval=0,
             )
@@ -214,10 +214,12 @@ class StationSoakTests(unittest.TestCase):
             with self.subTest(vehicle=vehicle, profile=vehicle % 8):
                 self.assertEqual(len(traffic.saved[vehicle]), 1)
                 event = traffic.saved[vehicle][0]
+                self.assertEqual(event.station_id, 7)
                 self.assertEqual(event.weight, 70 + (vehicle % 5) * 10)
                 self.assertNotEqual(event.rfid_card_uid, INVALID_CARD)
                 self.assertEqual(traffic.prints[vehicle], [event.uuid.encode("ascii")])
                 self.assertEqual({attempt.uuid for attempt in traffic.submissions[vehicle]}, {event.uuid})
+                self.assertEqual({attempt.station_id for attempt in traffic.submissions[vehicle]}, {7})
                 self.assertEqual(len(traffic.submissions[vehicle]), 2 if vehicle % 8 == 4 else 1)
                 self.assertGreater(traffic.card_tags[vehicle], 20)
                 uuids.add(event.uuid)

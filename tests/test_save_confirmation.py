@@ -63,7 +63,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.submissions = []
         self.scale = RecordingScale()
         self.worker = WeighingStationWorker(
-            self.scale, on_event=self.submit, polling_interval=0,
+            self.scale, station_id=7, on_event=self.submit, polling_interval=0,
             receipt_builder=lambda event: b"receipt",
             vehicle_threshold=Decimal("1"),
         )
@@ -128,10 +128,12 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
     def assert_committed_record(self, event):
         # An independent connection cannot see the ORM's uncommitted insert.
         with closing(sqlite3.connect(self.db_path)) as connection:
-            rows = connection.execute("SELECT uuid, rfid_card_uid, weight, measured_at FROM record").fetchall()
+            rows = connection.execute(
+                "SELECT uuid, station_id, rfid_card_uid, weight, measured_at FROM record"
+            ).fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(uuid.UUID(rows[0][0]), uuid.UUID(event.uuid))
-        self.assertEqual(rows[0][1:3], (event.rfid_card_uid, event.weight))
+        self.assertEqual(rows[0][1:4], (event.station_id, event.rfid_card_uid, event.weight))
 
     async def finish_save(self):
         for _ in range(10):
@@ -192,7 +194,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(self.submissions), 2)
         self.assertTrue(all(submitted is event for submitted, _ in self.submissions))
         self.assertTrue(all(submitted.timestamp == event.timestamp for submitted, _ in self.submissions))
-        self.assertEqual((event.weight, event.rfid_card_uid), (12, "12345678"))
+        self.assertEqual((event.station_id, event.weight, event.rfid_card_uid), (7, 12, "12345678"))
         self.assert_committed_record(event)
 
     async def test_sqlite_readonly_failure_does_not_ack_or_complete(self):
@@ -215,9 +217,9 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_existing_identical_uuid_is_confirmed_without_a_second_record(self):
         self.start_consumer()
-        event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=12)
+        event = WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=12)
         await Record.create(
-            uuid=event.uuid, rfid_card_uid=event.rfid_card_uid,
+            uuid=event.uuid, station_id=event.station_id, rfid_card_uid=event.rfid_card_uid,
             weight=event.weight, measured_at=event.timestamp,
         )
 
@@ -259,12 +261,13 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_existing_uuid_with_different_source_is_not_confirmed(self):
         self.start_consumer()
-        event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=12)
+        event = WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=12)
         await Record.create(
-            uuid=event.uuid, rfid_card_uid=event.rfid_card_uid,
+            uuid=event.uuid, station_id=event.station_id, rfid_card_uid=event.rfid_card_uid,
             weight=event.weight, measured_at=event.timestamp,
         )
         for changed in (
+            replace(event, station_id=8),
             replace(event, weight=13),
             replace(event, rfid_card_uid="87654321"),
             replace(event, timestamp=event.timestamp.replace(year=2025)),
@@ -275,6 +278,24 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(acknowledgment.exception(timeout=0))
                 self.assertTrue(self.client.upload_queue.empty())
                 self.assert_committed_record(event)
+
+    async def test_measurements_from_two_stations_keep_their_source_ids(self):
+        self.start_consumer()
+        events = [
+            WeighingCompletedEvent(station_id=station_id, rfid_card_uid="12345678", weight=12)
+            for station_id in (7, 8)
+        ]
+        acknowledgments = [self.submit(event) for event in events]
+        await self.drain()
+
+        for event, acknowledgment in zip(events, acknowledgments):
+            self.assertIsNone(acknowledgment.result(timeout=0))
+            self.assertEqual((await Record.get(uuid=event.uuid)).station_id, event.station_id)
+        self.assertEqual(await Record.all().count(), 2)
+        self.assertEqual(
+            {self.client.upload_queue.get_nowait() for _ in events},
+            {event.uuid for event in events},
+        )
 
     async def test_offline_local_commit_allows_completion_without_upload(self):
         self.start_consumer()

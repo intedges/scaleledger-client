@@ -22,7 +22,7 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.responses = self.make_responses(1, "Cached")
         await self.snapshot().persist()
         self.record = await Record.create(
-            uuid=uuid.uuid4(), rfid_card_uid="old-card", weight=23, measured_at=self.now,
+            uuid=uuid.uuid4(), station_id=1, rfid_card_uid="old-card", weight=23, measured_at=self.now,
         )
         self.responses = self.make_responses(2, "Updated")
 
@@ -84,7 +84,8 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await Species.all().values_list("id", flat=True), [2])
         self.assertEqual(await Producer.all().values_list("id", flat=True), [2])
         self.assertEqual(await RFIDCard.all().values_list("uid", flat=True), ["card-2"])
-        self.assertEqual((await Record.get(uuid=self.record.uuid)).weight, 23)
+        record = await Record.get(uuid=self.record.uuid)
+        self.assertEqual((record.station_id, record.weight), (1, 23))
 
     async def test_empty_lists_remove_cached_settings_but_keep_gateway_and_records(self):
         for key in ("stations", "species", "producers", "rfid_cards"):
@@ -97,7 +98,7 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await Gateway.all().count(), 1)
         for model in (WeighingStation, Species, Producer, RFIDCard):
             self.assertEqual(await model.all().count(), 0)
-        self.assertTrue(await Record.filter(uuid=self.record.uuid).exists())
+        self.assertEqual((await Record.get(uuid=self.record.uuid)).station_id, 1)
 
     async def test_card_response_and_new_database_have_no_last_used_at_field(self):
         self.assertNotIn("last_used_at", self.responses["rfid_cards"][0])

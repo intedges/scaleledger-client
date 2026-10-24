@@ -260,7 +260,8 @@ class HeartbeatTests(unittest.IsolatedAsyncioTestCase):
     async def assert_auth_recovery_preserves_pending_record(self, status):
         socket, running = await self.start_connected()
         record = await Record.create(
-            uuid=uuid.uuid4(), rfid_card_uid="12345678", weight=23, measured_at=self.now,
+            uuid=uuid.uuid4(), rfid_card_uid="12345678", station_id=7,
+            weight=23, measured_at=self.now,
         )
         uploading, renewed, approved = asyncio.Event(), asyncio.Event(), asyncio.Event()
         recovered = ControlSocket()

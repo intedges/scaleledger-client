@@ -18,3 +18,4 @@ class RFIDTaggedEvent(BaseEvent):
 class WeighingCompletedEvent(BaseEvent):
     rfid_card_uid: str
     weight: int
+    station_id: int

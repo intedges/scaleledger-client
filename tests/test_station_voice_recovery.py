@@ -121,7 +121,7 @@ class StationVoiceRecoveryTests(unittest.TestCase):
             "suwol1000.get_logger", return_value=logger,
         ):
             worker = WeighingStationWorker(
-                scale, on_event=on_event, rfid_validator=lambda event: True,
+                scale, station_id=7, on_event=on_event, rfid_validator=lambda event: True,
                 receipt_builder=lambda event: event.uuid.encode("ascii"),
                 on_live_weight=scale.live_snapshots.append,
                 polling_interval=0.1, retry_interval=0.2,

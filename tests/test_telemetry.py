@@ -340,7 +340,8 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
             serial = Mock(port=f"COM{station_id}")
             serial.send_and_receive.return_value = ResponsePacket(weight_value=Decimal(station_id))
             devices.append(WeighingStationWorker(
-                serial, on_live_weight=lambda snapshot, i=station_id: self.updates.update(i, snapshot),
+                serial, station_id=station_id,
+                on_live_weight=lambda snapshot, i=station_id: self.updates.update(i, snapshot),
             ))
 
         def receive():

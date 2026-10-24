@@ -29,7 +29,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         self.serial = Mock(port="test-port")
         self.samples = []
         self.worker = WeighingStationWorker(
-            self.serial, polling_interval=0, receipt_builder=lambda event: b"receipt",
+            self.serial, station_id=7, polling_interval=0, receipt_builder=lambda event: b"receipt",
             on_live_weight=self.samples.append,
             vehicle_threshold=Decimal("1"),
         )
@@ -84,7 +84,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         self.assertEqual(self.worker.get_live_weight().sample_seq, 1)
         self.worker.poll_until_voice_ends(DisplayRequestPacket(voice_code=VoiceCode.PLEASE_WAIT))
         self.assertEqual(self.worker.get_live_weight().sample_seq, 3)
-        completed = WeighingCompletedEvent(rfid_card_uid="12345678", weight=3)
+        completed = WeighingCompletedEvent(rfid_card_uid="12345678", station_id=7, weight=3)
         self.worker.last_event = completed
         self.worker._saved_event_uuid = completed.uuid
         self.worker._visit_saved = True
@@ -294,7 +294,7 @@ class LiveWeightSnapshotTests(unittest.TestCase):
         self.assertFalse(self.worker.get_live_weight().sample_valid)
 
     def test_restart_keeps_sample_sequence_but_waits_for_a_new_measurement(self):
-        worker = WeighingStationWorker(self.serial, initial_sample_seq=27)
+        worker = WeighingStationWorker(self.serial, station_id=7, initial_sample_seq=27)
         self.assertEqual(worker.get_live_weight().sample_seq, 0)
         self.serial.send_and_receive.return_value = ResponsePacket()
         worker.exchange(DisplayRequestPacket())

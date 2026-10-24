@@ -35,6 +35,7 @@ class RecordUploadWorker:
                     record=RecordCreateDTO(
                         uuid=record.uuid,
                         rfid_card_uid=record.rfid_card_uid,
+                        station_id=record.station_id,
                         weight=record.weight,
                         measured_at=record.measured_at,
                     ),

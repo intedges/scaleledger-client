@@ -187,7 +187,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             method.return_value = value
 
     async def emit_and_save(self):
-        event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=12)
+        event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=12)
         self.client.handle_hardware_event(event)
         await asyncio.sleep(0)
         await self.wait_for(self.client.event_queue.join())
@@ -202,6 +202,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         record = await Record.get(uuid=event.uuid)
         self.assertEqual(record.weight, 12)
+        self.assertEqual(record.station_id, self.station.id)
         self.assertEqual(self.client.gateway_id, self.gateway.id)
         self.assertEqual(self.client.market_cache.gateway_name, "Cached gateway")
         self.assertEqual(self.client.market_cache.get_rfid_info("12345678").producer_name, "Cached producer")
@@ -232,6 +233,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.connections.opened.qsize(), 3)
         self.api.send_heartbeat.assert_not_awaited()
         self.assertEqual(str(self.api.create_record.call_args.kwargs["record"].uuid), event.uuid)
+        self.assertEqual(self.api.create_record.call_args.kwargs["record"].station_id, event.station_id)
         self.assertFalse(await Record.filter(uuid=event.uuid).exists())
         self.manager.stop_all.assert_not_called()
 
@@ -239,7 +241,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.cached_setup()
         self.online_responses()
         record = await Record.create(
-            uuid=uuid.uuid4(), rfid_card_uid="12345678", weight=19,
+            uuid=uuid.uuid4(), station_id=7, rfid_card_uid="12345678", weight=19,
             measured_at=self.now,
         )
         uploaded = asyncio.Event()
@@ -256,6 +258,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.connections.opened.empty())
         self.api.create_record.assert_awaited_once()
         self.assertEqual(self.api.create_record.call_args.kwargs["record"].uuid, record.uuid)
+        self.assertEqual(self.api.create_record.call_args.kwargs["record"].station_id, 7)
         self.assertFalse(await Record.filter(uuid=record.uuid).exists())
         self.manager.stop_all.assert_not_called()
 
@@ -338,7 +341,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch("main.Record.create", side_effect=delayed_create):
             self.start(self.client.run())
             await self.wait_for(disconnected.listening.wait())
-            event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=23)
+            event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=23)
             self.client.handle_hardware_event(event)
             await self.wait_for(write_started.wait())
             disconnected.hold.set()
@@ -355,7 +358,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_graceful_shutdown_saves_last_event_emitted_while_station_stops(self):
         await self.cached_setup()
-        final_event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=37)
+        final_event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=37)
         self.manager.stop_all.side_effect = lambda: self.client.handle_hardware_event(final_event)
         task = self.start(self.client.run())
         await self.wait_for(self.started.wait())
@@ -586,7 +589,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             client.setup = AsyncMock()
             self.start(client.run())
             await self.wait_for(self.started.wait())
-            event = WeighingCompletedEvent(rfid_card_uid="12345678", weight=41)
+            event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=41)
             client.handle_hardware_event(event)
             await asyncio.sleep(0)
             await self.wait_for(client.event_queue.join())
@@ -672,7 +675,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             json.dumps({"server_url": "http://previous-server:8000", "credential": "previous-token"}),
             encoding="utf-8",
         )
-        await Record.create(uuid=uuid.uuid4(), rfid_card_uid="12345678", weight=19, measured_at=self.now)
+        await Record.create(uuid=uuid.uuid4(), station_id=1, rfid_card_uid="12345678", weight=19, measured_at=self.now)
         requested = asyncio.Event()
 
         async def pending(token, **identity):
@@ -778,7 +781,7 @@ class DatabaseLocationTests(unittest.IsolatedAsyncioTestCase):
         try:
             await client.setup()
             await Record.create(
-                uuid=record_uuid, rfid_card_uid="12345678", weight=31,
+                uuid=record_uuid, station_id=1, rfid_card_uid="12345678", weight=31,
                 measured_at=datetime(2026, 10, 11, tzinfo=UTC),
             )
         finally:

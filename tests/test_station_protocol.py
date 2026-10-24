@@ -178,7 +178,7 @@ class DisplayWeightTests(unittest.TestCase):
     def test_weight_beyond_the_display_is_not_used_so_requests_stay_32_bytes(self):
         client = Mock(port="test-port")
         with patch("suwol1000.get_logger", return_value=Mock()):
-            worker = WeighingStationWorker(client, polling_interval=0)
+            worker = WeighingStationWorker(client, station_id=7, polling_interval=0)
         cases = (
             (Decimal("999999"), True), (Decimal("-999999"), True),
             (Decimal("999999.7"), False), (Decimal("1234567"), False), (Decimal("-1000000"), False),
@@ -248,7 +248,7 @@ class UnreadableFieldStationTests(unittest.TestCase):
         with patch("suwol1000.get_logger") as get_logger:
             get_logger.return_value.bind.return_value = logger
             worker = WeighingStationWorker(
-                scale, on_event=save, on_live_weight=samples.append,
+                scale, station_id=7, on_event=save, on_live_weight=samples.append,
                 polling_interval=0, retry_interval=0,
             )
         scale.stop_event = worker.stop_event

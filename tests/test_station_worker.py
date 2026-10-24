@@ -92,7 +92,7 @@ class PoweredOffStationTests(unittest.TestCase):
         logger = Mock()
         with patch("suwol1000.get_logger") as get_logger:
             get_logger.return_value.bind.return_value = logger
-            worker = WeighingStationWorker(client, polling_interval=0, retry_interval=0, **worker_kwargs)
+            worker = WeighingStationWorker(client, station_id=7, polling_interval=0, retry_interval=0, **worker_kwargs)
         # Each clock reading stands for one second of the polling loop.
         ticks = iter(range(1_000_000))
         worker.failures = RepeatedFailureLog(logger, "hw.station", clock=lambda: float(next(ticks)))
@@ -162,7 +162,7 @@ class PoweredOffStationTests(unittest.TestCase):
         logger = Mock()
         with patch("suwol1000.get_logger") as get_logger:
             get_logger.return_value.bind.return_value = logger
-            worker = WeighingStationWorker(client, polling_interval=0, retry_interval=0)
+            worker = WeighingStationWorker(client, station_id=7, polling_interval=0, retry_interval=0)
         thread = threading.Thread(target=worker.run)
         thread.start()
         self.assertTrue(client.reading.wait(timeout=5))

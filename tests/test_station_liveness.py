@@ -174,7 +174,7 @@ class StationLivenessTests(unittest.TestCase):
             "suwol1000.get_logger", return_value=Mock(),
         ):
             worker = WeighingStationWorker(
-                scale, on_event=on_event, rfid_validator=validator,
+                scale, station_id=7, on_event=on_event, rfid_validator=validator,
                 receipt_builder=lambda event: event.uuid.encode(),
                 polling_interval=0.1, retry_interval=0.2,
                 vehicle_confirm_seconds=3,
