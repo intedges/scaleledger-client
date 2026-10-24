@@ -73,31 +73,30 @@ class LiveWeightSnapshotTests(unittest.TestCase):
     def test_idle_voice_and_print_responses_all_refresh_snapshot(self):
         self.serial.send_and_receive.side_effect = [
             ResponsePacket(weight_value=Decimal("1")),
-            ResponsePacket(weight_value=Decimal("2"), voice_code=VoiceCode.PLEASE_WAIT),
+            ResponsePacket(weight_value=Decimal("2"), voice_code=VoiceCode.TAG_CARD),
             ResponsePacket(weight_value=Decimal("3")),
-            ResponsePacket(weight_value=Decimal("4")),
-            ResponsePacket(weight_value=Decimal("5"), voice_code=VoiceCode.THANK_YOU),
-            ResponsePacket(weight_value=Decimal("6")),
-            ResponsePacket(weight_value=Decimal("7")),
+            ResponsePacket(weight_value=Decimal("4"), voice_code=VoiceCode.WEIGHT_COMPLETE),
+            ResponsePacket(weight_value=Decimal("5")),
         ]
         self.worker.idle()
-        self.assertEqual(self.worker.get_live_weight().sample_seq, 1)
-        self.worker.poll_until_voice_ends(DisplayRequestPacket(voice_code=VoiceCode.PLEASE_WAIT))
-        self.assertEqual(self.worker.get_live_weight().sample_seq, 3)
+        self.worker.idle()
+        self.assertEqual(self.worker.get_live_weight().sample_seq, 2)
         completed = WeighingCompletedEvent(rfid_card_uid="12345678", station_id=7, weight=3)
         self.worker.last_event = completed
         self.worker._saved_event_uuid = completed.uuid
-        self.worker._visit_saved = True
+        self.worker._processing = True
         self.worker.print()
+        self.worker.idle()
+        self.worker.idle()
 
         sample = self.worker.get_live_weight()
-        self.assertEqual(sample.weight, Decimal("7"))
-        self.assertEqual(sample.sample_seq, 7)
+        self.assertEqual(sample.weight, Decimal("5"))
+        self.assertEqual(sample.sample_seq, 5)
         self.assertEqual(sample.connection_status, "connected")
         self.assertTrue(sample.sample_valid)
         self.assertEqual(completed.weight, 3)
-        self.assertEqual([snapshot.sample_seq for snapshot in self.samples], [1, 2, 3, 4, 5, 6, 7])
-        self.assertIsInstance(self.serial.send_and_receive.call_args_list[3].args[0], PrinterRequestPacket)
+        self.assertEqual([snapshot.sample_seq for snapshot in self.samples], [1, 2, 3, 4, 5])
+        self.assertIsInstance(self.serial.send_and_receive.call_args_list[2].args[0], PrinterRequestPacket)
         cleared_lights = self.serial.send_and_receive.call_args.args[0]
         self.assertFalse(cleared_lights.green_blink or cleared_lights.red_blink)
 
@@ -250,7 +249,6 @@ class LiveWeightSnapshotTests(unittest.TestCase):
             self.worker.exchange(DisplayRequestPacket())
         prepare_vehicle(self.worker, reserve=False)
         self.worker.idle()
-        self.worker.poll_until_voice_ends = Mock()
         self.worker.measure()
 
         self.assertEqual(self.worker.get_live_weight().sample_seq, 4)

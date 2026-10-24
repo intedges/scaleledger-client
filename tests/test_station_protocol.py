@@ -275,10 +275,10 @@ class UnreadableFieldStationTests(unittest.TestCase):
 
         self.assertEqual([type(event) for event in events], [RFIDTaggedEvent, WeighingCompletedEvent])
         self.assertEqual((events[1].rfid_card_uid, events[1].weight), ("12345678", 120))
-        self.assertEqual(
-            self.voices(scale),
-            [VoiceCode.TAG_CARD, VoiceCode.PLEASE_WAIT, VoiceCode.WEIGHT_COMPLETE, VoiceCode.THANK_YOU],
-        )
+        # The vehicle stays on the platform, so completion keeps being announced.
+        voices = self.voices(scale)
+        self.assertEqual(voices[:3], [VoiceCode.TAG_CARD, VoiceCode.WEIGHT_COMPLETE, VoiceCode.WEIGHT_COMPLETE])
+        self.assertEqual(set(voices[1:]), {VoiceCode.WEIGHT_COMPLETE})
         self.assertEqual(fields, ["fan_trigger_temp", "heater_trigger_temp"])
         self.assertNotIn("error", [sample.connection_status for sample in samples])
 
