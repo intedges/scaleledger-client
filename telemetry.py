@@ -12,19 +12,19 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from logconfig import RepeatedFailureLog
-from suwol1000 import LiveWeightSnapshot, WeightStatus
+from suwol1000 import StationTelemetrySnapshot, printer_status_label
 
 
 @dataclass
 class _StationUpdate:
     connection_status: str
-    sample: LiveWeightSnapshot | None = None
+    sample: StationTelemetrySnapshot | None = None
     last_sample_seq: int = 0
     status_pending: bool = True
     sample_pending: bool = False
 
 
-class LatestWeightBuffer:
+class LatestTelemetryBuffer:
     """Bridge device threads to one sender, retaining only each station's latest state."""
 
     def __init__(self):
@@ -34,16 +34,17 @@ class LatestWeightBuffer:
         self._pending: dict[int, None] = {}
         self._waiter: asyncio.Future | None = None
 
-    def update(self, station_id: int, snapshot: LiveWeightSnapshot):
+    def update(self, station_id: int, snapshot: StationTelemetrySnapshot):
         with self._lock:
             state = self._latest.get(station_id)
             if state is None:
                 state = _StationUpdate(snapshot.connection_status)
                 self._latest[station_id] = state
+            # A response is one observation, including any unreadable fields.
+            if snapshot.sample_valid and snapshot.sample_seq <= state.last_sample_seq:
+                return
             if snapshot.sample_valid:
                 # A status event never resets the station's observed sample counter.
-                if snapshot.sample_seq <= state.last_sample_seq:
-                    return
                 if state.connection_status != snapshot.connection_status:
                     state.connection_status = snapshot.connection_status
                     state.status_pending = True
@@ -53,7 +54,10 @@ class LatestWeightBuffer:
             else:
                 # Status changes invalidate samples taken before that transition,
                 # including a connected notification after a serial reconnect.
-                if state.connection_status != snapshot.connection_status or state.sample is not None:
+                if (
+                    state.connection_status != snapshot.connection_status
+                    or state.sample is not None
+                ):
                     state.status_pending = True
                 state.connection_status = snapshot.connection_status
                 state.sample = None
@@ -99,7 +103,9 @@ class LatestWeightBuffer:
                             self._pending[station_id] = None
                         return {
                             "type": "station.status",
-                            "payload": {"station_id": station_id, "connection_status": state.connection_status},
+                            "payload": {
+                                "station_id": station_id, "connection_status": state.connection_status,
+                            },
                         }
                     snapshot = state.sample
                     state.sample_pending = False
@@ -110,7 +116,7 @@ class LatestWeightBuffer:
                     waiter = loop.create_future()
                     self._waiter = waiter
             if snapshot is not None:
-                return {"type": "weight.updated", "payload": weight_payload(station_id, snapshot)}
+                return {"type": "station.telemetry", "payload": telemetry_payload(station_id, snapshot)}
             try:
                 await waiter
             finally:
@@ -119,34 +125,47 @@ class LatestWeightBuffer:
                         self._waiter = None
 
 
-def weight_payload(station_id: int, snapshot: LiveWeightSnapshot) -> dict:
-    # Compute age at send time, including time spent offline or behind a slow send.
+def telemetry_payload(station_id: int, snapshot: StationTelemetrySnapshot) -> dict:
+    # All fields belong to one response; resending never creates a new observation.
     if (
         not snapshot.sample_valid or snapshot.connection_status != "connected"
         or snapshot.sampled_at is None or snapshot.sampled_monotonic is None
         or snapshot.sample_seq < 1
-        or (snapshot.weight is None and snapshot.weight_status not in (WeightStatus.OVERLOAD, WeightStatus.NONE))
     ):
-        raise ValueError("A weight message requires a valid sample from the current serial connection")
+        raise ValueError("Telemetry requires an observed response from the current serial connection")
+    if snapshot.weight_valid and (
+        snapshot.weight is None or snapshot.unit is None
+        or snapshot.weight_status is None or snapshot.weight_type is None
+    ):
+        raise ValueError("A valid weight requires a value, unit, status and type")
     age = max(0, int((time.monotonic() - snapshot.sampled_monotonic) * 1000))
     return {
         "station_id": station_id,
-        "weight": format(snapshot.weight, "f") if snapshot.weight is not None else None,
-        "unit": snapshot.unit,
-        "weight_status": snapshot.weight_status.value,
-        "weight_type": snapshot.weight_type.value,
+        "weight": format(snapshot.weight, "f") if snapshot.weight_valid else None,
+        "unit": snapshot.unit if snapshot.weight_valid else None,
+        "weight_status": snapshot.weight_status.value if snapshot.weight_status is not None else None,
+        "weight_type": snapshot.weight_type.value if snapshot.weight_type is not None else None,
+        "weight_valid": snapshot.weight_valid,
         "sampled_at": snapshot.sampled_at.isoformat(),
         "sample_age_ms": age,
         "sample_seq": snapshot.sample_seq,
-        "connection_status": snapshot.connection_status,
+        "printer_status": printer_status_label(snapshot.printer_status),
+        "voice_code": int(snapshot.voice_code) if snapshot.voice_code is not None else None,
+        "green_blink": snapshot.green_blink,
+        "red_blink": snapshot.red_blink,
+        "fan_on": snapshot.fan_on,
+        "heater_on": snapshot.heater_on,
+        "temperature": snapshot.temperature,
+        "fan_trigger_temp": snapshot.fan_trigger_temp,
+        "heater_trigger_temp": snapshot.heater_trigger_temp,
     }
 
 
-class LiveWeightPublisher:
+class StationTelemetryPublisher:
     """Send each station update through one Gateway socket without a backlog."""
 
     def __init__(
-        self, url: str, access_token: str, updates: LatestWeightBuffer,
+        self, url: str, access_token: str, updates: LatestTelemetryBuffer,
         *, ws_kwargs: dict | None = None,
         refresh_stations: Callable[[], Awaitable[bool]] | None = None,
     ):
@@ -160,7 +179,7 @@ class LiveWeightPublisher:
         self.retry_interval = 1.0
         self.max_retry_interval = 30.0
         self.logger = get_logger()
-        self.failures = RepeatedFailureLog(self.logger, "net.weights")
+        self.failures = RepeatedFailureLog(self.logger, "net.telemetry")
 
     async def run(self):
         retry_delay = self.retry_interval
@@ -171,7 +190,7 @@ class LiveWeightPublisher:
             try:
                 if needs_station_sync:
                     if self.refresh_stations is None:
-                        self.logger.error("net.weights.stopped", code=4403, action="refresh_station_configuration")
+                        self.logger.error("net.telemetry.stopped", code=4403, action="refresh_station_configuration")
                         return 4403
                     if not await self.refresh_stations():
                         raise ConnectionError("Station configuration refresh failed")
@@ -187,7 +206,7 @@ class LiveWeightPublisher:
                 ) as ws:
                     connected_at = loop.time()
                     await self.run_connection(ws)
-                    raise ConnectionError("Live weight connection closed")
+                    raise ConnectionError("Station telemetry connection closed")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -199,13 +218,13 @@ class LiveWeightPublisher:
                 elif isinstance(exc, InvalidStatus):
                     code = exc.response.status_code
                 if code in (1009, 4400, 4401, 4409, 4429, 401, 403):
-                    self.logger.error("net.weights.stopped", code=code, action="check_configuration_and_restart", error=str(exc))
+                    self.logger.error("net.telemetry.stopped", code=code, action="check_configuration_and_restart", error=str(exc))
                     return code
                 if code == 4403:
                     needs_station_sync = True
                 # Optional telemetry must never restart weighing, HTTP uploads or control.
                 self.failures.failure(
-                    "net.weights.unavailable", exc, level=logging.WARNING, traceback=False,
+                    "net.telemetry.unavailable", exc, level=logging.WARNING, traceback=False,
                 )
 
             if connected_at is not None and loop.time() - connected_at >= 10:
@@ -215,7 +234,7 @@ class LiveWeightPublisher:
 
     async def run_connection(self, ws):
         self.updates.replay_latest()
-        sender = asyncio.create_task(self.send_weights(ws))
+        sender = asyncio.create_task(self.send_telemetry(ws))
         receiver = asyncio.create_task(self.receive_messages(ws))
         try:
             await asyncio.wait((sender, receiver), return_when=asyncio.FIRST_COMPLETED)
@@ -238,7 +257,7 @@ class LiveWeightPublisher:
         async for _ in ws:
             pass
 
-    async def send_weights(self, ws):
+    async def send_telemetry(self, ws):
         sequence = 0
         while True:
             try:

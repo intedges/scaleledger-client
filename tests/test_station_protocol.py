@@ -248,7 +248,7 @@ class UnreadableFieldStationTests(unittest.TestCase):
         with patch("suwol1000.get_logger") as get_logger:
             get_logger.return_value.bind.return_value = logger
             worker = WeighingStationWorker(
-                scale, station_id=7, on_event=save, on_live_weight=samples.append,
+                scale, station_id=7, on_event=save, on_telemetry=samples.append,
                 polling_interval=0, retry_interval=0,
             )
         scale.stop_event = worker.stop_event
@@ -300,8 +300,11 @@ class UnreadableFieldStationTests(unittest.TestCase):
         self.assertEqual(fields, ["weight_value"])
         last = scale.requests[-1]
         self.assertEqual((last.green_blink, last.red_blink), (False, True))
-        self.assertIn("error", [sample.connection_status for sample in samples])
-        self.assertFalse(any(sample.sample_valid for sample in samples))
+        self.assertNotIn("error", [sample.connection_status for sample in samples])
+        observed = [sample for sample in samples if sample.sample_valid]
+        self.assertTrue(observed)
+        self.assertTrue(all(sample.connection_status == "connected" for sample in observed))
+        self.assertFalse(any(sample.weight_valid for sample in samples))
 
 
 if __name__ == "__main__":

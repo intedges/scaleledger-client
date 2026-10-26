@@ -157,7 +157,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.submissions), 1)
         self.assertIs(self.worker.last_event, event)
         self.assertEqual((event.weight, event.rfid_card_uid), (12, "12345678"))
-        self.assertEqual(self.worker.get_live_weight().weight, Decimal("99.8"))
+        self.assertEqual(self.worker.get_telemetry().weight, Decimal("99.8"))
         pending = [
             call for call in self.worker.logger.warning.call_args_list
             if call.args[0] == "biz.weighing.local_save_pending"

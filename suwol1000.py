@@ -63,8 +63,8 @@ class InputCode(StrEnum):
 
 class RelayCode(IntFlag):
     OFF    = 0
-    GREEN  = 1 << 0  # Relay 1: 녹색등 점멸
-    RED    = 1 << 1  # Relay 2: 적색등 점멸
+    GREEN  = 1 << 0  # Relay 1: 녹색등 출력
+    RED    = 1 << 1  # Relay 2: 적색등 출력
     RELAY3 = 1 << 2  # Relay 3: 모름
     FAN    = 1 << 3  # Relay 4: 팬 작동
     HEATER = 1 << 4  # Relay 5: 히터 작동
@@ -77,6 +77,10 @@ class PrinterStatus(IntEnum):
     NORMAL = 0        # 정상
     NO_PAPER = 1      # 용지없음
     TRANSMITTING = 2  # 전송중
+
+
+def printer_status_label(status: PrinterStatus | None) -> str:
+    return status.name.lower() if status is not None else "unknown"
 
 
 class WeightStatus(StrEnum):
@@ -358,16 +362,26 @@ class WorkerState(Enum):
 
 
 @dataclass(frozen=True)
-class LiveWeightSnapshot:
+class StationTelemetrySnapshot:
     weight: Decimal | None = None
-    unit: str = "kg"
-    weight_status: WeightStatus = WeightStatus.NONE
-    weight_type: WeightType = WeightType.NONE
+    unit: str | None = None
+    weight_status: WeightStatus | None = None
+    weight_type: WeightType | None = None
+    weight_valid: bool = False
     sampled_at: datetime | None = None
     sampled_monotonic: float | None = None
     sample_seq: int = 0
     connection_status: str = "waiting"
     sample_valid: bool = False
+    printer_status: PrinterStatus | None = None
+    voice_code: VoiceCode | None = None
+    green_blink: bool | None = None
+    red_blink: bool | None = None
+    fan_on: bool | None = None
+    heater_on: bool | None = None
+    temperature: int | None = None
+    fan_trigger_temp: int | None = None
+    heater_trigger_temp: int | None = None
 
 
 class WeighingStationWorker:
@@ -380,7 +394,7 @@ class WeighingStationWorker:
         polling_interval: float = 0.1,
         retry_interval: float = 1.0,
         initial_sample_seq: int = 0,
-        on_live_weight: Callable[[LiveWeightSnapshot], None] | None = None,
+        on_telemetry: Callable[[StationTelemetrySnapshot], None] | None = None,
         vehicle_threshold: Decimal = Decimal("50"),
         vehicle_ready_seconds: float = 1.0,
         vehicle_empty_seconds: float = 3.0,
@@ -395,7 +409,7 @@ class WeighingStationWorker:
         self.receipt_builder = receipt_builder
         self.polling_interval = polling_interval
         self.retry_interval = retry_interval
-        self.on_live_weight = on_live_weight
+        self.on_telemetry = on_telemetry
         self.cycle = WeighingCycle(
             vehicle_threshold, vehicle_ready_seconds, vehicle_empty_seconds,
         )
@@ -441,13 +455,13 @@ class WeighingStationWorker:
         self._save_delay_reported = False
         self.stop_event = threading.Event()
         self._snapshot_lock = threading.Lock()
-        self._live_weight = LiveWeightSnapshot()
         self._sample_seq = initial_sample_seq
+        self._telemetry = StationTelemetrySnapshot(sample_seq=initial_sample_seq)
 
         self.logger = get_logger().bind(port=serial_client.port)
         # A powered-off scale fails about once a second; summarize the repeats.
         self.failures = RepeatedFailureLog(self.logger, "hw.station")
-        self.live_weight_failures = RepeatedFailureLog(self.logger, "hw.station.live_weight")
+        self.telemetry_failures = RepeatedFailureLog(self.logger, "hw.station.telemetry")
 
     def stop(self):
         self.logger.info("sys.worker.stop_requested")
@@ -455,34 +469,48 @@ class WeighingStationWorker:
         self._set_connection_status("disconnected")
         self.client.interrupt()
 
-    def get_live_weight(self) -> LiveWeightSnapshot:
-        # Keep weight, device status and sample time from the same serial response.
+    def get_telemetry(self) -> StationTelemetrySnapshot:
+        # One immutable observation contains the readable fields from one response.
         with self._snapshot_lock:
-            return self._live_weight
+            return self._telemetry
 
     def _set_connection_status(self, status: str):
         with self._snapshot_lock:
             if self.stop_event.is_set():
                 status = "disconnected"
-            if self._live_weight.connection_status == status and not self._live_weight.sample_valid:
+            snapshot = StationTelemetrySnapshot(connection_status=status, sample_seq=self._sample_seq)
+            if snapshot == self._telemetry:
                 return
-            self._live_weight = dataclasses.replace(
-                self._live_weight, connection_status=status, sample_valid=False,
-            )
-            self._notify_live_weight()
+            self._update_telemetry(snapshot)
 
-    def _notify_live_weight(self):
+    def _update_telemetry(self, snapshot: StationTelemetrySnapshot):
+        # Called under _snapshot_lock so logs and callbacks follow observation order.
+        previous = self._telemetry.printer_status
+        self._telemetry = snapshot
+        if previous != snapshot.printer_status and not self.stop_event.is_set():
+            log = (
+                self.logger.warning
+                if snapshot.printer_status in (None, PrinterStatus.NO_PAPER)
+                else self.logger.info
+            )
+            log(
+                "hw.printer.status_changed", previous=printer_status_label(previous),
+                status=printer_status_label(snapshot.printer_status),
+            )
+        self._notify_telemetry()
+
+    def _notify_telemetry(self):
         # Called under _snapshot_lock so stop cannot publish before an older sample.
         # The callback must only enqueue/update state; it must not wait for I/O or
         # re-enter this worker. The separate sender performs all network work.
-        if self.on_live_weight is None:
+        if self.on_telemetry is None:
             return
         try:
-            self.on_live_weight(self._live_weight)
+            self.on_telemetry(self._telemetry)
         except Exception as exc:
-            self.live_weight_failures.failure("hw.station.live_weight.callback_failed", exc)
+            self.telemetry_failures.failure("hw.station.telemetry.callback_failed", exc)
         else:
-            self.live_weight_failures.success()
+            self.telemetry_failures.success()
 
     def run(self):
         self.logger.info("sys.worker.started")
@@ -583,8 +611,10 @@ class WeighingStationWorker:
                         reason="response_lost", action="suppress_voice_until_busy_then_idle",
                     )
             raise
+        sampled_at = datetime.now(UTC)
+        sampled_monotonic = time.monotonic()
         if not self.stop_event.is_set():
-            now = time.monotonic()
+            now = sampled_monotonic
             self._observe_voice(response.voice_code, now)
             self._report_invalid_fields(response)
             if self._valid_weighing_response(response):
@@ -606,26 +636,30 @@ class WeighingStationWorker:
                 self._indicator_fault = True
         with self._snapshot_lock:
             if not self.stop_event.is_set():
-                if self._valid_live_response(response):
-                    self._sample_seq += 1
-                    self._live_weight = LiveWeightSnapshot(
-                        weight=response.weight_value,
-                        unit=response.weight_unit,
-                        weight_status=response.weight_status,
-                        weight_type=response.weight_type,
-                        sampled_at=datetime.now(UTC),
-                        sampled_monotonic=time.monotonic(),
-                        sample_seq=self._sample_seq,
-                        connection_status="connected",
-                        sample_valid=True,
-                    )
-                    self._notify_live_weight()
-                elif self._live_weight.connection_status != "error":
-                    # Leave the business parser contract intact; invalid numbers aren't live samples.
-                    self._live_weight = dataclasses.replace(
-                        self._live_weight, connection_status="error", sample_valid=False,
-                    )
-                    self._notify_live_weight()
+                weight_valid = self._valid_live_response(response)
+                self._sample_seq += 1
+                snapshot = StationTelemetrySnapshot(
+                    weight=response.weight_value if weight_valid else None,
+                    unit=response.weight_unit if weight_valid else None,
+                    weight_status=response.weight_status,
+                    weight_type=response.weight_type,
+                    weight_valid=weight_valid,
+                    sampled_at=sampled_at,
+                    sampled_monotonic=sampled_monotonic,
+                    sample_seq=self._sample_seq,
+                    connection_status="connected",
+                    sample_valid=True,
+                    printer_status=response.printer_status,
+                    voice_code=response.voice_code,
+                    green_blink=response.green_blink,
+                    red_blink=response.red_blink,
+                    fan_on=response.fan_on,
+                    heater_on=response.heater_on,
+                    temperature=response.inner_temperature,
+                    fan_trigger_temp=response.fan_trigger_temp,
+                    heater_trigger_temp=response.heater_trigger_temp,
+                )
+                self._update_telemetry(snapshot)
         self.failures.success()
         return response
 
@@ -679,7 +713,8 @@ class WeighingStationWorker:
 
     def _report_invalid_fields(self, response: ResponsePacket):
         # Unreadable weight pauses weighing, voice skips guidance and a card is
-        # ignored; other fields are unused. Report each field once per worker.
+        # ignored; unreadable printer status is reported as unknown. Log each
+        # invalid field once per worker.
         new_fields = set(response.invalid_fields) - self._reported_invalid_fields
         if new_fields:
             self._reported_invalid_fields |= new_fields

@@ -9,7 +9,7 @@ from cache import MarketDataCache
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 from printer import Receipt, ReceiptTemplate
 from models import WeighingStation
-from suwol1000 import LiveWeightSnapshot, SerialClient, WeighingStationWorker
+from suwol1000 import StationTelemetrySnapshot, SerialClient, WeighingStationWorker
 
 
 @dataclass
@@ -26,12 +26,12 @@ class WeighingStationManager:
         on_event: Callable[[BaseEvent], Future[None] | None],
         market_cache: MarketDataCache,
         *,
-        on_live_weight: Callable[[int, LiveWeightSnapshot], None] | None = None,
+        on_telemetry: Callable[[int, StationTelemetrySnapshot], None] | None = None,
         on_station_removed: Callable[[int], None] | None = None,
     ):
         self.on_event = on_event
         self.market_cache = market_cache
-        self.on_live_weight = on_live_weight
+        self.on_telemetry = on_telemetry
         self.on_station_removed = on_station_removed
         self.workers: dict[int, StationRuntime] = {}
         self._sample_sequences: dict[int, int] = {}
@@ -93,8 +93,8 @@ class WeighingStationManager:
             )
             return ReceiptTemplate.render(receipt)
 
-        def on_live_weight(snapshot: LiveWeightSnapshot):
-            self.on_live_weight(station.id, snapshot)
+        def on_telemetry(snapshot: StationTelemetrySnapshot):
+            self.on_telemetry(station.id, snapshot)
 
         worker = WeighingStationWorker(
             serial_client=SerialClient(port=station.serial_port),
@@ -103,17 +103,17 @@ class WeighingStationManager:
             rfid_validator=validate_rfid,
             receipt_builder=build_receipt,
             initial_sample_seq=self._sample_sequences.get(station.id, 0),
-            on_live_weight=on_live_weight if self.on_live_weight is not None else None,
+            on_telemetry=on_telemetry if self.on_telemetry is not None else None,
         )
 
         thread = threading.Thread(target=worker.run, name=f"WeighingStation-{station.id}-{station.serial_port}", daemon=True)
         runtime = StationRuntime(worker=worker, thread=thread, port=station.serial_port, station_name=station.name)
         self.workers[station.id] = runtime
-        if self.on_live_weight is not None:
+        if self.on_telemetry is not None:
             try:
-                on_live_weight(worker.get_live_weight())
+                on_telemetry(worker.get_telemetry())
             except Exception:
-                self.logger.exception("sys.manager.station.live_weight.callback_failed", station_id=station.id)
+                self.logger.exception("sys.manager.station.telemetry.callback_failed", station_id=station.id)
         try:
             thread.start()
         except Exception:
@@ -139,7 +139,7 @@ class WeighingStationManager:
 
     def _remember_sample_sequence(self, station_id: int, runtime: StationRuntime):
         self._sample_sequences[station_id] = max(
-            self._sample_sequences.get(station_id, 0), runtime.worker.get_live_weight().sample_seq,
+            self._sample_sequences.get(station_id, 0), runtime.worker.get_telemetry().sample_seq,
         )
 
     def stop_all(self):

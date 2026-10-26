@@ -526,7 +526,7 @@ class StationCycleTests(unittest.TestCase):
         )
         self.idle_at(*(start + offset for offset in (3, 5, 6, 7)))
         self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 1)
-        sample = self.worker.get_live_weight()
+        sample = self.worker.get_telemetry()
         self.assertTrue(sample.sample_valid)
         self.assertEqual(sample.connection_status, "connected")
         self.assertFalse(self.worker._indicator_fault)
@@ -552,7 +552,12 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(self.worker.cycle.state, CycleState.READY)
         self.idle_at(self.clock.now, self.clock.now + 1, self.clock.now + 2)
         self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 1)
-        self.worker.logger.warning.assert_called_once_with(
+        voice_warnings = [
+            call for call in self.worker.logger.warning.call_args_list
+            if call.args[0] == "hw.speaker.playback_uncertain"
+        ]
+        self.assertEqual(len(voice_warnings), 1)
+        self.worker.logger.warning.assert_any_call(
             "hw.speaker.playback_uncertain", voice_code="TAG_CARD",
             reason="response_lost", action="suppress_voice_until_busy_then_idle",
         )
