@@ -103,7 +103,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch("main.get_hostname", return_value="test-gateway"),
             patch("main.get_logger", return_value=Mock()),
             patch("main.websockets.connect", return_value=self.connections),
-            patch("main.LiveWeightPublisher", return_value=self.publisher),
+            patch("main.StationTelemetryPublisher", return_value=self.publisher),
         )
         for patcher in patches:
             patcher.start()

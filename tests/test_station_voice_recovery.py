@@ -134,7 +134,7 @@ class StationVoiceRecoveryTests(unittest.TestCase):
             worker = WeighingStationWorker(
                 scale, station_id=7, on_event=on_event, rfid_validator=lambda event: True,
                 receipt_builder=lambda event: event.uuid.encode("ascii"),
-                on_live_weight=scale.live_snapshots.append,
+                on_telemetry=scale.live_snapshots.append,
                 polling_interval=0.1, retry_interval=0.2,
             )
             worker.stop_event = BoundedSimulationStop(clock, 88)

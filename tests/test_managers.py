@@ -8,7 +8,7 @@ from cache import MarketDataCache, RFIDInfo
 from events import WeighingCompletedEvent
 from managers import StationRuntime, WeighingStationManager
 from models import WeighingStation
-from suwol1000 import DisplayRequestPacket, LiveWeightSnapshot, ResponsePacket, WorkerState
+from suwol1000 import DisplayRequestPacket, StationTelemetrySnapshot, ResponsePacket, WorkerState
 from tests.helpers import prepare_vehicle
 
 
@@ -71,7 +71,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         cached = WeighingStation(id=1, name="Cached station", serial_port="old-port")
         updated = WeighingStation(id=1, name="Updated station", serial_port="new-port")
         workers = [Mock(), Mock()]
-        workers[0].get_live_weight.return_value = LiveWeightSnapshot(sample_seq=12)
+        workers[0].get_telemetry.return_value = StationTelemetrySnapshot(sample_seq=12)
         threads = [Mock(), Mock()]
 
         with patch("managers.WeighingStationWorker", side_effect=workers) as worker, patch(
@@ -114,7 +114,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         runtimes = []
         for station_id in (1, 2):
             worker = Mock()
-            worker.get_live_weight.return_value = LiveWeightSnapshot()
+            worker.get_telemetry.return_value = StationTelemetrySnapshot()
             thread = Mock()
             worker.stop.side_effect = lambda i=station_id: actions.append(("stop", i))
 
@@ -138,7 +138,7 @@ class WeighingStationManagerTests(unittest.TestCase):
 
     def test_stop_worker_remains_registered_until_thread_terminates(self):
         runtime = StationRuntime(Mock(), Mock(), "test-port", "Station")
-        runtime.worker.get_live_weight.return_value = LiveWeightSnapshot()
+        runtime.worker.get_telemetry.return_value = StationTelemetrySnapshot()
         self.manager.workers[1] = runtime
 
         def join():
@@ -171,7 +171,7 @@ class WeighingStationManagerTests(unittest.TestCase):
             self.assertIn(station_id, self.manager.workers)
             updates.append((station_id, sample))
 
-        self.manager.on_live_weight = receive
+        self.manager.on_telemetry = receive
         station = WeighingStation(id=7, name="Station", serial_port="test-port")
         client = Mock(port="test-port")
         client.send_and_receive.return_value = ResponsePacket()
@@ -190,7 +190,7 @@ class WeighingStationManagerTests(unittest.TestCase):
 
     def test_port_restart_removes_old_snapshot_before_waiting_and_new_sample(self):
         actions = []
-        self.manager.on_live_weight = lambda station_id, sample: actions.append(
+        self.manager.on_telemetry = lambda station_id, sample: actions.append(
             (station_id, sample.connection_status, sample.sample_seq),
         )
         self.manager.on_station_removed = lambda station_id: actions.append((station_id, "removed"))
@@ -211,12 +211,12 @@ class WeighingStationManagerTests(unittest.TestCase):
 
         self.assertEqual(actions, [
             (1, "waiting", 0), (1, "connected", 1), (1, "disconnected", 1), (1, "removed"),
-            (1, "waiting", 0), (1, "connected", 2), (1, "disconnected", 2), (1, "removed"),
+            (1, "waiting", 1), (1, "connected", 2), (1, "disconnected", 2), (1, "removed"),
         ])
         self.assertEqual(self.manager.workers, {})
 
     def test_failed_initial_callback_does_not_prevent_worker_start(self):
-        self.manager.on_live_weight = Mock(side_effect=RuntimeError("Callback failed"))
+        self.manager.on_telemetry = Mock(side_effect=RuntimeError("Callback failed"))
         station = WeighingStation(id=1, name="Station", serial_port="test-port")
 
         with patch("managers.threading.Thread") as thread:
@@ -227,7 +227,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         self.manager.logger.exception.assert_called_once()
 
     def test_failed_thread_start_removes_waiting_snapshot_and_registration(self):
-        self.manager.on_live_weight = Mock()
+        self.manager.on_telemetry = Mock()
         self.manager.on_station_removed = Mock()
         station = WeighingStation(id=1, name="Station", serial_port="test-port")
 
