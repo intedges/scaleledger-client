@@ -56,6 +56,8 @@ class ScheduledTraffic:
     """
 
     port = "virtual-soak-scale"
+    timeout = 2.0
+    write_timeout = 2.0
     startup_occupied_seconds = 6.0
     initial_empty_seconds = 6.0
     occupied_seconds = 24.0

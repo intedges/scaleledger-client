@@ -19,7 +19,8 @@ class WeighingCycle:
         threshold: Decimal,
         ready_seconds: float,
         empty_seconds: float,
-        max_sample_gap: float = 2.0,
+        max_sample_gap: float = 5.0,
+        max_sample_age: float = 2.0,
     ):
         if not isinstance(threshold, Decimal) or not threshold.is_finite() or threshold <= 0:
             raise ValueError("threshold must be a finite positive Decimal")
@@ -27,6 +28,9 @@ class WeighingCycle:
         self.ready_seconds = self._positive_seconds(ready_seconds, "ready_seconds")
         self.empty_seconds = self._positive_seconds(empty_seconds, "empty_seconds")
         self.max_sample_gap = self._positive_seconds(max_sample_gap, "max_sample_gap")
+        # Slow successful exchanges may stay continuous without authorizing
+        # a stale, already-received weight for a new measurement.
+        self.max_sample_age = self._positive_seconds(max_sample_age, "max_sample_age")
         self.state = CycleState.WAIT_EMPTY
         self.ready_sequence = 0
         # Breaks in observation; a vehicle seen before one may have left since.
@@ -65,11 +69,21 @@ class WeighingCycle:
         if self.state in (CycleState.READY, CycleState.RESERVED):
             self.state = CycleState.WAIT_ENTRY
 
-    def _expire_sample(self, now: float):
+    def _expire_sample(self, now: float, *, max_age: float):
         if self._last_sample_at is not None and (
-            now < self._last_sample_at or now - self._last_sample_at > self.max_sample_gap
+            now < self._last_sample_at or now - self._last_sample_at > max_age
         ):
             self.invalidate()
+
+    def expire_observation(self, *, now: float) -> bool:
+        """Expire continuity even when no new weight has arrived."""
+        now = self._finite_seconds(now, "now")
+        if self._last_sample_at is not None and (
+            now < self._last_sample_at or now - self._last_sample_at >= self.max_sample_gap
+        ):
+            self.invalidate()
+            return True
+        return False
 
     def _become_ready(self):
         self.state = CycleState.READY
@@ -77,7 +91,7 @@ class WeighingCycle:
 
     def observe(self, weight: Decimal | None, *, now: float):
         now = self._finite_seconds(now, "now")
-        self._expire_sample(now)
+        self.expire_observation(now=now)
         if not isinstance(weight, Decimal) or not weight.is_finite():
             self.invalidate()
             return
@@ -105,7 +119,7 @@ class WeighingCycle:
 
     def reserve(self, *, now: float) -> bool:
         now = self._finite_seconds(now, "now")
-        self._expire_sample(now)
+        self._expire_sample(now, max_age=self.max_sample_age)
         if self.state != CycleState.READY or not self._last_sample_high:
             return False
         self.state = CycleState.RESERVED
@@ -117,7 +131,7 @@ class WeighingCycle:
 
     def consume(self, *, now: float) -> bool:
         now = self._finite_seconds(now, "now")
-        self._expire_sample(now)
+        self._expire_sample(now, max_age=self.max_sample_age)
         if self.state != CycleState.RESERVED or not self._last_sample_high:
             return False
         self.state = CycleState.LOCKED

@@ -1,5 +1,6 @@
 from concurrent.futures import Future
 from decimal import Decimal
+import logging
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -8,7 +9,7 @@ import serial
 
 from events import WeighingCompletedEvent
 from suwol1000 import (
-    DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
+    DeviceResponseTimeout, DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
     WeighingStationWorker, WorkerState,
 )
 from tests.helpers import prepare_vehicle
@@ -19,7 +20,7 @@ class StationSaveTests(unittest.TestCase):
         self.result = Future()
         self.on_event = Mock(return_value=self.result)
         self.receipt_builder = Mock(return_value=b"saved receipt")
-        self.client = Mock(port="save-test-port")
+        self.client = Mock(port="save-test-port", timeout=2.0, write_timeout=2.0)
         self.requests = []
         self.client.send_and_receive.side_effect = self.answer
         logger = Mock()
@@ -201,6 +202,14 @@ class StationSaveTests(unittest.TestCase):
     def test_serial_disconnection_reconnects_and_preserves_pending_save(self):
         self.assert_run_preserves_pending_save(serial.SerialException("device disconnected"))
 
+    def test_response_timeout_reconnects_and_preserves_pending_save(self):
+        self.assert_run_preserves_pending_save(
+            DeviceResponseTimeout("Serial response timeout: received 0/53 bytes"),
+        )
+
+    def test_write_timeout_reconnects_and_preserves_pending_save(self):
+        self.assert_run_preserves_pending_save(serial.SerialTimeoutException("Write timeout"))
+
     def assert_run_preserves_pending_save(self, failure):
         event = self.begin_measurement()
         self.worker.state = WorkerState.SAVE
@@ -242,6 +251,13 @@ class StationSaveTests(unittest.TestCase):
         self.assertEqual(requests_after_failure[0].voice_code, VoiceCode.NONE)
         if isinstance(failure, serial.SerialException):
             self.client.connect.assert_called_once_with()
+            self.worker.logger.log.assert_called_once()
+            failure_log = self.worker.logger.log.call_args
+            self.assertEqual(failure_log.args[0], logging.ERROR)
+            self.assertEqual(failure_log.kwargs["rfid_card_uid"], event.rfid_card_uid)
+            self.assertEqual(failure_log.kwargs["event_id"], event.uuid)
+            self.assertNotIn("exc_info", failure_log.kwargs)
+            self.assertEqual(failure_log.kwargs["error"], repr(failure))
         else:
             self.client.connect.assert_not_called()
         self.assert_no_completion()

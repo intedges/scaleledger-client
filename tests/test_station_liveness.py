@@ -14,9 +14,10 @@ import serial
 
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from suwol1000 import (
-    DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
+    DeviceResponseTimeout, DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
     WeighingStationWorker, WorkerState,
 )
+from weighing_cycle import CycleState
 
 
 class SimulatedClock:
@@ -59,9 +60,12 @@ def simulated_wait(clock):
 
 class ContinuousScale:
     port = "continuous-liveness-simulation"
+    timeout = 2.0
+    write_timeout = 2.0
 
     def __init__(self, clock, *, missing_voices=(), busy_seconds=0.8,
-                 fault=None, jitter=False, repeat_tags=True):
+                 fault=None, jitter=False, repeat_tags=True, exchange_seconds=0.1,
+                 visit_windows=((6, 40), (46, 80))):
         self.clock = clock
         self.missing_voices = set(missing_voices)
         self.busy_seconds = busy_seconds
@@ -69,6 +73,8 @@ class ContinuousScale:
         self.fault_used = False
         self.jitter = jitter
         self.repeat_tags = repeat_tags
+        self.exchange_seconds = exchange_seconds
+        self.visit_windows = visit_windows
         self.tagged_visits = set()
         self.active_voice = VoiceCode.NONE
         self.voice_until = 0.0
@@ -88,14 +94,13 @@ class ContinuousScale:
 
     def visit_at(self, at=None):
         at = self.clock.now if at is None else at
-        if 6 <= at < 40:
-            return 1
-        if 46 <= at < 80:
-            return 2
+        for visit, (start, end) in enumerate(self.visit_windows, start=1):
+            if start <= at < end:
+                return visit
         return 0
 
     def send_and_receive(self, request):
-        self.clock.advance(0.1)
+        self.clock.advance(self.exchange_seconds)
         visit = self.visit_at()
         self.requests.append((self.clock.now, visit, self.worker.state, request))
         if self.fault and not self.fault_used and self.fault(request, self):
@@ -139,11 +144,13 @@ class ContinuousScale:
 class StationLivenessTests(unittest.TestCase):
     def simulate(self, *, missing_voices=(), busy_seconds=0.8, fault=None,
                  jitter=False, fail_first_save=False, save_delay=0.0,
-                 rejected_first_card=False, repeat_tags=True):
+                 rejected_first_card=False, repeat_tags=True, exchange_seconds=0.1,
+                 visit_windows=((6, 40), (46, 80)), deadline=88):
         clock = SimulatedClock()
         scale = ContinuousScale(
             clock, missing_voices=missing_voices, busy_seconds=busy_seconds,
             fault=fault, jitter=jitter, repeat_tags=repeat_tags,
+            exchange_seconds=exchange_seconds, visit_windows=visit_windows,
         )
         submissions = []
         accepted = []
@@ -189,7 +196,7 @@ class StationLivenessTests(unittest.TestCase):
                 polling_interval=0.1, retry_interval=0.2,
                 voice_timeout=2,
             )
-            worker.stop_event = BoundedSimulationStop(clock, 88)
+            worker.stop_event = BoundedSimulationStop(clock, deadline)
             scale.worker = worker
             worker.run()
         self.assertLess(len(scale.requests), 2000, "simulation failed to make time progress")
@@ -213,6 +220,60 @@ class StationLivenessTests(unittest.TestCase):
         self.assert_two_visits_once(submissions)
         self.assertEqual(len(accepted), 2)
         self.assertEqual(len(scale.printed), 2)
+
+    def test_slow_successful_exchanges_complete_two_vehicle_visits(self):
+        for exchange_seconds in (2.5, 3.0, 3.9, 4.0):
+            with self.subTest(exchange_seconds=exchange_seconds):
+                scale, submissions, accepted = self.simulate(
+                    exchange_seconds=exchange_seconds,
+                    visit_windows=((20, 80), (100, 160)), deadline=180,
+                )
+                self.assert_two_visits_once(submissions)
+                self.assertEqual(len(accepted), 2)
+                self.assertEqual([visit for visit, _ in scale.printed], [1, 2])
+                self.assertEqual(scale.connect_calls, 1)
+                self.assertEqual(scale.worker.cycle.state, CycleState.WAIT_ENTRY)
+                self.assertEqual(scale.worker.cycle.invalidations, 0)
+
+    def test_timeout_after_slow_print_does_not_reweigh_the_same_vehicle(self):
+        def timeout_after_print(request, scale):
+            if scale.printed and scale.visit_at() == 1:
+                scale.fault_used = True
+                raise DeviceResponseTimeout("one simulated response timeout")
+            return False
+
+        scale, submissions, accepted = self.simulate(
+            exchange_seconds=2.5, fault=timeout_after_print,
+            visit_windows=((20, 80), (100, 160)), deadline=180,
+        )
+        self.assertTrue(scale.fault_used)
+        self.assertEqual(scale.connect_calls, 2)
+        self.assert_two_visits_once(submissions)
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual([visit for visit, _ in scale.printed], [1, 2])
+        self.assertEqual(scale.worker.cycle.state, CycleState.WAIT_ENTRY)
+
+    def test_observation_gap_after_slow_print_preserves_the_consumed_visit(self):
+        paused = False
+
+        def pause_after_print(request, scale):
+            nonlocal paused
+            if not paused and scale.printed and scale.visit_at() == 1:
+                paused = True
+                scale.clock.advance(10)
+            return False
+
+        scale, submissions, accepted = self.simulate(
+            exchange_seconds=2.5, fault=pause_after_print,
+            visit_windows=((20, 80), (100, 160)), deadline=180,
+        )
+        self.assertTrue(paused)
+        self.assertGreater(scale.worker.cycle.invalidations, 0)
+        self.assertEqual(scale.connect_calls, 1)
+        self.assert_two_visits_once(submissions)
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual([visit for visit, _ in scale.printed], [1, 2])
+        self.assertEqual(scale.worker.cycle.state, CycleState.WAIT_ENTRY)
 
     def test_busy_voice_ends_and_both_vehicles_eventually_finish(self):
         scale, submissions, _ = self.simulate(busy_seconds=1.6)

@@ -25,6 +25,8 @@ from workers import RecordUploadWorker
 
 class RecordingScale:
     port = "save-confirmation-test"
+    timeout = 2.0
+    write_timeout = 2.0
 
     def __init__(self):
         self.requests = []

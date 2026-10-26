@@ -14,7 +14,7 @@ from tests.test_station_protocol import frame
 
 class PrinterObservationTests(unittest.TestCase):
     def setUp(self):
-        self.serial = Mock(port="test-port")
+        self.serial = Mock(port="test-port", timeout=2.0, write_timeout=2.0)
         self.snapshots = []
         self.worker = WeighingStationWorker(
             self.serial, station_id=7, on_telemetry=self.snapshots.append,

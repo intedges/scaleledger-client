@@ -7,6 +7,7 @@ import dataclasses
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import auto, Enum, IntEnum, StrEnum, IntFlag
+import logging
 import math
 import re
 from typing import ClassVar, Literal, Self
@@ -29,6 +30,8 @@ RESPONSE_LENGTH = 53
 NO_CARD = "00000000"
 # Sign and six significant digits fill the 8-byte weight display of a request.
 DISPLAY_WEIGHT_FORMAT = "=+8.6"
+SLOW_EXCHANGE_SECONDS = 1.0
+SLOW_EXCHANGE_LOG_INTERVAL = 600.0
 
 
 class CommandCode(StrEnum):
@@ -311,12 +314,18 @@ class ResponsePacket:
         )
 
 
+class DeviceResponseTimeout(serial.SerialException):
+    """The device did not return a complete response within the read timeout."""
+
+
 class SerialClient:
-    def __init__(self, port: str, timeout: float = 1.0, write_timeout: float = 1.0):
+    def __init__(self, port: str, timeout: float = 2.0, write_timeout: float = 2.0):
         self.port = port
         self.timeout = timeout
         self.write_timeout = write_timeout
         self.serial: serial.Serial | None = None
+        self.logger = get_logger().bind(port=port)
+        self._next_slow_log_at = 0.0
 
     def connect(self):
         self.serial = serial.Serial(
@@ -345,9 +354,45 @@ class SerialClient:
         # Drop late or stray bytes so an earlier fault cannot shift this frame,
         # and read the fixed length: a field byte may itself equal ETX.
         self.serial.reset_input_buffer()
-        self.serial.write(request.to_bytes())
+        data = request.to_bytes()
+        started_at = time.monotonic()
+        try:
+            self.serial.write(data)
+        except serial.SerialTimeoutException as exc:
+            write_seconds = time.monotonic() - started_at
+            raise serial.SerialTimeoutException(
+                f"Serial write timeout: command={request.command_code.value} "
+                f"request_bytes={len(data)} timeout={self.write_timeout}s "
+                f"write_seconds={write_seconds:.3f}: {exc}"
+            ) from exc
+        written_at = time.monotonic()
         response = self.serial.read(RESPONSE_LENGTH)
-        return ResponsePacket.from_bytes(response)
+        received_at = time.monotonic()
+        write_seconds = written_at - started_at
+        read_seconds = received_at - written_at
+        # pyserial returns a short read on timeout (or cancellation), rather
+        # than raising. Route it through the worker's serial recovery path.
+        if len(response) < RESPONSE_LENGTH:
+            raise DeviceResponseTimeout(
+                f"Serial response timeout: received {len(response)}/{RESPONSE_LENGTH} bytes "
+                f"(timeout={self.timeout}s command={request.command_code.value} "
+                f"request_bytes={len(data)} write_seconds={write_seconds:.3f} "
+                f"read_seconds={read_seconds:.3f}) {response.hex(' ')}".rstrip()
+            )
+        packet = ResponsePacket.from_bytes(response)
+        # Measure API calls, not wire time or physical printing completion.
+        # A persistently slow device must not emit a warning on every poll.
+        elapsed = received_at - started_at
+        if elapsed >= SLOW_EXCHANGE_SECONDS and received_at >= self._next_slow_log_at:
+            self._next_slow_log_at = received_at + SLOW_EXCHANGE_LOG_INTERVAL
+            self.logger.warning(
+                "hw.serial.slow_exchange", command=request.command_code.value,
+                request_bytes=len(data), response_bytes=len(response),
+                write_seconds=round(write_seconds, 3), read_seconds=round(read_seconds, 3),
+                total_seconds=round(elapsed, 3),
+                read_timeout=self.timeout, write_timeout=self.write_timeout,
+            )
+        return packet
 
 
 class WorkerState(Enum):
@@ -397,7 +442,7 @@ class WeighingStationWorker:
         on_telemetry: Callable[[StationTelemetrySnapshot], None] | None = None,
         vehicle_threshold: Decimal = Decimal("50"),
         vehicle_ready_seconds: float = 1.0,
-        vehicle_empty_seconds: float = 3.0,
+        vehicle_empty_seconds: float = 1.0,
         voice_timeout: float = 15.0,
         *,
         station_id: int,
@@ -412,6 +457,8 @@ class WeighingStationWorker:
         self.on_telemetry = on_telemetry
         self.cycle = WeighingCycle(
             vehicle_threshold, vehicle_ready_seconds, vehicle_empty_seconds,
+            max_sample_gap=5.0,
+            max_sample_age=2.0,
         )
         if (
             isinstance(voice_timeout, bool) or not isinstance(voice_timeout, (int, float))
@@ -459,7 +506,7 @@ class WeighingStationWorker:
         self._telemetry = StationTelemetrySnapshot(sample_seq=initial_sample_seq)
 
         self.logger = get_logger().bind(port=serial_client.port)
-        # A powered-off scale fails about once a second; summarize the repeats.
+        # A powered-off scale repeatedly times out; summarize the repeats.
         self.failures = RepeatedFailureLog(self.logger, "hw.station")
         self.telemetry_failures = RepeatedFailureLog(self.logger, "hw.station.telemetry")
 
@@ -518,6 +565,7 @@ class WeighingStationWorker:
         while not self.stop_event.is_set():
             structlog.contextvars.bind_contextvars(state=self.state.name)
             try:
+                self._expire_observation(now=time.monotonic())
                 match self.state:
                     case WorkerState.INITIALIZE:
                         self.state = self.initialize()
@@ -543,10 +591,16 @@ class WeighingStationWorker:
                 self.stop_event.wait(self.polling_interval)
                 self.state = self._resume_state()
 
-            except serial.SerialTimeoutException as e:
+            except DeviceResponseTimeout as e:
                 self.cycle.invalidate()
                 self._indicator_fault = True
                 self.record_failure("hw.serial.timeout", e)
+                self.state = WorkerState.RECOVER
+
+            except serial.SerialTimeoutException as e:
+                self.cycle.invalidate()
+                self._indicator_fault = True
+                self.record_failure("hw.serial.write_timeout", e)
                 self.state = WorkerState.RECOVER
 
             except serial.SerialException as e:
@@ -571,21 +625,31 @@ class WeighingStationWorker:
         self._set_connection_status("disconnected")
         self.logger.info("sys.worker.terminated")
 
+    def _expire_observation(self, *, now: float):
+        if self.cycle.expire_observation(now=now):
+            self._indicator_fault = True
+            self._set_connection_status("error")
+
     def record_failure(self, event: str, exc: Exception):
         # stop() cancels a pending read or write; that is not a device failure.
         if self.stop_event.is_set():
             return
         self._set_connection_status("disconnected" if isinstance(exc, serial.SerialException) else "error")
-        if self.state in (
+        during_weighing = self.state in (
             WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.SAVE, WorkerState.PRINT,
-        ):
+        )
+        context = {}
+        if during_weighing:
             # An interrupted weighing must stay traceable to its card and receipt.
             context = {"rfid_card_uid": self.last_plate}
             if isinstance(self.last_event, WeighingCompletedEvent):
                 context["event_id"] = self.last_event.uuid
-            self.failures.failure(event, exc, always_log=True, **context)
-        else:
-            self.failures.failure(event, exc)
+        expected_serial_failure = isinstance(exc, serial.SerialException)
+        self.failures.failure(
+            event, exc, always_log=during_weighing,
+            level=logging.WARNING if expected_serial_failure and not during_weighing else logging.ERROR,
+            traceback=not expected_serial_failure, **context,
+        )
 
     def exchange(self, request: RequestPacket) -> ResponsePacket:
         voice = getattr(request, "voice_code", VoiceCode.NONE)
