@@ -4,9 +4,12 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
+import serial
+
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from suwol1000 import (
-    RESPONSE_LENGTH, CommandCode, DisplayRequestPacket, InputCode, PrinterStatus,
+    RESPONSE_LENGTH, CommandCode, DeviceResponseTimeout, DisplayRequestPacket, InputCode,
+    PrinterRequestPacket, PrinterStatus,
     ResponsePacket, SerialClient, VoiceCode, WeighingStationWorker, WeightStatus, WeightType,
 )
 
@@ -158,6 +161,100 @@ class ResponsePacketTests(unittest.TestCase):
 
 
 class SerialClientTests(unittest.TestCase):
+    def test_connect_uses_two_second_read_and_write_limits(self):
+        with patch("suwol1000.serial.Serial") as open_serial:
+            client = SerialClient("test-port")
+            client.connect()
+
+        open_serial.assert_called_once_with("test-port", timeout=2.0, write_timeout=2.0)
+
+    def test_incomplete_response_is_a_serial_timeout_with_received_bytes(self):
+        for raw in (b"", b"\x020\x03", CAPTURED[:-1]):
+            with self.subTest(received=len(raw)):
+                client = SerialClient("test-port", timeout=0.5)
+                client.serial = Mock(is_open=True)
+                client.serial.read.return_value = raw
+
+                with patch("suwol1000.time.monotonic", side_effect=[10, 10.25, 10.75]), self.assertRaises(DeviceResponseTimeout) as caught:
+                    client.send_and_receive(DisplayRequestPacket())
+
+                self.assertEqual(
+                    str(caught.exception),
+                    f"Serial response timeout: received {len(raw)}/{RESPONSE_LENGTH} bytes "
+                    f"(timeout=0.5s command=D request_bytes=32 "
+                    f"write_seconds=0.250 read_seconds=0.500) {raw.hex(' ')}".rstrip(),
+                )
+                self.assertNotIsInstance(caught.exception, serial.SerialTimeoutException)
+                # Do not retry a command whose receipt by the device is unknown.
+                self.assertEqual(client.serial.write.call_count, 1)
+                client.serial.read.assert_called_once_with(RESPONSE_LENGTH)
+
+    def test_write_timeout_does_not_read_or_resend_and_keeps_write_timing(self):
+        client = SerialClient("test-port")
+        client.serial = Mock(is_open=True)
+        failure = serial.SerialTimeoutException("Write timeout")
+        client.serial.write.side_effect = failure
+        request = PrinterRequestPacket(document_bytes=b"receipt")
+
+        with patch("suwol1000.time.monotonic", side_effect=[10, 12]), self.assertRaises(serial.SerialTimeoutException) as caught:
+            client.send_and_receive(request)
+
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertIn("command=P request_bytes=16 timeout=2.0s write_seconds=2.000", str(caught.exception))
+        client.serial.write.assert_called_once_with(request.to_bytes())
+        client.serial.read.assert_not_called()
+
+    def test_slow_success_keeps_response_and_limits_timing_logs_to_ten_minutes(self):
+        client = SerialClient("test-port")
+        client.serial = Mock(is_open=True)
+        client.serial.read.return_value = CAPTURED
+        client.logger = Mock()
+        requests = [DisplayRequestPacket(), PrinterRequestPacket(document_bytes=b"receipt")]
+        # The second exchange is still slow but within the log interval.
+        for ticks, request in (
+            ([10, 10.2, 11.5], requests[0]),
+            ([12, 12.2, 14], requests[0]),
+            ([610, 610.6, 611.5], requests[1]),
+        ):
+            with patch("suwol1000.time.monotonic", side_effect=ticks):
+                response = client.send_and_receive(request)
+            self.assertEqual(response, ResponsePacket.from_bytes(CAPTURED))
+
+        self.assertEqual(client.logger.warning.call_count, 2)
+        first, last = client.logger.warning.call_args_list
+        self.assertEqual(first.args, ("hw.serial.slow_exchange",))
+        self.assertEqual(first.kwargs["command"], "D")
+        self.assertEqual(first.kwargs["write_seconds"], 0.2)
+        self.assertEqual(first.kwargs["read_seconds"], 1.3)
+        self.assertEqual(last.kwargs["command"], "P")
+        self.assertEqual(last.kwargs["write_seconds"], 0.6)
+        self.assertEqual(last.kwargs["read_seconds"], 0.9)
+        self.assertEqual(last.kwargs["request_bytes"], 16)
+        self.assertEqual(last.kwargs["response_bytes"], RESPONSE_LENGTH)
+        self.assertEqual(last.kwargs["read_timeout"], 2.0)
+        self.assertEqual(last.kwargs["write_timeout"], 2.0)
+
+    def test_fast_success_has_no_timing_log_or_extra_io(self):
+        client = SerialClient("test-port")
+        client.serial = Mock(is_open=True)
+        client.serial.read.return_value = CAPTURED
+        client.logger = Mock()
+
+        with patch("suwol1000.time.monotonic", side_effect=[10, 10.03, 10.09]):
+            response = client.send_and_receive(DisplayRequestPacket())
+
+        self.assertEqual(response, ResponsePacket.from_bytes(CAPTURED))
+        client.logger.warning.assert_not_called()
+        self.assertEqual([name for name, *_ in client.serial.method_calls], ["reset_input_buffer", "write", "read"])
+
+    def test_complete_but_broken_frame_remains_a_protocol_error(self):
+        client = SerialClient("test-port")
+        client.serial = Mock(is_open=True)
+        client.serial.read.return_value = b"\x00" + CAPTURED[1:]
+
+        with self.assertRaisesRegex(ValueError, "^Invalid STX/ETX"):
+            client.send_and_receive(DisplayRequestPacket())
+
     def test_drops_stale_bytes_and_reads_one_fixed_length_frame(self):
         client = SerialClient("test-port")
         client.serial = Mock(is_open=True)
@@ -176,7 +273,7 @@ class SerialClientTests(unittest.TestCase):
 
 class DisplayWeightTests(unittest.TestCase):
     def test_weight_beyond_the_display_is_not_used_so_requests_stay_32_bytes(self):
-        client = Mock(port="test-port")
+        client = Mock(port="test-port", timeout=2.0, write_timeout=2.0)
         with patch("suwol1000.get_logger", return_value=Mock()):
             worker = WeighingStationWorker(client, station_id=7, polling_interval=0)
         cases = (
@@ -199,6 +296,8 @@ class RawFrameScale:
     """Answers with wire frames so the production parser runs on every exchange."""
 
     port = "raw-frame-test"
+    timeout = 2.0
+    write_timeout = 2.0
 
     def __init__(self, **fields):
         self.fields = fields

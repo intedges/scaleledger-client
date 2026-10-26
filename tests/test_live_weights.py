@@ -27,7 +27,7 @@ def response_bytes(weight: bytes) -> bytes:
 
 class StationTelemetrySnapshotTests(unittest.TestCase):
     def setUp(self):
-        self.serial = Mock(port="test-port")
+        self.serial = Mock(port="test-port", timeout=2.0, write_timeout=2.0)
         self.samples = []
         self.worker = WeighingStationWorker(
             self.serial, station_id=7, polling_interval=0, receipt_builder=lambda event: b"receipt",

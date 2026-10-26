@@ -31,6 +31,8 @@ class CycleScale:
     """Echo each voice once, with explicit responses for arrival and tag races."""
 
     port = "vehicle-cycle-test"
+    timeout = 2.0
+    write_timeout = 2.0
 
     def __init__(self, clock):
         self.clock = clock
@@ -185,6 +187,59 @@ class StationCycleTests(unittest.TestCase):
         self.sustain("50.1")
         self.accept()
 
+    def test_two_observations_one_second_apart_confirm_empty_entry_and_departure(self):
+        self.observe("50", 0)
+        self.assertEqual(self.worker.cycle.state, CycleState.WAIT_EMPTY)
+        self.observe("50", 1)
+        self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
+
+        self.observe("120", 2)
+        self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
+        self.observe("120", 3)
+        self.assertEqual(self.worker.cycle.state, CycleState.READY)
+        self.accept()
+        self.measure()
+        self.finish()
+
+        self.observe("50", 4)
+        self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
+        self.observe("50", 5)
+        self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
+        self.assertEqual(len(self.measurements()), 1)
+        self.assertEqual(self.prints(), 1)
+
+    def test_initial_empty_observations_less_than_one_second_apart_do_not_confirm(self):
+        self.observe("0", 0)
+        self.observe("0", 0.99)
+
+        self.assertEqual(self.worker.cycle.state, CycleState.WAIT_EMPTY)
+        self.assertEqual(self.events, [])
+
+    def test_response_at_or_after_five_seconds_starts_a_new_empty_observation(self):
+        for gap in (4.999, 5.0, 5.001):
+            with self.subTest(gap=gap):
+                worker = WeighingStationWorker(self.scale, station_id=7)
+                self.scale.weight = Decimal("0")
+                self.clock.now = 0
+                worker.exchange(DisplayRequestPacket())
+
+                self.clock.now = gap
+                worker.exchange(DisplayRequestPacket())
+
+                expired = gap >= 5
+                self.assertEqual(
+                    worker.cycle.state,
+                    CycleState.WAIT_EMPTY if expired else CycleState.WAIT_ENTRY,
+                )
+                self.assertEqual(worker.cycle.invalidations, int(expired))
+                self.assertTrue(worker.get_telemetry().weight_valid)
+                self.assertEqual(worker.get_telemetry().sampled_monotonic, gap)
+                self.assertFalse(worker._indicator_fault)
+                if expired:
+                    self.clock.now = gap + 1
+                    worker.exchange(DisplayRequestPacket())
+                    self.assertEqual(worker.cycle.state, CycleState.WAIT_ENTRY)
+
     def test_entry_needs_one_second_and_the_card_prompt_repeats_every_five_seconds(self):
         self.sustain("0")
         start = self.clock.now + 1
@@ -251,6 +306,22 @@ class StationCycleTests(unittest.TestCase):
         self.assertFalse(self.events)
         self.accept(SECOND_CARD)
         self.assertEqual(self.worker.last_plate, SECOND_CARD)
+
+    def test_slow_card_validation_cannot_save_weight_older_than_two_seconds(self):
+        self.ready()
+        self.accept()
+
+        def slow_validation(event):
+            self.clock.now += 2.1
+            return True
+
+        self.validator.side_effect = slow_validation
+        self.assertEqual(self.invoke("verify"), WorkerState.MEASURE)
+        self.assertEqual(self.invoke("measure"), WorkerState.IDLE)
+
+        self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
+        self.assertEqual(self.measurements(), [])
+        self.assertEqual(self.prints(), 0)
 
     def test_card_prompt_stops_when_the_vehicle_leaves_and_restarts_on_the_next_entry(self):
         self.ready()
@@ -343,7 +414,7 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(self.invoke("idle"), WorkerState.VERIFY)
         self.assertEqual(self.worker.last_plate, SECOND_CARD)
 
-    def test_one_record_and_receipt_per_vehicle_until_three_seconds_at_or_below_limit(self):
+    def test_one_record_and_receipt_per_vehicle_until_one_second_at_or_below_limit(self):
         self.ready()
         self.accept()
         self.measure()
@@ -359,10 +430,10 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(len(self.voices(VoiceCode.WEIGHT_COMPLETE)), 1)
 
         start = self.clock.now + 1
-        for offset in (0, 1, 2, 2.99):
+        for offset in (0, 0.5, 0.99):
             self.observe("50", start + offset)
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
-        self.observe("50", start + 3)
+        self.observe("50", start + 1)
         self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
         self.sustain("120")
         self.accept(SECOND_CARD)

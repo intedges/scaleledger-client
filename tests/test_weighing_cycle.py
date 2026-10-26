@@ -151,52 +151,164 @@ class WeighingCycleTests(unittest.TestCase):
 
     def test_missing_samples_reset_initial_empty_and_entry_confirmation(self):
         self.observe("0", 0)
-        self.observe("0", 3)
-        self.assertEqual(self.cycle.state, CycleState.WAIT_EMPTY)
         self.observe("0", 5)
+        self.assertEqual(self.cycle.state, CycleState.WAIT_EMPTY)
+        self.observe("0", 7)
         self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
-        self.observe("120", 6)
-        self.observe("120", 9)
+        self.observe("120", 8)
+        self.observe("120", 13)
         self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
-        self.observe("120", 10)
+        self.observe("120", 14)
         self.assertEqual(self.cycle.state, CycleState.READY)
 
     def test_observation_gap_cancels_reserved_card_and_requires_new_high_duration(self):
         self.ready()
         self.assertTrue(self.cycle.reserve(now=4))
-        self.observe("120", 7)
+        self.observe("120", 9)
         self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
-        self.observe("120", 8)
+        self.observe("120", 10)
         self.assertEqual(self.cycle.state, CycleState.READY)
-        self.assertFalse(self.cycle.consume(now=8))
+        self.assertFalse(self.cycle.consume(now=10))
 
     def test_observation_gap_keeps_lock_and_restarts_empty_confirmation(self):
         self.lock()
         self.observe("0", 5)
-        self.observe("0", 8)
-        self.assertEqual(self.cycle.state, CycleState.LOCKED)
-        self.assertFalse(self.cycle.reserve(now=8))
-        self.observe("0", 9)
-        self.assertEqual(self.cycle.state, CycleState.LOCKED)
         self.observe("0", 10)
+        self.assertEqual(self.cycle.state, CycleState.LOCKED)
+        self.assertFalse(self.cycle.reserve(now=10))
+        self.observe("0", 11)
+        self.assertEqual(self.cycle.state, CycleState.LOCKED)
+        self.observe("0", 12)
+        self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+
+    def test_slow_fresh_observations_allow_successive_vehicles_without_unlocking_early(self):
+        for interval in (2.5, 3.0, 3.9, 4.0):
+            with self.subTest(interval=interval):
+                self.cycle = WeighingCycle(
+                    Decimal("50"), ready_seconds=1, empty_seconds=3,
+                    max_sample_gap=5, max_sample_age=2,
+                )
+                for step in range(3):
+                    self.observe("0", step * interval)
+                self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+                for step in (3, 4):
+                    self.observe("120", step * interval)
+                self.assertTrue(self.cycle.reserve(now=4 * interval))
+                self.assertTrue(self.cycle.consume(now=4 * interval))
+
+                self.observe("120", 5 * interval)
+                self.assertFalse(self.cycle.reserve(now=5 * interval))
+                self.assertEqual(self.cycle.state, CycleState.LOCKED)
+                for step in (6, 7, 8):
+                    self.observe("0", step * interval)
+                self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+                for step in (9, 10):
+                    self.observe("120", step * interval)
+                self.assertTrue(self.cycle.reserve(now=10 * interval))
+                self.assertTrue(self.cycle.consume(now=10 * interval))
+                self.assertEqual(self.cycle.ready_sequence, 2)
+                self.assertEqual(self.cycle.invalidations, 0)
+
+    def test_two_samples_one_second_apart_confirm_empty_entry_and_departure(self):
+        self.cycle = WeighingCycle(
+            Decimal("50"), ready_seconds=1, empty_seconds=1,
+            max_sample_gap=5, max_sample_age=2,
+        )
+        self.observe("0", 0)
+        self.assertEqual(self.cycle.state, CycleState.WAIT_EMPTY)
+        self.observe("0", 1)
+        self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+        self.observe("120", 2)
+        self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+        self.observe("120", 3)
+        self.assertTrue(self.cycle.reserve(now=3))
+        self.assertTrue(self.cycle.consume(now=3))
+
+        self.observe("0", 4)
+        self.assertEqual(self.cycle.state, CycleState.LOCKED)
+        self.observe("0", 5)
+        self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+        self.assertEqual(self.cycle.invalidations, 0)
+
+    def test_five_second_gap_expires_before_the_next_empty_sample_is_applied(self):
+        for gap in (4.999, 5.0, 5.001):
+            for consumed in (False, True):
+                with self.subTest(gap=gap, consumed=consumed):
+                    self.cycle = WeighingCycle(
+                        Decimal("50"), ready_seconds=1, empty_seconds=1,
+                        max_sample_gap=5, max_sample_age=2,
+                    )
+                    if consumed:
+                        self.observe("0", -4)
+                        self.observe("0", -3)
+                        self.observe("120", -2)
+                        self.observe("120", -1)
+                        self.assertTrue(self.cycle.reserve(now=-1))
+                        self.assertTrue(self.cycle.consume(now=-1))
+                    self.observe("0", 0)
+                    self.observe("0", gap)
+                    if gap < 5:
+                        self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+                        self.assertEqual(self.cycle.invalidations, 0)
+                    else:
+                        expected = CycleState.LOCKED if consumed else CycleState.WAIT_EMPTY
+                        self.assertEqual(self.cycle.state, expected)
+                        self.assertEqual(self.cycle.invalidations, 1)
+                        self.observe("0", gap + 1.001)
+                        self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+
+    def test_observation_expires_without_a_new_sample_and_only_once(self):
+        for initial_state in (CycleState.READY, CycleState.RESERVED, CycleState.LOCKED):
+            with self.subTest(state=initial_state):
+                self.setUp()
+                self.ready(start=-4)
+                if initial_state in (CycleState.RESERVED, CycleState.LOCKED):
+                    self.assertTrue(self.cycle.reserve(now=0))
+                if initial_state == CycleState.LOCKED:
+                    self.assertTrue(self.cycle.consume(now=0))
+                self.assertFalse(self.cycle.expire_observation(now=4.999))
+                self.assertEqual(self.cycle.state, initial_state)
+                self.assertTrue(self.cycle.expire_observation(now=5.0))
+                expected = CycleState.LOCKED if initial_state == CycleState.LOCKED else CycleState.WAIT_ENTRY
+                self.assertEqual(self.cycle.state, expected)
+                self.assertEqual(self.cycle.invalidations, 1)
+                self.assertFalse(self.cycle.expire_observation(now=5.001))
+                self.assertFalse(self.cycle.expire_observation(now=100))
+                self.assertEqual(self.cycle.invalidations, 1)
+
+    def test_sample_age_expires_before_the_observation_gap(self):
+        self.ready(start=-4)
+        self.assertFalse(self.cycle.expire_observation(now=2.001))
+        self.assertEqual(self.cycle.state, CycleState.READY)
+        self.assertFalse(self.cycle.reserve(now=2.001))
         self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
 
     def test_stale_ready_or_reserved_weight_cannot_be_used_without_new_samples(self):
-        for reserve_first in (False, True):
-            with self.subTest(reserved=reserve_first):
-                self.setUp()
-                self.ready()
-                if reserve_first:
-                    self.assertTrue(self.cycle.reserve(now=4))
-                    self.assertFalse(self.cycle.consume(now=6.1))
-                else:
-                    self.assertFalse(self.cycle.reserve(now=6.1))
-                self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
+        for max_gap in (3.0, 5.0):
+            for reserve_first in (False, True):
+                with self.subTest(max_gap=max_gap, reserved=reserve_first):
+                    self.cycle = WeighingCycle(
+                        Decimal("50"), ready_seconds=1, empty_seconds=2,
+                        max_sample_gap=max_gap, max_sample_age=2,
+                    )
+                    self.ready()
+                    if reserve_first:
+                        self.assertTrue(self.cycle.reserve(now=4))
+                        self.assertFalse(self.cycle.consume(now=6.1))
+                    else:
+                        self.assertFalse(self.cycle.reserve(now=6.1))
+                    self.assertEqual(self.cycle.state, CycleState.WAIT_ENTRY)
 
-    def test_latest_sample_at_maximum_gap_is_still_usable(self):
-        self.ready()
-        self.assertTrue(self.cycle.reserve(now=6))
-        self.assertTrue(self.cycle.consume(now=6))
+    def test_latest_sample_at_maximum_age_is_still_usable(self):
+        for max_gap in (3.0, 5.0):
+            with self.subTest(max_gap=max_gap):
+                self.cycle = WeighingCycle(
+                    Decimal("50"), ready_seconds=1, empty_seconds=2,
+                    max_sample_gap=max_gap, max_sample_age=2,
+                )
+                self.ready()
+                self.assertTrue(self.cycle.reserve(now=6))
+                self.assertTrue(self.cycle.consume(now=6))
 
     def test_time_reversal_breaks_observation_continuity_and_reservation(self):
         self.ready()
@@ -222,16 +334,19 @@ class WeighingCycleTests(unittest.TestCase):
         for threshold in (Decimal("0"), Decimal("-1"), Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), 100):
             with self.subTest(threshold=threshold), self.assertRaises(ValueError):
                 WeighingCycle(threshold, ready_seconds=1, empty_seconds=2)
-        for name in ("ready_seconds", "empty_seconds", "max_sample_gap"):
+        for name in ("ready_seconds", "empty_seconds", "max_sample_gap", "max_sample_age"):
             for invalid in (0, -1, float("nan"), float("inf"), True, "1"):
-                arguments = {"ready_seconds": 1, "empty_seconds": 2, "max_sample_gap": 2}
+                arguments = {
+                    "ready_seconds": 1, "empty_seconds": 2,
+                    "max_sample_gap": 2, "max_sample_age": 2,
+                }
                 arguments[name] = invalid
                 with self.subTest(setting=name, value=invalid), self.assertRaises(ValueError):
                     WeighingCycle(Decimal("50"), **arguments)
 
     def test_nonfinite_clock_values_are_rejected(self):
         for invalid in (float("nan"), float("inf"), float("-inf"), True, "1"):
-            for action in ("observe", "reserve", "consume"):
+            for action in ("observe", "reserve", "consume", "expire_observation"):
                 with self.subTest(now=invalid, action=action), self.assertRaises(ValueError):
                     if action == "observe":
                         self.cycle.observe(Decimal("120"), now=invalid)

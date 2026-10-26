@@ -173,7 +173,7 @@ class WeighingStationManagerTests(unittest.TestCase):
 
         self.manager.on_telemetry = receive
         station = WeighingStation(id=7, name="Station", serial_port="test-port")
-        client = Mock(port="test-port")
+        client = Mock(port="test-port", timeout=2.0, write_timeout=2.0)
         client.send_and_receive.return_value = ResponsePacket()
         with patch("managers.SerialClient", return_value=client), patch("managers.threading.Thread") as thread:
             def start():
@@ -198,7 +198,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         updated = WeighingStation(id=1, name="Station", serial_port="new-port")
 
         def client(port):
-            result = Mock(port=port)
+            result = Mock(port=port, timeout=2.0, write_timeout=2.0)
             result.send_and_receive.return_value = ResponsePacket()
             return result
 

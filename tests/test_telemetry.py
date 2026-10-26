@@ -458,7 +458,7 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.frame())["payload"]["weight"], "1")
         devices = []
         for station_id in (3, 9):
-            serial = Mock(port=f"COM{station_id}")
+            serial = Mock(port=f"COM{station_id}", timeout=2.0, write_timeout=2.0)
             serial.send_and_receive.return_value = ResponsePacket(weight_value=Decimal(station_id))
             devices.append(WeighingStationWorker(
                 serial, station_id=station_id,
@@ -717,7 +717,7 @@ class PublisherTests(unittest.IsolatedAsyncioTestCase):
     async def test_raw_responses_report_partial_failures_and_clear_on_frame_loss_over_websocket(self):
         received = asyncio.Queue()
         publisher = self.publisher(seed=False)
-        serial = Mock(port="test-port")
+        serial = Mock(port="test-port", timeout=2.0, write_timeout=2.0)
         worker = WeighingStationWorker(
             serial, station_id=3, on_telemetry=lambda observation: self.updates.update(3, observation),
         )
