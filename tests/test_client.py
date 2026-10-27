@@ -390,6 +390,29 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restarted.gateway_id, 1)
         self.assertEqual(self.manager.sync.call_args.args[0][0].serial_port, "mock-port")
 
+    async def test_sync_and_local_recovery_keep_cards_without_species(self):
+        await self.cached_setup()
+        self.online_responses()
+        self.api.fetch_rfid_cards.return_value[0]["species"] = None
+        self.api.fetch_species.return_value = []
+        self.client.access_token = "cached-token"
+        self.client.gateway_id = 1
+
+        self.assertTrue(await self.client.sync_settings())
+
+        info = self.client.market_cache.get_rfid_info("12345678")
+        self.assertTrue(info.is_active)
+        self.assertEqual((info.producer_name, info.species_name), ("Server producer", ""))
+        self.assertIsNone((await RFIDCard.get(id=1)).species_id)
+
+        restarted = HeadlessClient(base_url=None, credential_path=self.credential_path)
+        await restarted.restore_local_state()
+
+        self.assertEqual(restarted.market_cache.get_rfid_info("12345678"), info)
+        self.assertEqual(restarted.market_cache.gateway_name, "Server gateway")
+        self.assertEqual(restarted.gateway_id, 1)
+        self.assertEqual(self.manager.sync.call_args.args[0][0].name, "Server station")
+
     async def test_failed_station_snapshot_keeps_last_successful_configuration(self):
         await self.cached_setup()
         self.online_responses()

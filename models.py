@@ -71,7 +71,7 @@ class RFIDCard(Model):
     uuid = fields.UUIDField(unique=True)
     uid = fields.CharField(max_length=50, unique=True)
     producer = fields.ForeignKeyField("models.Producer", related_name="rfid_cards")
-    species = fields.ForeignKeyField("models.Species", related_name="rfid_cards")
+    species = fields.ForeignKeyField("models.Species", related_name="rfid_cards", null=True)
     is_active = fields.BooleanField(default=True)
     issued_at = fields.DatetimeField()
 

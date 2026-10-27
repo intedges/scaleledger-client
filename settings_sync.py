@@ -106,8 +106,12 @@ class SettingsSnapshot:
         rfid_map = {}
         for row in _rows(rfid_cards, "RFID cards"):
             producer_id = _identifier(row["producer"], "Card producer ID")
-            species_id = _identifier(row["species"], "Card species ID")
-            if producer_id not in producers_by_id or species_id not in species_by_id:
+            species_id = row["species"]
+            if species_id is not None:
+                species_id = _identifier(species_id, "Card species ID")
+            if producer_id not in producers_by_id or (
+                species_id is not None and species_id not in species_by_id
+            ):
                 raise ValueError("RFID card references missing market data")
             card = _validate(RFIDCard,
                 id=_identifier(row["id"], "Card ID"), uuid=row["uuid"], uid=row["uid"],
@@ -118,7 +122,7 @@ class SettingsSnapshot:
             rfid_map[card.uid] = RFIDInfo(
                 is_active=card.is_active,
                 producer_name=producers_by_id[producer_id].name,
-                species_name=species_by_id[species_id].name,
+                species_name=species_by_id[species_id].name if species_id is not None else "",
             )
         _unique(card_models, "id", "uuid", "uid")
 
