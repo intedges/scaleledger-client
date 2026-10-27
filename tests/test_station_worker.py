@@ -284,6 +284,7 @@ class SerialClientRecoveryTests(unittest.TestCase):
         old_port = Mock(is_open=True)
         new_port = Mock(is_open=True)
         old_port.write.side_effect = failure
+        new_port.write.side_effect = len
         new_port.read.return_value = frame()
         logger = Mock()
 
@@ -319,6 +320,8 @@ class SerialClientRecoveryTests(unittest.TestCase):
     def test_empty_read_closes_and_reopens_port_before_publishing_fresh_weight(self):
         old_port = Mock(is_open=True)
         new_port = Mock(is_open=True)
+        old_port.write.side_effect = len
+        new_port.write.side_effect = len
         old_port.read.side_effect = [frame(weight=b"ST,NT,+     95kg"), b"", frame()]
         new_port.read.return_value = frame()
         samples = []
@@ -370,6 +373,7 @@ class SerialClientRecoveryTests(unittest.TestCase):
 
     def test_cancelled_empty_read_stops_without_logging_failure_or_reconnecting(self):
         port = Mock(is_open=True)
+        port.write.side_effect = len
         reading = threading.Event()
         cancelled = threading.Event()
         logger = Mock()

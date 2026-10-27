@@ -27,6 +27,7 @@ from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
 from models import Gateway, Producer, Record, RFIDCard, Species, WeighingStation
 from settings_sync import SettingsSnapshot
+from suwol1000 import ZeroRequestError, ZeroResult
 from telemetry import LatestTelemetryBuffer, StationTelemetryPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, scan_peripherals
 from workers import RecordUploadWorker
@@ -519,6 +520,9 @@ class HeadlessClient:
                 async for message in ws:
                     try:
                         data = json.loads(message)
+                        if not isinstance(data, dict) or not isinstance(data.get("type"), str):
+                            self.logger.warning("net.ws.message.invalid_envelope")
+                            continue
                         message_type = data["type"]
 
                         match message_type:
@@ -539,6 +543,9 @@ class HeadlessClient:
                                 self.logger.info("biz.active.settings_sync.requested", type=message_type)
                                 self.request_settings_sync()
 
+                            case "station.zero":
+                                self.dispatch_station_zero(data.get("payload"))
+
                             case _:
                                 self.logger.debug("net.ws.message.ignored", type=message_type)
 
@@ -547,6 +554,47 @@ class HeadlessClient:
             finally:
                 if heartbeat_task is not None:
                     heartbeat_task.cancel()
+
+    def dispatch_station_zero(self, payload):
+        station_id = payload.get("station_id") if isinstance(payload, dict) else None
+        if type(station_id) is not int or station_id <= 0:
+            self.logger.warning("biz.active.zero.rejected", reason="invalid_station_id")
+            return
+        if type(self.gateway_id) is not int or self.gateway_id <= 0:
+            self.logger.warning(
+                "biz.active.zero.rejected", station_id=station_id, reason="unresolved_gateway",
+            )
+            return
+        try:
+            # Dispatch once to the current port owner. No await, reconnect queue
+            # or socket-scoped task may delay or cancel the worker's OFF cleanup.
+            self.logger.info(
+                "biz.active.zero.requested", station_id=station_id, gateway_id=self.gateway_id,
+            )
+            result = self.station_manager.request_zero(station_id, gateway_id=self.gateway_id)
+            result.add_done_callback(lambda future: self._station_zero_finished(station_id, future))
+        except Exception:
+            self.logger.exception("biz.active.zero.dispatch_failed", station_id=station_id)
+
+    def _station_zero_finished(self, station_id: int, future: Future[ZeroResult]):
+        # This callback can run on the serial worker. Only consume the result and
+        # log locally; the server contract has no completion ACK or automatic retry.
+        try:
+            if future.cancelled():
+                self.logger.info("biz.active.zero.cancelled", station_id=station_id)
+                return
+            result = future.result()
+        except ZeroRequestError as exc:
+            self.logger.warning("biz.active.zero.rejected", station_id=station_id, reason=exc.reason)
+        except Exception:
+            self.logger.exception("biz.active.zero.failed", station_id=station_id)
+        else:
+            log = self.logger.info if result.output_released and result.error is None else self.logger.warning
+            log(
+                "biz.active.zero.finished", station_id=station_id,
+                output_released=result.output_released, zero_observed=result.zero_observed,
+                error=result.error,
+            )
 
     async def send_heartbeat(self):
         try:

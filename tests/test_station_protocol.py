@@ -85,7 +85,10 @@ class ResponsePacketTests(unittest.TestCase):
     def test_unreadable_relay_status_only_clears_the_relay_flags(self):
         response = ResponsePacket.from_bytes(frame(relay=b"\x00A"))
 
-        self.assertEqual(response.invalid_fields, ("green_blink", "red_blink", "fan_on", "heater_on"))
+        self.assertEqual(
+            response.invalid_fields,
+            ("green_blink", "red_blink", "fan_on", "heater_on", "zero_output_on"),
+        )
         self.assertEqual(response.weight_value, Decimal("120"))
 
     def test_unknown_voice_status_is_none(self):
@@ -173,6 +176,7 @@ class SerialClientTests(unittest.TestCase):
             with self.subTest(received=len(raw)):
                 client = SerialClient("test-port", timeout=0.5)
                 client.serial = Mock(is_open=True)
+                client.serial.write.side_effect = len
                 client.serial.read.return_value = raw
 
                 with patch("suwol1000.time.monotonic", side_effect=[10, 10.25, 10.75]), self.assertRaises(DeviceResponseTimeout) as caught:
@@ -207,6 +211,7 @@ class SerialClientTests(unittest.TestCase):
     def test_slow_success_keeps_response_and_limits_timing_logs_to_ten_minutes(self):
         client = SerialClient("test-port")
         client.serial = Mock(is_open=True)
+        client.serial.write.side_effect = len
         client.serial.read.return_value = CAPTURED
         client.logger = Mock()
         requests = [DisplayRequestPacket(), PrinterRequestPacket(document_bytes=b"receipt")]
@@ -237,6 +242,7 @@ class SerialClientTests(unittest.TestCase):
     def test_fast_success_has_no_timing_log_or_extra_io(self):
         client = SerialClient("test-port")
         client.serial = Mock(is_open=True)
+        client.serial.write.side_effect = len
         client.serial.read.return_value = CAPTURED
         client.logger = Mock()
 
@@ -250,6 +256,7 @@ class SerialClientTests(unittest.TestCase):
     def test_complete_but_broken_frame_remains_a_protocol_error(self):
         client = SerialClient("test-port")
         client.serial = Mock(is_open=True)
+        client.serial.write.side_effect = len
         client.serial.read.return_value = b"\x00" + CAPTURED[1:]
 
         with self.assertRaisesRegex(ValueError, "^Invalid STX/ETX"):
@@ -258,6 +265,7 @@ class SerialClientTests(unittest.TestCase):
     def test_drops_stale_bytes_and_reads_one_fixed_length_frame(self):
         client = SerialClient("test-port")
         client.serial = Mock(is_open=True)
+        client.serial.write.side_effect = len
         # read_until(ETX) would have cut this frame at the fan setting.
         client.serial.read.return_value = frame(fan=b"\x03\x00")
         request = DisplayRequestPacket()
