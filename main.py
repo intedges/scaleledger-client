@@ -26,6 +26,7 @@ from events import BaseEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
 from models import Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from schema import migrate_optional_card_species
 from settings_sync import SettingsSnapshot
 from suwol1000 import ZeroRequestError, ZeroResult
 from telemetry import LatestTelemetryBuffer, StationTelemetryPublisher
@@ -167,6 +168,13 @@ class HeadlessClient:
             "apps": {"models": {"models": ["models"], "default_connection": "default"}},
         })
         await Tortoise.generate_schemas()
+        try:
+            migrated = await migrate_optional_card_species()
+        except Exception:
+            self.logger.exception("sys.db.schema.upgrade_failed", db_path=str(self.db_path))
+            raise
+        if migrated:
+            self.logger.info("sys.db.schema.rfid_species_optional")
         self.logger.debug("sys.db.schema.ready")
     
     async def restore_local_state(self):
@@ -324,7 +332,7 @@ class HeadlessClient:
                 rfid_cache_data[card.uid] = RFIDInfo(
                     is_active=card.is_active,
                     producer_name=card.producer.name,
-                    species_name=card.species.name
+                    species_name=card.species.name if card.species is not None else ""
                 )
             
             gateway = await Gateway.get(id=self.gateway_id)

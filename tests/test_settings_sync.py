@@ -100,6 +100,46 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await model.all().count(), 0)
         self.assertEqual((await Record.get(uuid=self.record.uuid)).station_id, 1)
 
+    async def test_cards_with_and_without_species_are_synchronized_together(self):
+        for identifier, active in ((3, True), (4, False)):
+            self.responses["rfid_cards"].append(dict(
+                self.responses["rfid_cards"][0], id=identifier, uuid=str(uuid.uuid4()),
+                uid=f"card-{identifier}", species=None, is_active=active,
+            ))
+
+        snapshot = self.snapshot()
+        await snapshot.persist()
+
+        self.assertEqual(snapshot.rfid_map, {
+            "card-2": RFIDInfo(True, "Updated producer", "Updated species"),
+            "card-3": RFIDInfo(True, "Updated producer", ""),
+            "card-4": RFIDInfo(False, "Updated producer", ""),
+        })
+        self.assertEqual(
+            await RFIDCard.all().order_by("id").values_list("species_id", flat=True),
+            [2, None, None],
+        )
+        self.assertEqual((await Record.get(uuid=self.record.uuid)).weight, 23)
+
+    async def test_species_assignment_can_be_cleared_and_restored(self):
+        for species_id in (2, None, 2):
+            with self.subTest(species_id=species_id):
+                self.responses["rfid_cards"][0]["species"] = species_id
+                self.responses["species"] = (
+                    [{"id": 2, "name": "Updated species"}] if species_id is not None else []
+                )
+
+                snapshot = self.snapshot()
+                await snapshot.persist()
+
+                self.assertEqual((await RFIDCard.get(id=2)).species_id, species_id)
+                self.assertEqual(
+                    snapshot.rfid_map["card-2"].species_name,
+                    "Updated species" if species_id is not None else "",
+                )
+                self.assertEqual(await RFIDCard.all().count(), 1)
+                self.assertEqual((await Record.get(uuid=self.record.uuid)).weight, 23)
+
     async def test_card_response_and_new_database_have_no_last_used_at_field(self):
         self.assertNotIn("last_used_at", self.responses["rfid_cards"][0])
         await self.snapshot().persist()
@@ -141,7 +181,7 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
         for section, key in (
             ("gateway", "name"), ("stations", "serial_port"), ("species", "name"),
-            ("producers", "uuid"), ("rfid_cards", "issued_at"),
+            ("producers", "uuid"), ("rfid_cards", "issued_at"), ("rfid_cards", "species"),
         ):
             data = deepcopy(self.responses)
             row = data[section] if section == "gateway" else data[section][0]
@@ -152,6 +192,9 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
         malformed("stations", "gateway", 99)
         malformed("rfid_cards", "producer", 99)
         malformed("rfid_cards", "species", 99)
+        for value in (0, -1, "2", True, 2.5, [], {}):
+            malformed("rfid_cards", "species", value)
+        malformed("rfid_cards", "producer", None)
         malformed("rfid_cards", "is_active", "false")
         malformed("rfid_cards", "is_active", 1)
         malformed("species", "id", True)

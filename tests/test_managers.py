@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from cache import MarketDataCache, RFIDInfo
-from events import WeighingCompletedEvent
+from events import RFIDTaggedEvent, WeighingCompletedEvent
 from managers import StationRuntime, WeighingStationManager
 from models import WeighingStation
 from suwol1000 import (
@@ -189,6 +189,27 @@ class WeighingStationManagerTests(unittest.TestCase):
 
         local_time = event.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         self.assertIn(local_time.encode(), receipt)
+
+    def test_card_without_species_is_accepted_and_prints_a_blank_species(self):
+        self.manager.market_cache.update_rfid_data({
+            "12345678": RFIDInfo(True, "Producer", ""),
+            "87654321": RFIDInfo(False, "Inactive producer", ""),
+        })
+        event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=23)
+        station = WeighingStation(id=1, name="Station", serial_port="test-port")
+
+        with patch("managers.WeighingStationWorker") as worker, patch("managers.threading.Thread"):
+            self.manager.sync([station])
+            validate = worker.call_args.kwargs["rfid_validator"]
+            self.assertTrue(validate(RFIDTaggedEvent(rfid_card_uid="12345678")))
+            self.assertFalse(validate(RFIDTaggedEvent(rfid_card_uid="87654321")))
+            receipt = worker.call_args.kwargs["receipt_builder"](event).decode("cp949")
+
+        species_line = next(line for line in receipt.splitlines() if line.startswith("품 목 명"))
+        self.assertEqual(species_line.rstrip(), "품 목 명")
+        self.assertIn("Producer", receipt)
+        self.assertIn("12345678", receipt)
+        self.assertIn("23 kg", receipt)
 
     def test_stop_all_signals_every_worker_before_waiting_for_threads(self):
         actions = []
