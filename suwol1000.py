@@ -73,7 +73,7 @@ class RelayCode(IntFlag):
     HEATER = 1 << 4  # Relay 5: 히터 작동
     RELAY6 = 1 << 5  # Relay 6: 모름
     RELAY7 = 1 << 6  # Relay 7: 모름
-    RELAY8 = 1 << 7  # Relay 8: 모름
+    RELAY8 = 1 << 7  # Relay 8: 영점 출력 관측 (ZERO/TARE 구분 미확정)
 
 
 class PrinterStatus(IntEnum):
@@ -118,6 +118,7 @@ class DisplayRequestPacket(RequestPacket):
     green_blink: bool = False
     red_blink: bool = False
     voice_code: VoiceCode = VoiceCode.NONE
+    zero_output: bool = False
 
     def to_bytes(self) -> bytes:
         device_id = str(self.device_id)
@@ -142,7 +143,7 @@ class DisplayRequestPacket(RequestPacket):
             RelayCode.HEATER * False |
             RelayCode.RELAY6 * False |
             RelayCode.RELAY7 * False |
-            RelayCode.RELAY8 * False
+            RelayCode.RELAY8 * self.zero_output
         )
 
         # *주의* hex 표현 아님: 0, 1, ..., 9, A, B, C, D, E, F
@@ -249,6 +250,7 @@ class ResponsePacket:
     red_blink: bool | None = False
     fan_on: bool | None = False
     heater_on: bool | None = False
+    zero_output_on: bool | None = False
     unknown_input: str = "00"
     voice_code: VoiceCode | None = VoiceCode.NONE
     inner_temperature: int | None = 0
@@ -293,6 +295,7 @@ class ResponsePacket:
             red_blink=relay(RelayCode.RED),
             fan_on=relay(RelayCode.FAN),
             heater_on=relay(RelayCode.HEATER),
+            zero_output_on=relay(RelayCode.RELAY8),
             unknown_input=data[20:22],
             voice_code=_member(VoiceCode, _integer(data[22:24])),
             # The temperature carries a sign, e.g. "+28".
@@ -347,27 +350,58 @@ class SerialClient:
             except Exception:
                 pass
 
-    def send_and_receive(self, request: RequestPacket) -> ResponsePacket:
+    def send_and_receive(
+        self, request: RequestPacket, *, deadline: float | None = None,
+    ) -> ResponsePacket:
         if self.serial is None or not self.serial.is_open:
             raise serial.SerialException("Serial port is not connected")
+        if deadline is not None and (
+            isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+            or not math.isfinite(deadline)
+        ):
+            raise ValueError("deadline must be a finite monotonic timestamp")
         
         # Drop late or stray bytes so an earlier fault cannot shift this frame,
         # and read the fixed length: a field byte may itself equal ETX.
         self.serial.reset_input_buffer()
         data = request.to_bytes()
         started_at = time.monotonic()
+        original_limits = None
         try:
-            self.serial.write(data)
-        except serial.SerialTimeoutException as exc:
-            write_seconds = time.monotonic() - started_at
-            raise serial.SerialTimeoutException(
-                f"Serial write timeout: command={request.command_code.value} "
-                f"request_bytes={len(data)} timeout={self.write_timeout}s "
-                f"write_seconds={write_seconds:.3f}: {exc}"
-            ) from exc
-        written_at = time.monotonic()
-        response = self.serial.read(RESPONSE_LENGTH)
-        received_at = time.monotonic()
+            if deadline is not None:
+                remaining = deadline - started_at
+                if remaining <= 0:
+                    raise serial.SerialTimeoutException("Serial exchange deadline elapsed before write")
+                original_limits = self.serial.timeout, self.serial.write_timeout
+                self.serial.write_timeout = (
+                    min(self.write_timeout, remaining) if self.write_timeout is not None else remaining
+                )
+            try:
+                written = self.serial.write(data)
+                if written != len(data):
+                    raise serial.SerialTimeoutException(
+                        f"Incomplete serial write: sent {written}/{len(data)} bytes"
+                    )
+            except serial.SerialTimeoutException as exc:
+                write_seconds = time.monotonic() - started_at
+                raise serial.SerialTimeoutException(
+                    f"Serial write timeout: command={request.command_code.value} "
+                    f"request_bytes={len(data)} timeout={self.write_timeout}s "
+                    f"write_seconds={write_seconds:.3f}: {exc}"
+                ) from exc
+            written_at = time.monotonic()
+            if deadline is not None:
+                remaining = deadline - written_at
+                if remaining <= 0:
+                    raise DeviceResponseTimeout("Serial exchange deadline elapsed after write")
+                self.serial.timeout = min(self.timeout, remaining) if self.timeout is not None else remaining
+            response = self.serial.read(RESPONSE_LENGTH)
+            received_at = time.monotonic()
+            if deadline is not None and received_at > deadline:
+                raise DeviceResponseTimeout("Serial exchange deadline elapsed during read")
+        finally:
+            if original_limits is not None:
+                self.serial.timeout, self.serial.write_timeout = original_limits
         write_seconds = written_at - started_at
         read_seconds = received_at - written_at
         # pyserial returns a short read on timeout (or cancellation), rather
@@ -429,7 +463,41 @@ class StationTelemetrySnapshot:
     heater_trigger_temp: int | None = None
 
 
+class ZeroRequestError(RuntimeError):
+    """A request was rejected before any zero output was sent."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class ZeroResult:
+    """Output feedback and the received weight are separate observations.
+
+    zero_observed describes the OFF response, not a certified ZERO/TARE result.
+    An error after ON never means that the device did not receive the pulse.
+    """
+
+    output_released: bool
+    zero_observed: bool
+    weight_before: Decimal
+    weight_after: Decimal | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class _ZeroRequest:
+    future: Future[ZeroResult]
+    weight: Decimal
+    weight_type: WeightType
+    requested_at: float
+
+
 class WeighingStationWorker:
+    ZERO_HOLD_SECONDS = 1.5
+    ZERO_RELEASE_TIMEOUT = 2.0
+
     def __init__(
         self,
         serial_client: SerialClient,
@@ -504,6 +572,11 @@ class WeighingStationWorker:
         self._snapshot_lock = threading.Lock()
         self._sample_seq = initial_sample_seq
         self._telemetry = StationTelemetrySnapshot(sample_seq=initial_sample_seq)
+        self._zero_lock = threading.Lock()
+        self._zero_request: _ZeroRequest | None = None
+        self._zero_active = False
+        self._zero_release_pending = False
+        self._zero_alert_until: float | None = None
 
         self.logger = get_logger().bind(port=serial_client.port)
         # A powered-off scale repeatedly times out; summarize the repeats.
@@ -513,8 +586,205 @@ class WeighingStationWorker:
     def stop(self):
         self.logger.info("sys.worker.stop_requested")
         self.stop_event.set()
+        with self._zero_lock:
+            # The zero path has bounded I/O and must finish its OFF exchange.
+            interrupt = not self._zero_active
+            pending = self._zero_request if interrupt else None
+            if pending is not None:
+                self._zero_request = None
+        if pending is not None and pending.future.set_running_or_notify_cancel():
+            pending.future.set_exception(ZeroRequestError("stopped"))
         self._set_connection_status("disconnected")
-        self.client.interrupt()
+        if interrupt:
+            self.client.interrupt()
+
+    def request_zero(self) -> Future[ZeroResult]:
+        """Request one pulse on the station thread; never open another port.
+
+        The caller must obtain the operator's empty-platform confirmation.
+        Concurrent requests share the in-flight result. No command survives a
+        serial disconnect, stop or process restart, and ON is never retried.
+        """
+        snapshot = self.get_telemetry()
+        future: Future[ZeroResult] = Future()
+        with self._zero_lock:
+            if self._zero_request is not None:
+                return self._zero_request.future
+            reason = self._zero_rejection(snapshot)
+            if reason is None:
+                self._zero_request = _ZeroRequest(
+                    future, snapshot.weight, snapshot.weight_type, time.monotonic(),
+                )
+        # Future callbacks may call this worker again; never run them under a lock.
+        if reason is not None:
+            future.set_exception(ZeroRequestError(reason))
+        return future
+
+    def _zero_rejection(self, snapshot: StationTelemetrySnapshot) -> str | None:
+        if self.stop_event.is_set():
+            return "stopped"
+        if self._zero_release_pending:
+            return "release_pending"
+        if (
+            self.state not in (WorkerState.IDLE, WorkerState.VERIFY, WorkerState.MEASURE)
+            or self._pending_save is not None or self._save_result is not None
+            or isinstance(self.last_event, WeighingCompletedEvent) or self._save_fault
+        ):
+            return "busy"
+        if snapshot.connection_status != "connected":
+            return "disconnected"
+        if (
+            not snapshot.weight_valid or snapshot.sampled_monotonic is None
+            or not 0 <= time.monotonic() - snapshot.sampled_monotonic <= self.cycle.max_sample_age
+            or snapshot.weight is None
+            or snapshot.unit is None or snapshot.unit.strip().lower() != "kg"
+            or snapshot.weight_status != WeightStatus.STABLE
+            or snapshot.weight_type not in (WeightType.NET, WeightType.GROSS)
+            or len(format(snapshot.weight, DISPLAY_WEIGHT_FORMAT)) != 8
+        ):
+            return "invalid_weight"
+        return None
+
+    def _run_zero_request(self) -> bool:
+        with self._zero_lock:
+            request = self._zero_request
+            if request is None:
+                return False
+            self._zero_active = True
+        result = None
+        failure = None
+        try:
+            if not request.future.set_running_or_notify_cancel():
+                return True
+            snapshot = self.get_telemetry()
+            reason = self._zero_rejection(snapshot)
+            if reason is None and time.monotonic() - request.requested_at > self.cycle.max_sample_age:
+                reason = "expired"
+            if reason is None and (
+                snapshot.weight != request.weight or snapshot.weight_type != request.weight_type
+            ):
+                reason = "weight_changed"
+            if reason is not None:
+                failure = ZeroRequestError(reason)
+            else:
+                result = self._execute_zero(request)
+        except Exception as exc:
+            failure = exc
+        finally:
+            with self._zero_lock:
+                self._zero_active = False
+                self._zero_request = None
+        if failure is not None:
+            request.future.set_exception(failure)
+        elif result is not None:
+            request.future.set_result(result)
+        return True
+
+    def _execute_zero(self, request: _ZeroRequest) -> ZeroResult:
+        error = None
+        response = None
+        self._cancel_weighing_for_zero()
+        self._zero_alert_until = time.monotonic() + self.guidance_interval
+        # A sent ON can remain active even when its reply is lost.
+        self._zero_release_pending = True
+        deadline = time.monotonic() + self.ZERO_HOLD_SECONDS
+        self.logger.info("hw.zero.started", station_id=self.station_id, weight=str(request.weight))
+        try:
+            if self.stop_event.is_set():
+                error = "stopped"
+            else:
+                on_response = self.exchange(
+                    dataclasses.replace(
+                        self._display_request(), zero_output=True,
+                        voice_code=self._take_zero_alert(time.monotonic()),
+                    ),
+                    deadline=deadline,
+                )
+                if on_response.zero_output_on is not True:
+                    error = "on_unconfirmed"
+                elif self.stop_event.wait(max(0.0, deadline - time.monotonic())):
+                    error = "stopped"
+        except Exception as exc:
+            error = "on_failed"
+            self.logger.warning("hw.zero.on_failed", station_id=self.station_id, error=str(exc))
+        finally:
+            # Even stop() and a missing ON response must take this path. It runs
+            # on the port owner, without cancellation or another ON attempt.
+            try:
+                response = self.exchange(
+                    dataclasses.replace(
+                        self._display_request(), voice_code=self._take_zero_alert(time.monotonic()),
+                    ),
+                    deadline=time.monotonic() + self.ZERO_RELEASE_TIMEOUT,
+                )
+            except Exception as exc:
+                error = error or "off_failed"
+                self.logger.warning("hw.zero.off_failed", station_id=self.station_id, error=str(exc))
+
+        released = response is not None and response.zero_output_on is False
+        if released:
+            self._zero_release_pending = False
+            self._reset_after_zero()
+        else:
+            error = error or "off_unconfirmed"
+            self._indicator_fault = True
+            self.state = WorkerState.RECOVER
+        if self.stop_event.is_set():
+            error = error or "stopped"
+        valid_weight = (
+            response is not None and self._valid_weighing_response(response)
+            and response.weight_type == request.weight_type
+        )
+        result = ZeroResult(
+            output_released=released,
+            zero_observed=bool(
+                released and valid_weight and response.weight_status == WeightStatus.STABLE
+                and response.weight_value == 0
+            ),
+            weight_before=request.weight,
+            weight_after=response.weight_value if valid_weight else None,
+            error=error,
+        )
+        log = self.logger.info if released and error is None else self.logger.warning
+        log(
+            "hw.zero.finished", station_id=self.station_id,
+            output_released=result.output_released, zero_observed=result.zero_observed,
+            weight_before=str(result.weight_before),
+            weight_after=str(result.weight_after) if result.weight_after is not None else None,
+            error=result.error,
+        )
+        return result
+
+    def _cancel_weighing_for_zero(self):
+        # Only called after the save boundary has been checked. A submitted
+        # record and its Future are never cancelled or cleared by this path.
+        if isinstance(self.last_event, RFIDTaggedEvent):
+            self.logger.info(
+                "biz.weighing.card_cancelled", reason="manual_zero",
+                rfid_card_uid=self.last_event.rfid_card_uid,
+            )
+        self._reset_after_zero()
+        # An explicit operator reset also ends a printed visit's departure wait.
+        self.cycle.state = CycleState.WAIT_EMPTY
+        self.state = WorkerState.IDLE
+        self._processing = False
+        self.last_plate = ""
+        self.last_event = None
+        self._saved_event_uuid = None
+        self._rejected_until = self._rejection_notice_until = 0.0
+
+    def _reset_after_zero(self):
+        # Ignore observations made during the pulse and do not invent a departure.
+        # Automatic OFF recovery preserves an already consumed visit's lock.
+        self.cycle.invalidate()
+        if self.cycle.state != CycleState.LOCKED:
+            self.cycle.state = CycleState.WAIT_EMPTY
+        self._tag_prompt_at = None
+        self._tag_prompted = False
+        self._weighed_vehicle_on = False
+        self._completion_at = None
+        self._completion_announced = False
+        self._farewell_pending = False
 
     def get_telemetry(self) -> StationTelemetrySnapshot:
         # One immutable observation contains the readable fields from one response.
@@ -566,6 +836,8 @@ class WeighingStationWorker:
             structlog.contextvars.bind_contextvars(state=self.state.name)
             try:
                 self._expire_observation(now=time.monotonic())
+                if self._run_zero_request():
+                    continue
                 match self.state:
                     case WorkerState.INITIALIZE:
                         self.state = self.initialize()
@@ -651,7 +923,7 @@ class WeighingStationWorker:
             traceback=not expected_serial_failure, **context,
         )
 
-    def exchange(self, request: RequestPacket) -> ResponsePacket:
+    def exchange(self, request: RequestPacket, *, deadline: float | None = None) -> ResponsePacket:
         voice = getattr(request, "voice_code", VoiceCode.NONE)
         if voice != VoiceCode.NONE:
             # Remember the command before I/O: a lost response does not prove
@@ -661,7 +933,10 @@ class WeighingStationWorker:
             self._voice_fault_reported = False
             self._voice_sent_at = time.monotonic()
         try:
-            response = self.client.send_and_receive(request)
+            if deadline is None:
+                response = self.client.send_and_receive(request)
+            else:
+                response = self.client.send_and_receive(request, deadline=deadline)
         except Exception as exc:
             self._voice_status = None
             self.cycle.invalidate()
@@ -677,6 +952,15 @@ class WeighingStationWorker:
             raise
         sampled_at = datetime.now(UTC)
         sampled_monotonic = time.monotonic()
+        if (
+            response.zero_output_on is True and not self._zero_active
+            and not self._zero_release_pending
+        ):
+            # A previous process may have stopped between ON and OFF. Even a
+            # fresh worker must not treat a known active zero output as ready.
+            self._zero_release_pending = True
+            self.cycle.invalidate()
+            self.logger.warning("hw.zero.unexpected_active_output", station_id=self.station_id)
         if not self.stop_event.is_set():
             now = sampled_monotonic
             self._observe_voice(response.voice_code, now)
@@ -684,17 +968,18 @@ class WeighingStationWorker:
             if self._valid_weighing_response(response):
                 previous_state = self.cycle.state
                 self.last_weight = response.weight_value
-                self.cycle.observe(response.weight_value, now=now)
                 self._indicator_fault = False
-                if response.weight_value <= self.cycle.threshold:
-                    self._weighed_vehicle_left()
-                if previous_state != self.cycle.state:
-                    self.logger.info(
-                        "biz.weighing.vehicle_state", previous_state=previous_state.name,
-                        vehicle_state=self.cycle.state.name, weight=str(response.weight_value),
-                    )
-                    if self.cycle.state == CycleState.READY:
-                        self._vehicle_ready(now)
+                if not self._zero_active and not self._zero_release_pending:
+                    self.cycle.observe(response.weight_value, now=now)
+                    if response.weight_value <= self.cycle.threshold:
+                        self._weighed_vehicle_left()
+                    if previous_state != self.cycle.state:
+                        self.logger.info(
+                            "biz.weighing.vehicle_state", previous_state=previous_state.name,
+                            vehicle_state=self.cycle.state.name, weight=str(response.weight_value),
+                        )
+                        if self.cycle.state == CycleState.READY:
+                            self._vehicle_ready(now)
             else:
                 self.cycle.invalidate()
                 self._indicator_fault = True
@@ -724,6 +1009,14 @@ class WeighingStationWorker:
                     heater_trigger_temp=response.heater_trigger_temp,
                 )
                 self._update_telemetry(snapshot)
+        if (
+            self._zero_release_pending and not self._zero_active
+            and isinstance(request, DisplayRequestPacket) and not request.zero_output
+            and response.zero_output_on is False
+        ):
+            self._zero_release_pending = False
+            self._reset_after_zero()
+            self.logger.info("hw.zero.release_recovered", station_id=self.station_id)
         self.failures.success()
         return response
 
@@ -819,8 +1112,14 @@ class WeighingStationWorker:
 
     def _display_request(self) -> DisplayRequestPacket:
         # Green alone always means a card may be accepted. Both lamps mean busy.
+        if self._zero_active:
+            return DisplayRequestPacket(
+                display_weight=self.last_weight, display_plate=self.last_plate,
+                green_blink=True, red_blink=True,
+            )
         fault = (
             self._indicator_fault or self._save_fault
+            or self._zero_release_pending
             or self._card_rejected(time.monotonic())
         )
         busy = self._processing or self._pending_save is not None
@@ -835,6 +1134,7 @@ class WeighingStationWorker:
             return False
         if (
             self._processing or self._pending_save is not None or self.stop_event.is_set()
+            or self._zero_request is not None or self._zero_release_pending
             # Red follows an unregistered card; only green alone accepts cards.
             or self._card_rejected(time.monotonic())
             or not self.cycle.reserve(now=time.monotonic())
@@ -845,6 +1145,8 @@ class WeighingStationWorker:
                 vehicle_state=self.cycle.state.name,
             )
             return False
+        # A new accepted visit must not hear a delayed alert from the prior reset.
+        self._zero_alert_until = None
         self._processing = True
         self.last_plate = response.rfid_card_uid
         self.last_event = RFIDTaggedEvent(rfid_card_uid=response.rfid_card_uid)
@@ -876,7 +1178,11 @@ class WeighingStationWorker:
         """
         # Lamps reflect the state before this poll's guidance updates it.
         request = self._display_request()
-        if self._voice_status == VoiceCode.NONE and self._pending_voice is None:
+        if (
+            not self._zero_active and not self._zero_release_pending
+            and self._zero_request is None
+            and self._voice_status == VoiceCode.NONE and self._pending_voice is None
+        ):
             request = dataclasses.replace(request, voice_code=self._next_guidance(time.monotonic()))
         return self.exchange(request)
 
@@ -884,6 +1190,9 @@ class WeighingStationWorker:
         if self._save_fault and now >= self._next_save_announcement:
             self._next_save_announcement = now + 30.0
             return self._announce(VoiceCode.CHECK_ADMIN)
+        zero_alert = self._take_zero_alert(now)
+        if zero_alert != VoiceCode.NONE:
+            return zero_alert
         if now < self._rejection_notice_until:
             self._rejection_notice_until = 0.0
             return self._announce(VoiceCode.UNREGISTERED_CARD)
@@ -909,6 +1218,19 @@ class WeighingStationWorker:
             self._tag_prompt_at = now + self.guidance_interval
             return self._announce(VoiceCode.TAG_CARD, repeated=repeated)
         return VoiceCode.NONE
+
+    def _take_zero_alert(self, now: float) -> VoiceCode:
+        if self._zero_alert_until is None:
+            return VoiceCode.NONE
+        if self.stop_event.is_set() or now >= self._zero_alert_until:
+            self._zero_alert_until = None
+            return VoiceCode.NONE
+        if self._voice_status != VoiceCode.NONE or self._pending_voice is not None:
+            return VoiceCode.NONE
+        # Consume before sending so OFF and later polls cannot replay the alert,
+        # even if its first response is lost or its playback start is unobserved.
+        self._zero_alert_until = None
+        return self._announce(VoiceCode.ALERT_SOUND)
 
     def _announce(self, voice: VoiceCode, *, repeated: bool = False) -> VoiceCode:
         # Reminders repeat every few seconds while a vehicle waits; log them quietly.
@@ -967,20 +1289,30 @@ class WeighingStationWorker:
         if self.stop_event.is_set():
             return WorkerState.IDLE
         self.logger.info("hw.weighing.started")
-        if self._pending_save is None:
-            if not self.cycle.consume(now=time.monotonic()):
-                self.logger.warning("biz.weighing.card_cancelled", reason="vehicle_no_longer_ready")
-                return self._resume_state()
-            self._processing = True
-            self._weighed_vehicle_on = True
-            self._weighed_invalidations = self.cycle.invalidations
-            # VERIFY exchanges nothing, so this is the weight from the card's response.
-            self._pending_save = WeighingCompletedEvent(
-                rfid_card_uid=self.last_plate, weight=int(self.last_weight),
-                station_id=self.station_id,
-            )
-            self.last_event = self._pending_save
-            self._saved_event_uuid = None
+        submit = False
+        # Linearize zero acceptance and record creation. Once the immutable
+        # original exists, request_zero rejects instead of discarding a save.
+        with self._zero_lock:
+            if self._pending_save is None:
+                if self._zero_request is not None and not self._zero_request.future.cancelled():
+                    # Keep the reservation if zero is cancelled or fails revalidation.
+                    return WorkerState.MEASURE
+                if not self.cycle.consume(now=time.monotonic()):
+                    self.logger.warning("biz.weighing.card_cancelled", reason="vehicle_no_longer_ready")
+                    return self._resume_state()
+                self._processing = True
+                self._weighed_vehicle_on = True
+                self._weighed_invalidations = self.cycle.invalidations
+                # VERIFY exchanges nothing, so this is the weight from the card's response.
+                self._pending_save = WeighingCompletedEvent(
+                    rfid_card_uid=self.last_plate, weight=int(self.last_weight),
+                    station_id=self.station_id,
+                )
+                self.last_event = self._pending_save
+                self._saved_event_uuid = None
+                submit = True
+        # User callbacks can re-enter the worker; do not invoke them under its lock.
+        if submit:
             self._submit_save()
         return WorkerState.SAVE
 

@@ -8,7 +8,9 @@ from cache import MarketDataCache, RFIDInfo
 from events import WeighingCompletedEvent
 from managers import StationRuntime, WeighingStationManager
 from models import WeighingStation
-from suwol1000 import DisplayRequestPacket, StationTelemetrySnapshot, ResponsePacket, WorkerState
+from suwol1000 import (
+    DisplayRequestPacket, StationTelemetrySnapshot, ResponsePacket, WorkerState, ZeroRequestError,
+)
 from tests.helpers import prepare_vehicle
 
 
@@ -16,6 +18,86 @@ class WeighingStationManagerTests(unittest.TestCase):
     def setUp(self):
         self.manager = WeighingStationManager(Mock(), MarketDataCache())
         self.manager.logger = Mock()
+
+    def test_zero_request_uses_existing_station_worker_and_returns_its_future(self):
+        worker, other_worker = Mock(), Mock()
+        pending = Future()
+        worker.request_zero.return_value = pending
+        self.manager.workers[7] = StationRuntime(
+            worker, Mock(is_alive=Mock(return_value=True)), "test-port", "Station", gateway_id=1,
+        )
+        self.manager.workers[11] = StationRuntime(
+            other_worker, Mock(is_alive=Mock(return_value=True)), "other-port", "Other", gateway_id=1,
+        )
+
+        self.assertIs(self.manager.request_zero(7, gateway_id=1), pending)
+
+        worker.request_zero.assert_called_once_with()
+        other_worker.request_zero.assert_not_called()
+        worker.run.assert_not_called()
+        worker.client.connect.assert_not_called()
+
+    def test_zero_request_for_unknown_station_returns_rejected_future(self):
+        result = self.manager.request_zero(99, gateway_id=1)
+
+        self.assertTrue(result.done())
+        with self.assertRaises(ZeroRequestError) as caught:
+            result.result()
+        self.assertEqual(caught.exception.reason, "unknown_station")
+
+    def test_zero_request_rejects_foreign_or_stopped_runtime(self):
+        for runtime_gateway, alive, reason in (
+            (2, True, "wrong_gateway"),
+            (None, True, "wrong_gateway"),
+            (1, False, "not_running"),
+        ):
+            with self.subTest(gateway_id=runtime_gateway, alive=alive):
+                worker = Mock()
+                self.manager.workers[7] = StationRuntime(
+                    worker, Mock(is_alive=Mock(return_value=alive)), "test-port", "Station",
+                    gateway_id=runtime_gateway,
+                )
+
+                result = self.manager.request_zero(7, gateway_id=1)
+
+                self.assertTrue(result.done())
+                with self.assertRaises(ZeroRequestError) as caught:
+                    result.result()
+                self.assertEqual(caught.exception.reason, reason)
+                worker.request_zero.assert_not_called()
+
+    def test_gateway_change_replaces_same_port_worker_before_accepting_new_scope(self):
+        cached = WeighingStation(id=7, gateway_id=1, name="Station", serial_port="same-port")
+        updated = WeighingStation(id=7, gateway_id=2, name="Station", serial_port="same-port")
+        old_worker, new_worker = Mock(), Mock()
+        old_worker.get_telemetry.return_value = StationTelemetrySnapshot(sample_seq=12)
+        pending = Future()
+        new_worker.request_zero.return_value = pending
+        old_thread, new_thread = (
+            Mock(is_alive=Mock(return_value=True)), Mock(is_alive=Mock(return_value=True)),
+        )
+
+        with patch("managers.WeighingStationWorker", side_effect=[old_worker, new_worker]), patch(
+            "managers.threading.Thread", side_effect=[old_thread, new_thread],
+        ):
+            self.manager.sync([cached])
+            before_replacement = self.manager.request_zero(7, gateway_id=2)
+            self.manager.sync([updated])
+            after_replacement = self.manager.request_zero(7, gateway_id=1)
+            accepted = self.manager.request_zero(7, gateway_id=2)
+
+        for rejected in (before_replacement, after_replacement):
+            with self.assertRaises(ZeroRequestError) as caught:
+                rejected.result()
+            self.assertEqual(caught.exception.reason, "wrong_gateway")
+        old_worker.request_zero.assert_not_called()
+        old_worker.stop.assert_called_once_with()
+        old_thread.join.assert_called_once_with()
+        new_thread.start.assert_called_once_with()
+        self.assertIs(self.manager.workers[7].worker, new_worker)
+        self.assertEqual(self.manager.workers[7].gateway_id, 2)
+        self.assertIs(accepted, pending)
+        new_worker.request_zero.assert_called_once_with()
 
     def test_each_worker_records_the_station_id_from_server_settings(self):
         stations = [

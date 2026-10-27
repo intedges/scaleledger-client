@@ -9,7 +9,9 @@ from cache import MarketDataCache
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 from printer import Receipt, ReceiptTemplate
 from models import WeighingStation
-from suwol1000 import StationTelemetrySnapshot, SerialClient, WeighingStationWorker
+from suwol1000 import (
+    StationTelemetrySnapshot, SerialClient, WeighingStationWorker, ZeroRequestError, ZeroResult,
+)
 
 
 @dataclass
@@ -18,6 +20,7 @@ class StationRuntime:
     thread: threading.Thread
     port: str
     station_name: str
+    gateway_id: int | None = None
 
 
 class WeighingStationManager:
@@ -37,6 +40,27 @@ class WeighingStationManager:
         self._sample_sequences: dict[int, int] = {}
         self.logger = get_logger()
 
+    def request_zero(self, station_id: int, *, gateway_id: int) -> Future[ZeroResult]:
+        """Forward an operator-confirmed request to the existing port owner.
+
+        Capture the current runtime once; a concurrent replacement stops that
+        worker and rejects its pending request. Cached workers from a previous
+        Gateway registration must not receive this connection's commands.
+        """
+        runtime = self.workers.get(station_id)
+        reason = None
+        if runtime is None:
+            reason = "unknown_station"
+        elif runtime.gateway_id != gateway_id:
+            reason = "wrong_gateway"
+        elif not runtime.thread.is_alive():
+            reason = "not_running"
+        if reason is not None:
+            result: Future[ZeroResult] = Future()
+            result.set_exception(ZeroRequestError(reason))
+            return result
+        return runtime.worker.request_zero()
+
     def sync(self, stations: list[WeighingStation]):
         self.logger.info("sys.manager.station.sync_evalutaing", current_count=len(self.workers), target_count=len(stations))
 
@@ -52,12 +76,17 @@ class WeighingStationManager:
                 self.start_worker(station)
             else:
                 runtime = self.workers[station.id]
-                if runtime.port != station.serial_port:
+                if (
+                    runtime.port != station.serial_port
+                    or runtime.gateway_id != getattr(station, "gateway_id", None)
+                ):
                     self.logger.info(
                         "sys.manager.station.config_changed", 
                         station_id=station.id, 
                         current_port=runtime.port,
                         target_port=station.serial_port,
+                        current_gateway_id=runtime.gateway_id,
+                        target_gateway_id=getattr(station, "gateway_id", None),
                         action="restart_worker"
                     )
                     self.stop_worker(station.id)
@@ -107,7 +136,10 @@ class WeighingStationManager:
         )
 
         thread = threading.Thread(target=worker.run, name=f"WeighingStation-{station.id}-{station.serial_port}", daemon=True)
-        runtime = StationRuntime(worker=worker, thread=thread, port=station.serial_port, station_name=station.name)
+        runtime = StationRuntime(
+            worker=worker, thread=thread, port=station.serial_port, station_name=station.name,
+            gateway_id=getattr(station, "gateway_id", None),
+        )
         self.workers[station.id] = runtime
         if self.on_telemetry is not None:
             try:
