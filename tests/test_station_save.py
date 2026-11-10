@@ -52,7 +52,7 @@ class StationSaveTests(unittest.TestCase):
     def assert_no_completion(self):
         self.assertFalse(any(isinstance(request, PrinterRequestPacket) for request in self.requests))
         self.assertFalse(any(
-            request.voice_code in (VoiceCode.WEIGHT_COMPLETE, VoiceCode.THANK_YOU)
+            request.voice_code in (VoiceCode.WEIGHT_COMPLETE_THANKS, VoiceCode.THANK_YOU)
             or (request.green_blink and not request.red_blink)
             for request in self.requests if isinstance(request, DisplayRequestPacket)
         ))
@@ -146,7 +146,7 @@ class StationSaveTests(unittest.TestCase):
             for request in self.requests
             if isinstance(request, PrinterRequestPacket) or request.voice_code != VoiceCode.NONE
         ]
-        self.assertEqual(actions, ["print", "WEIGHT_COMPLETE"])
+        self.assertEqual(actions, ["print", "WEIGHT_COMPLETE_THANKS"])
         self.receipt_builder.assert_called_once_with(event)
         self.on_event.assert_called_once_with(event)
         self.assertIsNone(self.worker.last_event)

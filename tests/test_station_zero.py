@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from suwol1000 import (
-    DeviceResponseTimeout, DisplayRequestPacket, ResponsePacket, VoiceCode,
+    VOICE_SECONDS, DeviceResponseTimeout, DisplayRequestPacket, ResponsePacket, VoiceCode,
     WeighingStationWorker, WeightStatus, WeightType, WorkerState, ZeroRequestError,
 )
 from weighing_cycle import CycleState
@@ -65,9 +65,10 @@ class ZeroScale:
         self.after_weight = Decimal("0")
         self.after_status = WeightStatus.STABLE
         self.after_type = WeightType.NET
-        # Default successful pulse: the ON reply observes sound 12 and the OFF
-        # reply observes playback finished. Busy/unknown cases override these.
-        self.on_voice = VoiceCode.ALERT_SOUND
+        # Default successful pulse: the ON reply observes the alert and the OFF
+        # reply observes playback finished. The real alert outlasts the 1.5 s hold;
+        # its own test and the busy/unknown cases override these.
+        self.on_voice = VoiceCode.PLEASE_WAIT
         self.off_voice = VoiceCode.NONE
         self.pulse_started = False
         self.off_attempts = 0
@@ -183,7 +184,7 @@ class StationZeroTests(unittest.TestCase):
         self.assertAlmostEqual(on[3] - on[0], 1.5)
         self.assertAlmostEqual(off[3] - off[0], 2.0)
         self.assertTrue(on[2].green_blink and on[2].red_blink)
-        self.assertEqual(on[2].voice_code, VoiceCode.ALERT_SOUND)
+        self.assertEqual(on[2].voice_code, VoiceCode.PLEASE_WAIT)
         self.assertEqual(off[2].voice_code, VoiceCode.NONE)
         self.assertEqual(on[2].display_weight, Decimal("-990"))
         self.assertEqual(result.weight_before, Decimal("-990"))
@@ -365,10 +366,10 @@ class StationZeroTests(unittest.TestCase):
         self.run_request(before_request=lock_visit).result()
         self.assertEqual(self.completed_state, CycleState.WAIT_EMPTY)
         self.events.assert_not_called()
-        self.assertFalse(self.worker._farewell_pending)
+        self.assertIsNone(self.worker._farewell_until)
         self.assertEqual(
             [call[2].voice_code for call in self.scale.calls if call[3] is not None],
-            [VoiceCode.ALERT_SOUND, VoiceCode.NONE],
+            [VoiceCode.PLEASE_WAIT, VoiceCode.NONE],
         )
 
     def test_zero_cancels_verify_or_measure_card_before_output_but_preserves_playing_voice(self):
@@ -378,7 +379,8 @@ class StationZeroTests(unittest.TestCase):
                 self.prepare_card(state)
                 self.worker._rejected_until = self.worker._rejection_notice_until = 30
                 self.worker._tag_prompt_at = self.worker._completion_at = 30
-                self.worker._farewell_pending = self.worker._weighed_vehicle_on = True
+                self.worker._farewell_until = 30
+                self.worker._weighed_vehicle_on = True
                 self.worker._pending_voice = VoiceCode.TAG_CARD
                 self.worker._voice_status = VoiceCode.TAG_CARD
                 self.worker._voice_started = True
@@ -394,7 +396,7 @@ class StationZeroTests(unittest.TestCase):
                     self.assertEqual(self.worker._rejection_notice_until, 0)
                     self.assertIsNone(self.worker._tag_prompt_at)
                     self.assertIsNone(self.worker._completion_at)
-                    self.assertFalse(self.worker._farewell_pending)
+                    self.assertIsNone(self.worker._farewell_until)
 
                 self.scale.after_on = during_on
                 result = self.execute_queued_zero()
@@ -525,9 +527,9 @@ class StationZeroTests(unittest.TestCase):
             self.worker._poll()
 
         voices = [call[2].voice_code for call in self.scale.calls]
-        self.assertEqual(voices.count(VoiceCode.ALERT_SOUND), 1)
+        self.assertEqual(voices.count(VoiceCode.PLEASE_WAIT), 1)
         on = next(index for index, call in enumerate(self.scale.calls) if call[2].zero_output)
-        self.assertEqual(voices[on], VoiceCode.ALERT_SOUND)
+        self.assertEqual(voices[on], VoiceCode.PLEASE_WAIT)
         self.assertEqual(voices[on + 1], VoiceCode.NONE)
         self.assertIsNone(self.worker._zero_alert_until)
 
@@ -535,11 +537,35 @@ class StationZeroTests(unittest.TestCase):
         self.worker._poll()
         self.assertEqual(self.scale.calls[-1][2].voice_code, VoiceCode.UNREGISTERED_CARD)
 
+    def test_alert_outlasting_the_pulse_finishes_on_a_later_poll_without_resending(self):
+        self.assertGreater(VOICE_SECONDS[VoiceCode.PLEASE_WAIT], self.worker.ZERO_HOLD_SECONDS)
+        self.prime()
+        # "잠시만 기다려주십시오" is still playing when OFF is sent.
+        self.scale.off_voice = VoiceCode.PLEASE_WAIT
+
+        result = self.execute_queued_zero()
+
+        self.assertTrue(result.output_released)
+        self.assertIsNone(result.error)
+        self.assertEqual(self.worker._pending_voice, VoiceCode.PLEASE_WAIT)
+        self.assertTrue(self.worker._voice_started)
+        self.worker._rejection_notice_until = self.clock.now + 5
+        self.worker._poll()
+        self.assertEqual(self.scale.calls[-1][2].voice_code, VoiceCode.NONE)
+        self.scale.off_voice = VoiceCode.NONE
+        self.worker._poll()  # Observe the alert's Busy -> 00 completion.
+        self.assertIsNone(self.worker._pending_voice)
+        self.worker._poll()
+
+        voices = [call[2].voice_code for call in self.scale.calls]
+        self.assertEqual(voices.count(VoiceCode.PLEASE_WAIT), 1)
+        self.assertEqual(voices[-1], VoiceCode.UNREGISTERED_CARD)
+
     def test_unobserved_or_lost_on_voice_reply_keeps_tracking_without_resending_alert(self):
         for feedback, error in (
             (VoiceCode.NONE, None),
             (None, None),
-            (VoiceCode.ALERT_SOUND, DeviceResponseTimeout("ON response lost")),
+            (VoiceCode.PLEASE_WAIT, DeviceResponseTimeout("ON response lost")),
         ):
             with self.subTest(feedback=feedback, error=error):
                 self.reset_station()
@@ -547,7 +573,7 @@ class StationZeroTests(unittest.TestCase):
                 self.scale.on_voice = feedback
                 self.scale.on_error = error
                 self.execute_queued_zero()
-                self.assertEqual(self.worker._pending_voice, VoiceCode.ALERT_SOUND)
+                self.assertEqual(self.worker._pending_voice, VoiceCode.PLEASE_WAIT)
                 self.assertFalse(self.worker._voice_started)
                 self.assertIsNone(self.worker._zero_alert_until)
                 self.worker._rejection_notice_until = self.clock.now + 1
@@ -555,9 +581,9 @@ class StationZeroTests(unittest.TestCase):
                     self.worker._poll()
 
                 voices = [call[2].voice_code for call in self.scale.calls]
-                self.assertEqual(voices.count(VoiceCode.ALERT_SOUND), 1)
+                self.assertEqual(voices.count(VoiceCode.PLEASE_WAIT), 1)
                 self.assertNotIn(VoiceCode.UNREGISTERED_CARD, voices)
-                self.assertEqual(self.worker._pending_voice, VoiceCode.ALERT_SOUND)
+                self.assertEqual(self.worker._pending_voice, VoiceCode.PLEASE_WAIT)
                 self.assertFalse(self.worker._voice_started)
 
     def test_busy_speaker_finishing_in_on_reply_allows_alert_with_off(self):
@@ -573,7 +599,7 @@ class StationZeroTests(unittest.TestCase):
         self.assertAlmostEqual(pulse[1][0] - pulse[0][0], 1.5)
         self.assertEqual(
             [call[2].voice_code for call in pulse],
-            [VoiceCode.NONE, VoiceCode.ALERT_SOUND],
+            [VoiceCode.NONE, VoiceCode.PLEASE_WAIT],
         )
 
     def test_busy_speaker_delays_alert_without_delaying_zero_or_forgetting_old_playback(self):
@@ -593,25 +619,25 @@ class StationZeroTests(unittest.TestCase):
         self.scale.off_voice = VoiceCode.NONE
         self.worker._poll()  # Observe the old voice's Busy -> 00 completion.
         self.assertIsNone(self.worker._pending_voice)
-        self.worker._poll()  # The first subsequent idle send can contain 12.
+        self.worker._poll()  # The first subsequent idle send can carry the alert.
         self.worker._poll()
 
         voices = [call[2].voice_code for call in self.scale.calls]
-        self.assertEqual(voices.count(VoiceCode.ALERT_SOUND), 1)
-        self.assertEqual(voices[-2], VoiceCode.ALERT_SOUND)
+        self.assertEqual(voices.count(VoiceCode.PLEASE_WAIT), 1)
+        self.assertEqual(voices[-2], VoiceCode.PLEASE_WAIT)
 
     def test_unknown_speaker_defers_alert_until_an_idle_response_is_observed(self):
         self.prime()
         self.worker._voice_status = None
         self.scale.on_voice = self.scale.off_voice = None
         self.execute_queued_zero()
-        self.assertFalse(any(call[2].voice_code == VoiceCode.ALERT_SOUND for call in self.scale.calls))
+        self.assertFalse(any(call[2].voice_code == VoiceCode.PLEASE_WAIT for call in self.scale.calls))
 
         self.scale.off_voice = VoiceCode.NONE
         self.worker._poll()
         self.assertEqual(self.scale.calls[-1][2].voice_code, VoiceCode.NONE)
         self.worker._poll()
-        self.assertEqual(self.scale.calls[-1][2].voice_code, VoiceCode.ALERT_SOUND)
+        self.assertEqual(self.scale.calls[-1][2].voice_code, VoiceCode.PLEASE_WAIT)
 
     def test_delayed_alert_expires_and_is_not_replayed_after_speaker_becomes_idle(self):
         self.prime()
@@ -620,14 +646,14 @@ class StationZeroTests(unittest.TestCase):
         self.worker._voice_started = True
         self.scale.on_voice = self.scale.off_voice = VoiceCode.TAG_CARD
         self.execute_queued_zero()
-        self.clock.advance(self.worker.guidance_interval)
+        self.clock.advance(self.worker.notice_wait)
 
         self.scale.off_voice = VoiceCode.NONE
         self.worker._poll()
         self.worker._poll()
 
         self.assertIsNone(self.worker._zero_alert_until)
-        self.assertFalse(any(call[2].voice_code == VoiceCode.ALERT_SOUND for call in self.scale.calls))
+        self.assertFalse(any(call[2].voice_code == VoiceCode.PLEASE_WAIT for call in self.scale.calls))
 
     def test_accepting_a_new_card_discards_delayed_alert_from_the_previous_zero(self):
         self.prime()
@@ -652,7 +678,7 @@ class StationZeroTests(unittest.TestCase):
         self.scale.off_voice = VoiceCode.NONE
         self.worker._poll()
         self.worker._poll()
-        self.assertFalse(any(call[2].voice_code == VoiceCode.ALERT_SOUND for call in self.scale.calls))
+        self.assertFalse(any(call[2].voice_code == VoiceCode.PLEASE_WAIT for call in self.scale.calls))
 
     def test_stop_after_on_suppresses_only_unsent_alert_and_still_sends_off(self):
         for busy in (False, True):
@@ -674,7 +700,7 @@ class StationZeroTests(unittest.TestCase):
                 voices = [call[2].voice_code for call in self.scale.calls if call[3] is not None]
                 self.assertEqual(
                     voices,
-                    [VoiceCode.NONE if busy else VoiceCode.ALERT_SOUND, VoiceCode.NONE],
+                    [VoiceCode.NONE if busy else VoiceCode.PLEASE_WAIT, VoiceCode.NONE],
                 )
 
     def test_unexpected_output_recovery_keeps_consumed_visit_locked(self):
@@ -691,7 +717,7 @@ class StationZeroTests(unittest.TestCase):
         self.assertFalse(self.worker._zero_release_pending)
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
         self.events.assert_not_called()
-        self.assertFalse(any(call[2].voice_code == VoiceCode.ALERT_SOUND for call in self.scale.calls))
+        self.assertFalse(any(call[2].voice_code == VoiceCode.PLEASE_WAIT for call in self.scale.calls))
 
     def test_new_worker_blocks_lingering_output_until_off_and_fresh_empty_then_entry(self):
         # The previous process may have died with relay 8 active. Even though

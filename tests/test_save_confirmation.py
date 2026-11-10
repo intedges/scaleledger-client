@@ -124,7 +124,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(isinstance(request, PrinterRequestPacket) for request in self.scale.requests))
         for request in self.scale.requests:
             if isinstance(request, DisplayRequestPacket):
-                self.assertNotIn(request.voice_code, (VoiceCode.WEIGHT_COMPLETE, VoiceCode.THANK_YOU))
+                self.assertNotIn(request.voice_code, (VoiceCode.WEIGHT_COMPLETE_THANKS, VoiceCode.THANK_YOU))
                 self.assertFalse(request.green_blink and not request.red_blink)
 
     def assert_committed_record(self, event):
@@ -178,7 +178,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(self.submissions), 1)
         self.assertEqual(sum(isinstance(request, PrinterRequestPacket) for request in self.scale.requests), 1)
-        self.assertEqual(sum(getattr(request, "voice_code", None) == VoiceCode.WEIGHT_COMPLETE for request in self.scale.requests), 1)
+        self.assertEqual(sum(getattr(request, "voice_code", None) == VoiceCode.WEIGHT_COMPLETE_THANKS for request in self.scale.requests), 1)
         self.assertIsInstance(self.scale.requests[-2], PrinterRequestPacket)
 
     async def test_sqlite_lock_failure_retries_the_original_event(self):

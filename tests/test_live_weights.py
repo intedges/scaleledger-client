@@ -91,7 +91,7 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
             ResponsePacket(weight_value=Decimal("1")),
             ResponsePacket(weight_value=Decimal("2"), voice_code=VoiceCode.TAG_CARD),
             ResponsePacket(weight_value=Decimal("3")),
-            ResponsePacket(weight_value=Decimal("4"), voice_code=VoiceCode.WEIGHT_COMPLETE),
+            ResponsePacket(weight_value=Decimal("4"), voice_code=VoiceCode.WEIGHT_COMPLETE_THANKS),
             ResponsePacket(weight_value=Decimal("5")),
         ]
         self.worker.idle()
@@ -129,7 +129,7 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
     def test_raw_frame_fields_share_one_observation_even_when_weight_is_invalid(self):
         observed_at = datetime(2026, 10, 26, tzinfo=UTC)
         raw = frame(
-            relay=b"19", voice=b"04", printer=b"1", temperature=b"+29", fan=b"32", heater=b"06",
+            relay=b"19", voice=b"17", printer=b"1", temperature=b"+29", fan=b"32", heater=b"06",
             weight=b"OL,NT,+     OLkg",
         )
         self.serial.send_and_receive.side_effect = lambda request: ResponsePacket.from_bytes(raw)
@@ -166,7 +166,7 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
         self.worker.exchange(DisplayRequestPacket())
         self.serial.send_and_receive.return_value = ResponsePacket.from_bytes(
             frame(
-                relay=b"\x00A", voice=b"13", printer=b"9", temperature=b"\x00\x00\x00",
+                relay=b"\x00A", voice=b"19", printer=b"9", temperature=b"\x00\x00\x00",
                 fan=b"\x00\x00", heater=b"xx", weight=b"XX,XX,+    120kg",
             ),
         )
