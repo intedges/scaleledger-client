@@ -76,7 +76,7 @@ class StationZeroIntegrationTests(unittest.IsolatedAsyncioTestCase):
             pulse = [call for call in self.scales[7].calls if call[3] is not None]
             self.assertEqual(len(pulse), 2)
             self.assertEqual([call[2].zero_output for call in pulse], [True, False])
-            self.assertEqual([call[2].voice_code for call in pulse], [VoiceCode.ALERT_SOUND, VoiceCode.NONE])
+            self.assertEqual([call[2].voice_code for call in pulse], [VoiceCode.PLEASE_WAIT, VoiceCode.NONE])
             self.assertAlmostEqual(pulse[1][0] - pulse[0][0], 1.5)
             self.assertEqual(len(self.scales[11].calls), 1)  # Its initial observation only.
             self.assertTrue(socket.sent.empty())

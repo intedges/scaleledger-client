@@ -228,7 +228,7 @@ class StationSoakTests(unittest.TestCase):
         self.assertEqual(len(uuids), 500)
         self.assertGreater(traffic.invalid_tags, 0)
         self.assertGreater(traffic.voice_commands[VoiceCode.UNREGISTERED_CARD], 0)
-        self.assertGreater(traffic.voice_commands[VoiceCode.CHECK_ADMIN], 0)
+        self.assertGreater(traffic.voice_commands[VoiceCode.CONTACT_ADMIN], 0)
         self.assertEqual(traffic.faults, {v for v in expected_vehicles if v % 8 in (2, 3, 6, 7)})
         self.assertEqual(traffic.connect_calls, 1 + sum(v % 8 in (3, 7) for v in expected_vehicles))
         self.assertEqual(logger.events["sys.worker.unexpected_error"], 0)

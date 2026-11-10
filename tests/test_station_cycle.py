@@ -8,8 +8,8 @@ import serial
 
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from suwol1000 import (
-    DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
-    WeighingStationWorker, WorkerState,
+    VOICE_MARGIN_SECONDS, VOICE_SECONDS, DisplayRequestPacket, PrinterRequestPacket,
+    PrinterStatus, ResponsePacket, VoiceCode, WeighingStationWorker, WorkerState,
 )
 from weighing_cycle import CycleState
 
@@ -44,6 +44,7 @@ class CycleScale:
         self.step = 0.0
         self.fixed_voice = None
         self.tag_when_ready = NO_CARD
+        self.printer_status = PrinterStatus.NORMAL
         self.connect_calls = 0
 
     def connect(self):
@@ -81,7 +82,10 @@ class CycleScale:
         voice = self.fixed_voice
         if voice is None:
             voice = getattr(request, "voice_code", VoiceCode.NONE)
-        return ResponsePacket(weight_value=self.weight, rfid_card_uid=card, voice_code=voice)
+        return ResponsePacket(
+            weight_value=self.weight, rfid_card_uid=card, voice_code=voice,
+            printer_status=self.printer_status,
+        )
 
 
 class StationCycleTests(unittest.TestCase):
@@ -388,31 +392,59 @@ class StationCycleTests(unittest.TestCase):
         self.scale.fixed_voice = None
         self.idle_at(rejected_at + 3.5)
         self.assertEqual(self.lights(), (True, False))
-        self.idle_at(rejected_at + 3.5)
-        self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 2)
+        # Green alone takes the next card at once; no prompt plays right after the notice.
+        self.idle_at(rejected_at + 3.5, rejected_at + 4.99)
+        self.assertEqual(self.commands_since(0), [VoiceCode.TAG_CARD, VoiceCode.UNREGISTERED_CARD])
+        self.idle_at(rejected_at + 5)
+        self.assertEqual(self.voice_times(VoiceCode.TAG_CARD)[-1], rejected_at + 5)
         self.assertFalse(self.measurements())
         self.validator.return_value = True
         self.accept(SECOND_CARD)
         self.measure()
         self.assertEqual([event.rfid_card_uid for event in self.measurements()], [SECOND_CARD])
 
-    def test_unregistered_card_red_ends_after_five_seconds_if_the_notice_cannot_play(self):
+    def test_unregistered_card_red_ends_after_the_notice_wait_if_the_notice_cannot_play(self):
         self.ready()
         self.accept()
         self.scale.fixed_voice = VoiceCode.TAG_CARD
         self.validator.return_value = False
         rejected_at = self.clock.now
         self.assertEqual(self.invoke("verify"), WorkerState.IDLE)
+        # The wait outlasts the longest voice that can be playing, plus a margin.
+        self.assertAlmostEqual(self.worker.notice_wait, 4.49 + 1)
+        waited = rejected_at + self.worker.notice_wait
 
-        self.idle_at(rejected_at + 2, rejected_at + 4, rejected_at + 4.99)
+        self.idle_at(rejected_at + 2, rejected_at + 4, waited - 0.01)
         self.assertEqual(self.lights(), (False, True))
-        self.idle_at(rejected_at + 5)
+        self.idle_at(waited)
 
         self.assertEqual(self.lights(), (True, False))
         self.assertFalse(self.voices(VoiceCode.UNREGISTERED_CARD))
         self.scale.card = SECOND_CARD
         self.assertEqual(self.invoke("idle"), WorkerState.VERIFY)
         self.assertEqual(self.worker.last_plate, SECOND_CARD)
+
+    def test_late_unregistered_notice_keeps_red_while_playing_until_its_latest_end(self):
+        self.ready()
+        self.accept()
+        # A voice that keeps playing delays the notice almost to the end of its wait.
+        self.scale.fixed_voice = VoiceCode.TAG_CARD
+        self.validator.return_value = False
+        rejected_at = self.clock.now
+        self.assertEqual(self.invoke("verify"), WorkerState.IDLE)
+        waited = rejected_at + self.worker.notice_wait
+        self.idle_at(rejected_at + 2, waited - 0.3)
+        self.scale.fixed_voice = None
+        self.idle_at(waited - 0.2, waited - 0.1)
+        self.assertEqual(self.voice_times(VoiceCode.UNREGISTERED_CARD), [waited - 0.1])
+
+        # Red outlasts the wait while the notice plays, but never its latest possible end.
+        self.scale.fixed_voice = VoiceCode.UNREGISTERED_CARD
+        latest_end = waited + VOICE_SECONDS[VoiceCode.UNREGISTERED_CARD] + VOICE_MARGIN_SECONDS
+        self.idle_at(waited + 1, latest_end - 0.01)
+        self.assertEqual(self.lights(), (False, True))
+        self.idle_at(latest_end)
+        self.assertEqual(self.lights(), (True, False))
 
     def test_one_record_and_receipt_per_vehicle_until_one_second_at_or_below_limit(self):
         self.ready()
@@ -427,7 +459,7 @@ class StationCycleTests(unittest.TestCase):
             self.assertEqual(self.invoke("idle"), WorkerState.IDLE)
         self.assertEqual(self.measurements(), [first])
         self.assertEqual(self.prints(), 1)
-        self.assertEqual(len(self.voices(VoiceCode.WEIGHT_COMPLETE)), 1)
+        self.assertEqual(len(self.voices(VoiceCode.WEIGHT_COMPLETE_THANKS)), 1)
 
         start = self.clock.now + 1
         for offset in (0, 0.5, 0.99):
@@ -443,24 +475,91 @@ class StationCycleTests(unittest.TestCase):
         self.assertNotEqual(self.measurements()[0].uuid, self.measurements()[1].uuid)
         self.assertEqual(self.prints(), 2)
 
-    def test_completion_repeats_every_five_seconds_until_departure_then_thanks_once(self):
+    def test_completion_repeats_every_ten_seconds_until_departure_then_thanks_once(self):
         self.ready()
         self.accept()
         self.measure()
         self.finish()
         printed_at = self.clock.now
 
-        self.idle_at(*(printed_at + offset for offset in (0, 1, 2, 3, 4, 4.99, 5, 6, 7, 8, 9, 10)))
-        self.observe("50", printed_at + 11)
-        self.idle_at(*(printed_at + offset for offset in range(11, 20)))
+        self.idle_at(*(printed_at + offset for offset in (0, 2, 4, 6, 8, 9.99, 10, 12, 14, 16, 18, 19.99, 20)))
+        self.observe("50", printed_at + 21)
+        self.idle_at(*(printed_at + offset for offset in range(21, 30)))
 
         self.assertEqual(
-            self.voice_times(VoiceCode.WEIGHT_COMPLETE),
-            [printed_at, printed_at + 5, printed_at + 10],
+            self.voice_times(VoiceCode.WEIGHT_COMPLETE_THANKS),
+            [printed_at, printed_at + 10, printed_at + 20],
         )
-        self.assertEqual(self.voice_times(VoiceCode.THANK_YOU), [printed_at + 11])
+        self.assertEqual(self.voice_times(VoiceCode.THANK_YOU), [printed_at + 21])
+        self.assertFalse(self.voices(VoiceCode.NO_PAPER))
         self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
         self.assertEqual(self.lights(), (False, False))
+
+    def test_thanks_that_cannot_start_within_a_second_of_departure_is_dropped(self):
+        self.ready()
+        self.accept()
+        self.measure()
+        self.finish()
+        printed_at = self.clock.now
+        self.idle_at(printed_at)
+        # The completion notice is still playing when the vehicle drives off.
+        self.scale.fixed_voice = VoiceCode.WEIGHT_COMPLETE_THANKS
+        departed_at = printed_at + 3
+        self.observe("50", departed_at)
+        self.idle_at(departed_at + 0.5)
+        self.scale.fixed_voice = None
+        self.idle_at(*(departed_at + offset for offset in (1, 1.5, 2, 3)))
+
+        self.assertFalse(self.voices(VoiceCode.THANK_YOU))
+        self.assertEqual(self.voice_times(VoiceCode.WEIGHT_COMPLETE_THANKS), [printed_at])
+        self.assertIsNone(self.worker._farewell_until)
+
+    def test_no_paper_after_printing_is_announced_once_before_the_completion(self):
+        self.ready()
+        self.accept()
+        self.measure()
+        self.scale.printer_status = PrinterStatus.NO_PAPER
+        self.finish()
+        printed_at = self.clock.now
+        begin = len(self.scale.requests)
+        event = self.measurements()[0]
+
+        self.idle_at(*(printed_at + offset for offset in range(20)))
+
+        complete = VoiceCode.WEIGHT_COMPLETE_THANKS
+        # Completion follows the single notice and keeps repeating while the vehicle stays.
+        self.assertEqual(self.commands_since(begin), [VoiceCode.NO_PAPER, complete, complete])
+        self.assertEqual(self.voice_times(VoiceCode.NO_PAPER), [printed_at])
+        self.assertEqual(self.voice_times(complete), [printed_at + 2, printed_at + 12])
+        self.assertEqual(self.prints(), 1)
+        self.worker.logger.warning.assert_any_call(
+            "hw.printer.command.no_paper", event_id=event.uuid,
+            action="refill_paper_and_check_receipt",
+        )
+        # The record was saved before printing; the paper only affects the receipt.
+        self.assertEqual(self.measurements(), [event])
+        self.assertEqual(self.lights(), (False, False))
+
+    def test_no_paper_notice_is_skipped_with_the_completion_of_a_superseded_visit(self):
+        self.ready()
+        self.accept()
+        self.result = Future()
+        self.measure()
+        self.sustain("0")
+        self.sustain("120")
+        self.result.set_result(None)
+        self.scale.printer_status = PrinterStatus.NO_PAPER
+
+        self.finish()
+        self.assertEqual(self.invoke("idle"), WorkerState.IDLE)
+
+        self.assertEqual(self.prints(), 1)
+        self.worker.logger.warning.assert_any_call(
+            "hw.printer.command.no_paper", event_id=self.measurements()[0].uuid,
+            action="refill_paper_and_check_receipt",
+        )
+        self.assertFalse(self.voices(VoiceCode.NO_PAPER))
+        self.assertEqual(self.scale.requests[-1].voice_code, VoiceCode.TAG_CARD)
 
     def test_departure_before_the_completion_notice_still_hears_it_then_thanks(self):
         self.ready()
@@ -475,7 +574,7 @@ class StationCycleTests(unittest.TestCase):
         for _ in range(6):
             self.assertEqual(self.invoke("idle"), WorkerState.IDLE)
 
-        self.assertEqual(self.commands_since(begin), [VoiceCode.WEIGHT_COMPLETE, VoiceCode.THANK_YOU])
+        self.assertEqual(self.commands_since(begin), [VoiceCode.WEIGHT_COMPLETE_THANKS, VoiceCode.THANK_YOU])
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
 
     def test_completion_reminders_stop_when_the_weight_becomes_unreadable(self):
@@ -492,7 +591,7 @@ class StationCycleTests(unittest.TestCase):
         self.scale.weight = Decimal("0")
         self.idle_at(*(printed_at + offset for offset in range(12, 20)))
 
-        self.assertEqual(self.voice_times(VoiceCode.WEIGHT_COMPLETE), [printed_at])
+        self.assertEqual(self.voice_times(VoiceCode.WEIGHT_COMPLETE_THANKS), [printed_at])
         self.assertFalse(self.voices(VoiceCode.THANK_YOU))
         self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
 
@@ -512,7 +611,7 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(self.invoke("connect"), WorkerState.IDLE)
         self.idle_at(*(printed_at + 600 + offset for offset in range(12)))
 
-        self.assertEqual(self.voice_times(VoiceCode.WEIGHT_COMPLETE), [printed_at])
+        self.assertEqual(self.voice_times(VoiceCode.WEIGHT_COMPLETE_THANKS), [printed_at])
         self.assertFalse(self.voices(VoiceCode.THANK_YOU))
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
         self.assertEqual(self.lights(), (False, False))
@@ -524,7 +623,7 @@ class StationCycleTests(unittest.TestCase):
         self.finish()
         self.idle_at(self.clock.now)
         # A long completion notice outlasts the departure and the next entry.
-        self.scale.fixed_voice = VoiceCode.WEIGHT_COMPLETE
+        self.scale.fixed_voice = VoiceCode.WEIGHT_COMPLETE_THANKS
         self.sustain("0")
         self.sustain("120")
         self.assertEqual(self.worker.cycle.state, CycleState.READY)
@@ -559,7 +658,7 @@ class StationCycleTests(unittest.TestCase):
 
         self.assertEqual(self.invoke("idle"), WorkerState.IDLE)
         notice = self.scale.requests[-1]
-        self.assertEqual(notice.voice_code, VoiceCode.WEIGHT_COMPLETE)
+        self.assertEqual(notice.voice_code, VoiceCode.WEIGHT_COMPLETE_THANKS)
         self.assertEqual((notice.green_blink, notice.red_blink), (False, False))
 
     def test_failed_save_keeps_red_and_the_original_event_when_new_cards_arrive(self):
@@ -578,10 +677,10 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
         self.assertEqual(self.measurements(), [original])
         self.assertIs(self.worker._pending_save, original)
-        notices = self.voices(VoiceCode.CHECK_ADMIN)
+        notices = self.voices(VoiceCode.CONTACT_ADMIN)
         self.assertEqual(len(notices), 1)
         self.assertEqual((notices[0].green_blink, notices[0].red_blink), (False, True))
-        self.assertFalse(self.voices(VoiceCode.WEIGHT_COMPLETE))
+        self.assertFalse(self.voices(VoiceCode.WEIGHT_COMPLETE_THANKS))
         self.assertEqual(self.prints(), 0)
 
     def test_unobserved_voice_start_suppresses_guidance_but_not_weighing(self):
@@ -648,7 +747,7 @@ class StationCycleTests(unittest.TestCase):
 
         self.assertEqual(self.measurements(), [original])
         self.assertEqual(self.prints(), 1)
-        self.assertFalse(self.voices(VoiceCode.WEIGHT_COMPLETE))
+        self.assertFalse(self.voices(VoiceCode.WEIGHT_COMPLETE_THANKS))
         self.assertFalse(self.voices(VoiceCode.THANK_YOU))
         # The vehicle now on the platform is prompted instead.
         self.assertEqual(self.scale.requests[-1].voice_code, VoiceCode.TAG_CARD)

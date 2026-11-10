@@ -8,8 +8,8 @@ import serial
 
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from suwol1000 import (
-    RESPONSE_LENGTH, CommandCode, DeviceResponseTimeout, DisplayRequestPacket, InputCode,
-    PrinterRequestPacket, PrinterStatus,
+    RESPONSE_LENGTH, VOICE_SECONDS, CommandCode, DeviceResponseTimeout, DisplayRequestPacket,
+    InputCode, PrinterRequestPacket, PrinterStatus,
     ResponsePacket, SerialClient, VoiceCode, WeighingStationWorker, WeightStatus, WeightType,
 )
 
@@ -69,7 +69,7 @@ class ResponsePacketTests(unittest.TestCase):
         }
         for name, fields in cases.items():
             with self.subTest(name):
-                response = ResponsePacket.from_bytes(frame(card=b"12345678", voice=b"04", **fields))
+                response = ResponsePacket.from_bytes(frame(card=b"12345678", voice=b"17", **fields))
 
                 self.assertEqual(response.invalid_fields, (name,))
                 self.assertIsNone(getattr(response, name))
@@ -91,8 +91,21 @@ class ResponsePacketTests(unittest.TestCase):
         )
         self.assertEqual(response.weight_value, Decimal("120"))
 
+    def test_every_uploaded_voice_round_trips_and_has_a_file_length(self):
+        # Voice files 01-18 are numbered in file name order on the device.
+        self.assertEqual([int(voice) for voice in VoiceCode], list(range(19)))
+        self.assertEqual(set(VOICE_SECONDS), set(VoiceCode) - {VoiceCode.NONE})
+        for voice in VoiceCode:
+            with self.subTest(voice=voice.name):
+                wire = f"{voice.value:02d}".encode()
+                # STX, ID, command, weight 8, plate 6, reserved 6 and relay 2 precede it.
+                self.assertEqual(DisplayRequestPacket(voice_code=voice).to_bytes()[25:27], wire)
+                self.assertIs(ResponsePacket.from_bytes(frame(voice=wire)).voice_code, voice)
+                if voice != VoiceCode.NONE:
+                    self.assertGreater(VOICE_SECONDS[voice], 0)
+
     def test_unknown_voice_status_is_none(self):
-        for voice in (b"13", b"\x00\x00", b"-1"):
+        for voice in (b"19", b"99", b"\x00\x00", b"-1"):
             with self.subTest(voice=voice):
                 response = ResponsePacket.from_bytes(frame(voice=voice))
                 self.assertIsNone(response.voice_code)
@@ -384,8 +397,9 @@ class UnreadableFieldStationTests(unittest.TestCase):
         self.assertEqual((events[1].rfid_card_uid, events[1].weight), ("12345678", 120))
         # The vehicle stays on the platform, so completion keeps being announced.
         voices = self.voices(scale)
-        self.assertEqual(voices[:3], [VoiceCode.TAG_CARD, VoiceCode.WEIGHT_COMPLETE, VoiceCode.WEIGHT_COMPLETE])
-        self.assertEqual(set(voices[1:]), {VoiceCode.WEIGHT_COMPLETE})
+        complete = VoiceCode.WEIGHT_COMPLETE_THANKS
+        self.assertEqual(voices[:3], [VoiceCode.TAG_CARD, complete, complete])
+        self.assertEqual(set(voices[1:]), {complete})
         self.assertEqual(fields, ["fan_trigger_temp", "heater_trigger_temp"])
         self.assertNotIn("error", [sample.connection_status for sample in samples])
 

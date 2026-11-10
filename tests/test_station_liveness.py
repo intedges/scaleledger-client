@@ -14,8 +14,8 @@ import serial
 
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from suwol1000 import (
-    DeviceResponseTimeout, DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
-    WeighingStationWorker, WorkerState,
+    VOICE_SECONDS, DeviceResponseTimeout, DisplayRequestPacket, PrinterRequestPacket,
+    ResponsePacket, VoiceCode, WeighingStationWorker, WorkerState,
 )
 from weighing_cycle import CycleState
 
@@ -63,11 +63,12 @@ class ContinuousScale:
     timeout = 2.0
     write_timeout = 2.0
 
-    def __init__(self, clock, *, missing_voices=(), busy_seconds=0.8,
+    def __init__(self, clock, *, missing_voices=(), busy_seconds=None,
                  fault=None, jitter=False, repeat_tags=True, exchange_seconds=0.1,
                  visit_windows=((6, 40), (46, 80))):
         self.clock = clock
         self.missing_voices = set(missing_voices)
+        # None plays each voice for the length of its uploaded file.
         self.busy_seconds = busy_seconds
         self.fault = fault
         self.fault_used = False
@@ -111,7 +112,9 @@ class ContinuousScale:
         voice = getattr(request, "voice_code", VoiceCode.NONE)
         if voice != VoiceCode.NONE:
             self.active_voice = voice
-            self.voice_until = self.clock.now + self.busy_seconds
+            self.voice_until = self.clock.now + (
+                VOICE_SECONDS[voice] if self.busy_seconds is None else self.busy_seconds
+            )
         current_voice = (
             self.active_voice
             if self.clock.now < self.voice_until
@@ -142,7 +145,7 @@ class ContinuousScale:
 
 
 class StationLivenessTests(unittest.TestCase):
-    def simulate(self, *, missing_voices=(), busy_seconds=0.8, fault=None,
+    def simulate(self, *, missing_voices=(), busy_seconds=None, fault=None,
                  jitter=False, fail_first_save=False, save_delay=0.0,
                  rejected_first_card=False, repeat_tags=True, exchange_seconds=0.1,
                  visit_windows=((6, 40), (46, 80)), deadline=88):
@@ -322,7 +325,7 @@ class StationLivenessTests(unittest.TestCase):
 
     def test_completion_voice_disconnect_preserves_one_record_and_next_vehicle_progress(self):
         def fault(request, scale):
-            return getattr(request, "voice_code", None) == VoiceCode.WEIGHT_COMPLETE
+            return getattr(request, "voice_code", None) == VoiceCode.WEIGHT_COMPLETE_THANKS
 
         scale, submissions, _ = self.simulate(fault=fault)
         self.assertTrue(scale.fault_used)
@@ -347,7 +350,7 @@ class StationLivenessTests(unittest.TestCase):
         self.assert_two_visits_once(submissions)
 
     def test_missing_completion_voice_start_does_not_permanently_block_valid_cards(self):
-        _, submissions, _ = self.simulate(missing_voices={VoiceCode.WEIGHT_COMPLETE})
+        _, submissions, _ = self.simulate(missing_voices={VoiceCode.WEIGHT_COMPLETE_THANKS})
         self.assert_two_visits_once(submissions)
 
     def test_unobserved_short_voices_do_not_permanently_block_valid_cards(self):

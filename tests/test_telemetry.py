@@ -198,7 +198,7 @@ class LatestTelemetryBufferTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(packet["payload"]["weight_valid"])
             self.assertEqual(packet["payload"]["sample_seq"], sequence)
             self.assertEqual(packet["payload"]["printer_status"], status.name.lower() if status is not None else "unknown")
-            self.assertEqual(packet["payload"]["voice_code"], 4)
+            self.assertEqual(packet["payload"]["voice_code"], 17)
             self.assertTrue(packet["payload"]["green_blink"])
             self.assertFalse(packet["payload"]["red_blink"])
             self.assertTrue(packet["payload"]["fan_on"])
