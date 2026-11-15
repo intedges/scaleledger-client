@@ -80,7 +80,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.manager = Mock()
         loop = asyncio.get_running_loop()
         self.manager.sync.side_effect = (
-            lambda stations: loop.call_soon_threadsafe(self.started.set) if stations else None
+            lambda stations, *, configuration=None: loop.call_soon_threadsafe(self.started.set) if stations else None
         )
         self.api = Mock(spec=APIClient)
         self.api.close = AsyncMock()

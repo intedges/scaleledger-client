@@ -10,8 +10,10 @@ from tortoise.connection import get_connection
 from tortoise.exceptions import IntegrityError, ValidationError
 
 from cache import RFIDInfo
-from models import Gateway, Producer, Record, RFIDCard, Species, WeighingStation
-from settings_sync import SettingsSnapshot
+from device_configuration import DeviceConfiguration
+from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from settings_sync import SettingsSnapshot, load_configuration
+from tests.test_device_configuration import configuration_response
 
 
 class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
@@ -60,8 +62,55 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def stored_state(self):
         return {
             model.__name__: await model.all().order_by(model._meta.pk_attr).values()
-            for model in (Gateway, WeighingStation, Species, Producer, RFIDCard, Record)
+            for model in (Gateway, WeighingStation, Species, Producer, RFIDCard, Record, CachedDeviceConfiguration)
         }
+
+    async def test_configuration_is_validated_before_any_write_and_persisted_with_snapshot(self):
+        before = await self.stored_state()
+        self.responses["gateway"]["configuration"] = configuration_response()
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.configuration, DeviceConfiguration.from_response(configuration_response()))
+        self.assertEqual(await self.stored_state(), before)
+
+        await snapshot.persist()
+
+        self.assertEqual(await load_configuration(), snapshot.configuration)
+        self.assertEqual(await CachedDeviceConfiguration.all().count(), 1)
+        self.assertEqual((await Record.get(uuid=self.record.uuid)).weight, 23)
+
+    async def test_missing_configuration_uses_last_good_value_or_initial_defaults(self):
+        self.assertEqual(self.snapshot().configuration, DeviceConfiguration())
+        previous = DeviceConfiguration.from_response(configuration_response())
+        snapshot = SettingsSnapshot.from_responses(**self.responses, fallback_configuration=previous)
+        self.assertEqual(snapshot.configuration, previous)
+        await snapshot.persist()
+        self.assertEqual(await load_configuration(), previous)
+
+    async def test_existing_configuration_object_never_uses_fallback_to_hide_bad_fields(self):
+        previous = DeviceConfiguration.from_response(configuration_response())
+        before = await self.stored_state()
+        for value in (None, {}, configuration_response(print_copies=0), configuration_response(updated_at=None)):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.responses["gateway"]["configuration"] = value
+                SettingsSnapshot.from_responses(**self.responses, fallback_configuration=previous)
+            self.assertEqual(await self.stored_state(), before)
+
+    async def test_configuration_write_rolls_back_when_later_settings_write_fails(self):
+        before = await self.stored_state()
+        self.responses["gateway"]["configuration"] = configuration_response()
+        with patch("settings_sync.RFIDCard.bulk_create", new=AsyncMock(side_effect=IntegrityError("failed"))):
+            with self.assertRaises(IntegrityError):
+                await self.snapshot().persist()
+        self.assertEqual(await self.stored_state(), before)
+        self.assertEqual(await load_configuration(), DeviceConfiguration())
+
+    async def test_configuration_storage_failure_preserves_all_existing_settings(self):
+        before = await self.stored_state()
+        self.responses["gateway"]["configuration"] = configuration_response()
+        with patch("settings_sync.CachedDeviceConfiguration.update_or_create", new=AsyncMock(side_effect=IntegrityError("failed"))):
+            with self.assertRaises(IntegrityError):
+                await self.snapshot().persist()
+        self.assertEqual(await self.stored_state(), before)
 
     async def test_snapshot_builds_complete_cache_before_changing_database(self):
         before = await self.stored_state()

@@ -103,13 +103,13 @@ class StationZeroIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.worker.state = self.worker.verify()
             saved = Future()
             self.worker.on_event.return_value = saved
+            self.worker.receipt_builder = Mock(return_value=b"new visit receipt")
             self.worker.state = self.worker.measure()
             record = self.worker.on_event.call_args.args[0]
             self.assertIsInstance(record, WeighingCompletedEvent)
             self.assertEqual((record.station_id, record.weight, record.rfid_card_uid), (7, 120, "87654321"))
             self.assertFalse(saved.done())
 
-            self.worker.receipt_builder = Mock(return_value=b"new visit receipt")
             printed = []
 
             def print_response(request):

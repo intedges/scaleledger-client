@@ -45,7 +45,7 @@ class SettingsRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.applied = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
-        def applied(stations):
+        def applied(stations, *, configuration=None):
             loop.call_soon_threadsafe(self.applied.put_nowait, stations)
 
         self.manager.sync.side_effect = applied
@@ -166,7 +166,7 @@ class SettingsRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.client.sync_settings())
 
         self.assertEqual(await WeighingStation.all().count(), 0)
-        self.manager.sync.assert_called_once_with([])
+        self.manager.sync.assert_called_once_with([], configuration=self.client.configuration)
         self.assertEqual(self.client.market_cache.gateway_name, "Server gateway")
         self.assertIsNotNone(self.client.market_cache.get_rfid_info("12345678"))
 
@@ -395,7 +395,7 @@ class SettingsRefreshTests(unittest.IsolatedAsyncioTestCase):
         finished = threading.Event()
         loop = asyncio.get_running_loop()
 
-        def apply_stations(stations):
+        def apply_stations(stations, *, configuration=None):
             loop.call_soon_threadsafe(entered.set)
             release.wait(timeout=2)
             finished.set()

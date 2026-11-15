@@ -21,13 +21,14 @@ from api import APIClient, AuthDegradedError
 from cache import MarketDataCache, RFIDInfo
 from config import ConfigError, load_settings, websocket_url
 from credential import CredentialError, CredentialStore
+from device_configuration import DeviceConfiguration
 from paths import AppPaths, program_dir
 from events import BaseEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
-from models import Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
 from schema import migrate_optional_card_species
-from settings_sync import SettingsSnapshot
+from settings_sync import SettingsSnapshot, load_configuration
 from suwol1000 import ZeroRequestError, ZeroResult
 from telemetry import LatestTelemetryBuffer, StationTelemetryPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, scan_peripherals
@@ -75,6 +76,7 @@ class HeadlessClient:
         self._telemetry_stop_code: int | None = None
 
         self.market_cache = MarketDataCache()
+        self.configuration = DeviceConfiguration()
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
         self.event_queue: asyncio.Queue[tuple[BaseEvent, Future[None]]] = asyncio.Queue()
         self.telemetry_updates = LatestTelemetryBuffer()
@@ -178,6 +180,7 @@ class HeadlessClient:
         self.logger.debug("sys.db.schema.ready")
     
     async def restore_local_state(self):
+        self.configuration = await load_configuration()
         unsynced_records = await Record.all().values_list("uuid", flat=True)
         for record_uuid in unsynced_records:
             self.upload_queue.put_nowait(str(record_uuid))
@@ -192,7 +195,7 @@ class HeadlessClient:
         self.gateway_id = gateway.id
         await self.refresh_market_cache()
         stations = await WeighingStation.filter(gateway_id=gateway.id)
-        self.station_manager.sync(stations)
+        self.station_manager.sync(stations, configuration=self.configuration)
         self.logger.info("sys.boot.local_cache.loaded", gateway_id=gateway.id)
 
     def forget_server_session(self):
@@ -278,7 +281,10 @@ class HeadlessClient:
                 producers = await self.api_client.fetch_producers(self.access_token)
                 cards = await self.api_client.fetch_rfid_cards(self.access_token)
                 stations = await self.api_client.list_gateway_stations(self.access_token)
-            snapshot = SettingsSnapshot.from_responses(gateway, stations, species, producers, cards)
+            snapshot = SettingsSnapshot.from_responses(
+                gateway, stations, species, producers, cards,
+                fallback_configuration=self.configuration,
+            )
             if snapshot.gateway_id != self.gateway_id:
                 raise ValueError("Gateway identity changed; registration must be resolved first")
             await snapshot.persist()
@@ -297,11 +303,14 @@ class HeadlessClient:
         except Exception as exc:
             self.network_failures.failure("sys.sync.settings.failed", exc)
         else:
+            self.configuration = snapshot.configuration
             self.market_cache.replace(snapshot.rfid_map, snapshot.gateway_name)
             # join() can wait for serial I/O. Never block WS, heartbeat or writes.
             # A cancelled to_thread continues running, so finish it before any
             # replacement task or process cleanup touches the station manager.
-            applying = asyncio.create_task(asyncio.to_thread(self.station_manager.sync, snapshot.stations))
+            applying = asyncio.create_task(asyncio.to_thread(
+                self.station_manager.sync, snapshot.stations, configuration=snapshot.configuration,
+            ))
             cancelled = None
             while True:
                 try:
@@ -421,9 +430,11 @@ class HeadlessClient:
     async def discard_server_data(self) -> int:
         async with in_transaction() as connection:
             # Children first, as in a settings snapshot.
-            for model in (RFIDCard, Producer, Species, WeighingStation, Gateway):
+            for model in (RFIDCard, Producer, Species, WeighingStation, Gateway, CachedDeviceConfiguration):
                 await model.all().using_db(connection).delete()
-            return await Record.all().using_db(connection).delete()
+            discarded = await Record.all().using_db(connection).delete()
+        self.configuration = DeviceConfiguration()
+        return discarded
 
     async def wait_for_approval(self):
         announced = False

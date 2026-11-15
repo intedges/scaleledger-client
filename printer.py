@@ -113,6 +113,22 @@ class EscPosBuilder:
     def add_text(self, text: str) -> Self:
         self._buffer.extend(text.encode("cp949", errors="replace"))
         return self
+
+    def add_wrapped_text(self, text: str, columns: int = 42) -> Self:
+        """Wrap the normal-width header without splitting a Korean character."""
+        line = ""
+        width = 0
+        for character in text:
+            size = len(character.encode("cp949", errors="replace"))
+            if character in "\r\n" or width + size > columns:
+                self.add_text(line).feed_lines(1)
+                line, width = "", 0
+            if character not in "\r\n":
+                line += character
+                width += size
+        if line:
+            self.add_text(line).feed_lines(1)
+        return self
     
     def add_kv(self, key: str, value: str, max_col: int = 42) -> Self:
         k_bytes = len(key.encode("cp949", errors="replace"))
@@ -168,6 +184,7 @@ class Receipt:
     species_name: str
     weight: Decimal
     measured_at: datetime
+    auction_name: str = ""
 
 
 class ReceiptTemplate:
@@ -186,7 +203,12 @@ class ReceiptTemplate:
             .set_quadruple(False)
             .set_bold(False)
             .feed_lines(2)
-            
+        )
+        if receipt.auction_name:
+            builder.add_wrapped_text(receipt.auction_name).feed_lines(1)
+
+        builder = (
+            builder
             # Meta Data
             .set_align(Alignment.LEFT)
             .add_separator("=", 42)
