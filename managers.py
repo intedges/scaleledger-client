@@ -9,9 +9,11 @@ from cache import MarketDataCache
 from device_configuration import DeviceConfiguration
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 from printer import Receipt, ReceiptTemplate
+from reprint import ReprintRequestError
 from models import WeighingStation
 from suwol1000 import (
-    StationTelemetrySnapshot, SerialClient, WeighingStationWorker, ZeroRequestError, ZeroResult,
+    PrinterStatus, StationTelemetrySnapshot, SerialClient, WeighingStationWorker,
+    ZeroRequestError, ZeroResult,
 )
 
 
@@ -62,6 +64,24 @@ class WeighingStationManager:
             result.set_exception(ZeroRequestError(reason))
             return result
         return runtime.worker.request_zero()
+
+    def request_reprint(
+        self, station_id: int, receipt: Receipt, *, copies: int, gateway_id: int,
+    ) -> Future[PrinterStatus | None]:
+        """Send this server receipt only to its current Gateway's port owner."""
+        runtime = self.workers.get(station_id)
+        reason = None
+        if runtime is None:
+            reason = "unknown_station"
+        elif runtime.gateway_id != gateway_id:
+            reason = "wrong_gateway"
+        elif not runtime.thread.is_alive():
+            reason = "not_running"
+        if reason is not None:
+            result: Future[PrinterStatus | None] = Future()
+            result.set_exception(ReprintRequestError(reason))
+            return result
+        return runtime.worker.request_reprint(receipt, copies=copies)
 
     def sync(
         self, stations: list[WeighingStation], *, configuration: DeviceConfiguration | None = None,

@@ -22,6 +22,8 @@ from structlog.stdlib import get_logger
 from device_configuration import DeviceConfiguration
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog
+from printer import Receipt, ReceiptTemplate
+from reprint import ReprintRequestError
 from weighing_cycle import CycleState, WeighingCycle
 
 
@@ -554,6 +556,14 @@ class _ZeroRequest:
     requested_at: float
 
 
+@dataclass(frozen=True)
+class _ReprintRequest:
+    future: Future[PrinterStatus | None]
+    receipt: Receipt
+    copies: int
+    requested_at: float
+
+
 class WeighingStationWorker:
     ZERO_HOLD_SECONDS = 1.5
     ZERO_RELEASE_TIMEOUT = 2.0
@@ -666,6 +676,10 @@ class WeighingStationWorker:
         self._zero_active = False
         self._zero_release_pending = False
         self._zero_alert_until: float | None = None
+        # Share the command lock with zero so the two cannot reserve the port
+        # concurrently. This single handoff is never retained for replay.
+        self._reprint_request: _ReprintRequest | None = None
+        self._reprint_active = False
 
         self.logger = get_logger().bind(port=serial_client.port)
         # A powered-off scale repeatedly times out; summarize the repeats.
@@ -700,6 +714,7 @@ class WeighingStationWorker:
             ))
             or self._zero_request is not None
             or self._zero_active or self._zero_release_pending
+            or self._reprint_request is not None
             or self.state in (WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.SAVE, WorkerState.PRINT)
             or not self.cycle.can_reconfigure(now=time.monotonic())
         ):
@@ -721,8 +736,13 @@ class WeighingStationWorker:
             pending = self._zero_request if interrupt else None
             if pending is not None:
                 self._zero_request = None
+            reprint = self._reprint_request if not self._reprint_active else None
+            if reprint is not None:
+                self._reprint_request = None
         if pending is not None and pending.future.set_running_or_notify_cancel():
             pending.future.set_exception(ZeroRequestError("stopped"))
+        if reprint is not None and reprint.future.set_running_or_notify_cancel():
+            reprint.future.set_exception(ReprintRequestError("stopped"))
         self._set_connection_status("disconnected")
         if interrupt:
             self.interrupt_pending_io()
@@ -766,6 +786,7 @@ class WeighingStationWorker:
             self.state not in (WorkerState.IDLE, WorkerState.VERIFY, WorkerState.MEASURE)
             or self._pending_save is not None or self._save_result is not None
             or isinstance(self.last_event, WeighingCompletedEvent) or self._save_fault
+            or self._reprint_request is not None
         ):
             return "busy"
         if snapshot.connection_status != "connected":
@@ -781,6 +802,99 @@ class WeighingStationWorker:
         ):
             return "invalid_weight"
         return None
+
+    def request_reprint(self, receipt: Receipt, *, copies: int) -> Future[PrinterStatus | None]:
+        """Hand off one print-only request to the existing serial owner."""
+        future: Future[PrinterStatus | None] = Future()
+        with self._zero_lock:
+            if not isinstance(receipt, Receipt):
+                reason = "invalid_receipt"
+            elif type(copies) is not int or not 1 <= copies <= 9:
+                reason = "invalid_copies"
+            elif self._reprint_request is not None:
+                reason = "busy"
+            else:
+                reason = self._reprint_rejection()
+            if reason is None:
+                self._reprint_request = _ReprintRequest(future, receipt, copies, time.monotonic())
+        if reason is not None:
+            future.set_exception(ReprintRequestError(reason))
+        return future
+
+    def _reprint_rejection(self) -> str | None:
+        if self.stop_event.is_set():
+            return "stopped"
+        if (
+            self.state != WorkerState.IDLE or self._processing or self.last_event is not None
+            or self._pending_save is not None or self._save_result is not None or self._save_fault
+            or self._zero_request is not None or self._zero_active or self._zero_release_pending
+        ):
+            return "busy"
+        # Leave card-ready and entering loads to normal weighing. A completed
+        # visit may keep its lock while the operator requests another receipt.
+        if not (
+            self.cycle.state == CycleState.LOCKED
+            or (self.cycle.state == CycleState.WAIT_ENTRY
+                and self.cycle.can_reconfigure(now=time.monotonic()))
+        ):
+            return "busy"
+        snapshot = self.get_telemetry()
+        if snapshot.connection_status != "connected":
+            return "disconnected"
+        if (
+            not snapshot.sample_valid or snapshot.sampled_monotonic is None
+            or not 0 <= time.monotonic() - snapshot.sampled_monotonic <= self.cycle.max_sample_age
+        ):
+            return "stale_status"
+        if snapshot.printer_status != PrinterStatus.NORMAL:
+            return "printer_" + printer_status_label(snapshot.printer_status)
+        return None
+
+    def _run_reprint_request(self) -> bool:
+        with self._zero_lock:
+            request = self._reprint_request
+            if request is None:
+                return False
+            self._reprint_active = True
+        status = None
+        failure = None
+        try:
+            if not request.future.set_running_or_notify_cancel():
+                return True
+            reason = self._reprint_rejection()
+            if reason is None and time.monotonic() - request.requested_at > self.cycle.max_sample_age:
+                reason = "expired"
+            if reason is not None:
+                raise ReprintRequestError(reason)
+            try:
+                packet = PrinterRequestPacket(
+                    document_bytes=ReceiptTemplate.render(request.receipt), copies=request.copies,
+                )
+                packet.to_bytes()  # Validate the encoded length before touching the port.
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise ReprintRequestError("invalid_receipt") from exc
+            # Rendering must not turn a stopped or stale request into a write.
+            reason = self._reprint_rejection()
+            if reason is not None:
+                raise ReprintRequestError(reason)
+            status = self.exchange(packet).printer_status
+        except ReprintRequestError as exc:
+            failure = exc
+        except Exception as exc:
+            # Clear the handoff and report the uncertain result before letting
+            # run() recover the serial connection. Never retry this packet.
+            failure = exc
+            raise
+        finally:
+            with self._zero_lock:
+                self._reprint_active = False
+                self._reprint_request = None
+            if not request.future.cancelled():
+                if failure is not None:
+                    request.future.set_exception(failure)
+                else:
+                    request.future.set_result(status)
+        return True
 
     def _run_zero_request(self) -> bool:
         with self._zero_lock:
@@ -976,6 +1090,8 @@ class WeighingStationWorker:
                 self._apply_configuration()
                 self._expire_observation(now=time.monotonic())
                 if self._run_zero_request():
+                    continue
+                if self._run_reprint_request():
                     continue
                 match self.state:
                     case WorkerState.INITIALIZE:
