@@ -23,13 +23,14 @@ from config import ConfigError, load_settings, websocket_url
 from credential import CredentialError, CredentialStore
 from device_configuration import DeviceConfiguration
 from paths import AppPaths, program_dir
+from reprint import ReprintRequest, ReprintRequestError
 from events import BaseEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
 from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
 from schema import migrate_optional_card_species
 from settings_sync import SettingsSnapshot, load_configuration
-from suwol1000 import ZeroRequestError, ZeroResult
+from suwol1000 import PrinterStatus, ZeroRequestError, ZeroResult
 from telemetry import LatestTelemetryBuffer, StationTelemetryPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, scan_peripherals
 from workers import RecordUploadWorker
@@ -539,40 +540,100 @@ class HeadlessClient:
                 async for message in ws:
                     try:
                         data = json.loads(message)
-                        if not isinstance(data, dict) or not isinstance(data.get("type"), str):
-                            self.logger.warning("net.ws.message.invalid_envelope")
-                            continue
-                        message_type = data["type"]
-
-                        match message_type:
-                            case "heartbeat.request":
-                                if heartbeat_task is None or heartbeat_task.done():
-                                    heartbeat_task = tasks.create_task(self.send_heartbeat())
-
-                            case "scan.peripherals":
-                                self.logger.info("biz.active.scan_peripherals.executing")
-                                peripherals = await asyncio.to_thread(scan_peripherals)
-                                await ws.send(json.dumps({
-                                    "type": "peripherals.scanned",
-                                    "payload": peripherals,
-                                }))
-                                self.logger.info("biz.active.scan_peripherals.completed", count=len(peripherals))
-
-                            case "sync.market_data" | "sync.gateway" | "sync.weighing_stations":
-                                self.logger.info("biz.active.settings_sync.requested", type=message_type)
-                                self.request_settings_sync()
-
-                            case "station.zero":
-                                self.dispatch_station_zero(data.get("payload"))
-
-                            case _:
-                                self.logger.debug("net.ws.message.ignored", type=message_type)
-
-                    except json.JSONDecodeError:
+                    except (ValueError, RecursionError):
+                        # Invalid binary encoding, oversized integers and decoder
+                        # depth failures are bad messages, not socket failures.
                         self.logger.error("net.ws.message.invalid_json")
+                        continue
+                    if not isinstance(data, dict) or not isinstance(data.get("type"), str):
+                        self.logger.warning("net.ws.message.invalid_envelope")
+                        continue
+                    message_type = data["type"]
+
+                    match message_type:
+                        case "heartbeat.request":
+                            if heartbeat_task is None or heartbeat_task.done():
+                                heartbeat_task = tasks.create_task(self.send_heartbeat())
+
+                        case "scan.peripherals":
+                            self.logger.info("biz.active.scan_peripherals.executing")
+                            peripherals = await asyncio.to_thread(scan_peripherals)
+                            await ws.send(json.dumps({
+                                "type": "peripherals.scanned",
+                                "payload": peripherals,
+                            }))
+                            self.logger.info("biz.active.scan_peripherals.completed", count=len(peripherals))
+
+                        case "sync.market_data" | "sync.gateway" | "sync.weighing_stations":
+                            self.logger.info("biz.active.settings_sync.requested", type=message_type)
+                            self.request_settings_sync()
+
+                        case "station.zero":
+                            self.dispatch_station_zero(data.get("payload"))
+
+                        case "station.reprint":
+                            self.dispatch_station_reprint(data.get("payload"))
+
+                        case _:
+                            self.logger.debug("net.ws.message.ignored", type=message_type)
             finally:
                 if heartbeat_task is not None:
                     heartbeat_task.cancel()
+
+    def dispatch_station_reprint(self, payload):
+        try:
+            request = ReprintRequest.from_payload(payload)
+        except ReprintRequestError as exc:
+            self.logger.warning("biz.active.reprint.rejected", reason=exc.reason)
+            return
+        if type(self.gateway_id) is not int or self.gateway_id <= 0:
+            self.logger.warning(
+                "biz.active.reprint.rejected", station_id=request.station_id,
+                reason="unresolved_gateway",
+            )
+            return
+        try:
+            self.logger.info(
+                "biz.active.reprint.requested", station_id=request.station_id,
+                gateway_id=self.gateway_id, record_uuid=str(request.receipt.record_uuid),
+                copies=request.copies,
+            )
+            result = self.station_manager.request_reprint(
+                request.station_id, request.receipt, copies=request.copies,
+                gateway_id=self.gateway_id,
+            )
+            result.add_done_callback(lambda future: self._station_reprint_finished(request, future))
+        except Exception:
+            self.logger.exception("biz.active.reprint.dispatch_failed", station_id=request.station_id)
+
+    def _station_reprint_finished(
+        self, request: ReprintRequest, future: Future[PrinterStatus | None],
+    ):
+        # A command response is not proof of paper output. Log locally and never
+        # retry an uncertain result or couple the worker to a socket's lifetime.
+        context = {
+            "station_id": request.station_id,
+            "record_uuid": str(request.receipt.record_uuid),
+            "copies": request.copies,
+        }
+        try:
+            if future.cancelled():
+                self.logger.info("biz.active.reprint.cancelled", **context)
+                return
+            status = future.result()
+        except ReprintRequestError as exc:
+            self.logger.warning("biz.active.reprint.rejected", reason=exc.reason, **context)
+        except Exception:
+            self.logger.exception("biz.active.reprint.failed", **context)
+        else:
+            if status == PrinterStatus.NORMAL:
+                self.logger.info("biz.active.reprint.command_sent", **context)
+            elif status == PrinterStatus.TRANSMITTING:
+                self.logger.info("biz.active.reprint.transmitting", **context)
+            elif status == PrinterStatus.NO_PAPER:
+                self.logger.warning("biz.active.reprint.no_paper", **context)
+            else:
+                self.logger.warning("biz.active.reprint.status_unknown", **context)
 
     def dispatch_station_zero(self, payload):
         station_id = payload.get("station_id") if isinstance(payload, dict) else None
