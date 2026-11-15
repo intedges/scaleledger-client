@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from cache import MarketDataCache, RFIDInfo
+from device_configuration import DeviceConfiguration
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from managers import StationRuntime, WeighingStationManager
 from models import WeighingStation
@@ -69,6 +70,8 @@ class WeighingStationManagerTests(unittest.TestCase):
     def test_gateway_change_replaces_same_port_worker_before_accepting_new_scope(self):
         cached = WeighingStation(id=7, gateway_id=1, name="Station", serial_port="same-port")
         updated = WeighingStation(id=7, gateway_id=2, name="Station", serial_port="same-port")
+        # These tests also run before Tortoise has initialized relation fields.
+        cached.gateway_id, updated.gateway_id = 1, 2
         old_worker, new_worker = Mock(), Mock()
         old_worker.get_telemetry.return_value = StationTelemetrySnapshot(sample_seq=12)
         pending = Future()
@@ -76,6 +79,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         old_thread, new_thread = (
             Mock(is_alive=Mock(return_value=True)), Mock(is_alive=Mock(return_value=True)),
         )
+        old_thread.join.side_effect = lambda **kwargs: setattr(old_thread.is_alive, "return_value", False)
 
         with patch("managers.WeighingStationWorker", side_effect=[old_worker, new_worker]), patch(
             "managers.threading.Thread", side_effect=[old_thread, new_thread],
@@ -92,7 +96,7 @@ class WeighingStationManagerTests(unittest.TestCase):
             self.assertEqual(caught.exception.reason, "wrong_gateway")
         old_worker.request_zero.assert_not_called()
         old_worker.stop.assert_called_once_with()
-        old_thread.join.assert_called_once_with()
+        old_thread.join.assert_called_once_with(timeout=0.1)
         new_thread.start.assert_called_once_with()
         self.assertIs(self.manager.workers[7].worker, new_worker)
         self.assertEqual(self.manager.workers[7].gateway_id, 2)
@@ -128,6 +132,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         updated = WeighingStation(id=1, name="Updated station", serial_port="test-port")
 
         with patch("managers.WeighingStationWorker") as worker, patch("managers.threading.Thread") as thread:
+            worker.return_value.configuration = DeviceConfiguration()
             self.manager.sync([cached])
             runtime = self.manager.workers[1]
             build_receipt = worker.call_args.kwargs["receipt_builder"]
@@ -152,9 +157,9 @@ class WeighingStationManagerTests(unittest.TestCase):
         event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=23)
         cached = WeighingStation(id=1, name="Cached station", serial_port="old-port")
         updated = WeighingStation(id=1, name="Updated station", serial_port="new-port")
-        workers = [Mock(), Mock()]
+        workers = [Mock(configuration=DeviceConfiguration()), Mock(configuration=DeviceConfiguration())]
         workers[0].get_telemetry.return_value = StationTelemetrySnapshot(sample_seq=12)
-        threads = [Mock(), Mock()]
+        threads = [Mock(is_alive=Mock(return_value=False)), Mock()]
 
         with patch("managers.WeighingStationWorker", side_effect=workers) as worker, patch(
             "managers.threading.Thread", side_effect=threads,
@@ -164,7 +169,7 @@ class WeighingStationManagerTests(unittest.TestCase):
             receipt = worker.call_args.kwargs["receipt_builder"](event)
 
         workers[0].stop.assert_called_once_with()
-        threads[0].join.assert_called_once_with()
+        threads[0].join.assert_called_once_with(timeout=0.1)
         threads[1].start.assert_called_once_with()
         self.assertIs(self.manager.workers[1].worker, workers[1])
         self.assertEqual(self.manager.workers[1].port, "new-port")
@@ -184,6 +189,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         station = WeighingStation(id=1, name="Station", serial_port="test-port")
 
         with patch("managers.WeighingStationWorker") as worker, patch("managers.threading.Thread"):
+            worker.return_value.configuration = DeviceConfiguration()
             self.manager.sync([station])
             receipt = worker.call_args.kwargs["receipt_builder"](event)
 
@@ -199,6 +205,7 @@ class WeighingStationManagerTests(unittest.TestCase):
         station = WeighingStation(id=1, name="Station", serial_port="test-port")
 
         with patch("managers.WeighingStationWorker") as worker, patch("managers.threading.Thread"):
+            worker.return_value.configuration = DeviceConfiguration()
             self.manager.sync([station])
             validate = worker.call_args.kwargs["rfid_validator"]
             self.assertTrue(validate(RFIDTaggedEvent(rfid_card_uid="12345678")))
@@ -218,10 +225,10 @@ class WeighingStationManagerTests(unittest.TestCase):
         for station_id in (1, 2):
             worker = Mock()
             worker.get_telemetry.return_value = StationTelemetrySnapshot()
-            thread = Mock()
+            thread = Mock(is_alive=Mock(return_value=False))
             worker.stop.side_effect = lambda i=station_id: actions.append(("stop", i))
 
-            def join(i=station_id):
+            def join(*, timeout, i=station_id):
                 self.assertIn(i, self.manager.workers)
                 actions.append(("join", i))
 
@@ -237,14 +244,14 @@ class WeighingStationManagerTests(unittest.TestCase):
         ])
         self.assertEqual(self.manager.workers, {})
         for runtime in runtimes:
-            runtime.thread.join.assert_called_once_with()
+            runtime.thread.join.assert_called_once_with(timeout=0.1)
 
     def test_stop_worker_remains_registered_until_thread_terminates(self):
-        runtime = StationRuntime(Mock(), Mock(), "test-port", "Station")
+        runtime = StationRuntime(Mock(), Mock(is_alive=Mock(return_value=False)), "test-port", "Station")
         runtime.worker.get_telemetry.return_value = StationTelemetrySnapshot()
         self.manager.workers[1] = runtime
 
-        def join():
+        def join(*, timeout):
             runtime.worker.stop.assert_called_once_with()
             self.assertIs(self.manager.workers[1], runtime)
 
@@ -252,7 +259,7 @@ class WeighingStationManagerTests(unittest.TestCase):
 
         self.manager.stop_worker(1)
 
-        runtime.thread.join.assert_called_once_with()
+        runtime.thread.join.assert_called_once_with(timeout=0.1)
         self.assertNotIn(1, self.manager.workers)
 
     def test_failed_join_does_not_forget_the_worker(self):
@@ -300,12 +307,13 @@ class WeighingStationManagerTests(unittest.TestCase):
         cached = WeighingStation(id=1, name="Station", serial_port="old-port")
         updated = WeighingStation(id=1, name="Station", serial_port="new-port")
 
-        def client(port):
-            result = Mock(port=port, timeout=2.0, write_timeout=2.0)
+        def client(port, timeout, write_timeout):
+            result = Mock(port=port, timeout=timeout, write_timeout=write_timeout)
             result.send_and_receive.return_value = ResponsePacket()
             return result
 
-        with patch("managers.SerialClient", side_effect=client), patch("managers.threading.Thread"):
+        with patch("managers.SerialClient", side_effect=client), patch("managers.threading.Thread") as thread:
+            thread.return_value.is_alive.return_value = False
             self.manager.sync([cached])
             self.manager.workers[1].worker.exchange(DisplayRequestPacket())
             self.manager.sync([updated])

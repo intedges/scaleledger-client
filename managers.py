@@ -6,6 +6,7 @@ import threading
 from structlog.stdlib import get_logger
 
 from cache import MarketDataCache
+from device_configuration import DeviceConfiguration
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 from printer import Receipt, ReceiptTemplate
 from models import WeighingStation
@@ -37,6 +38,7 @@ class WeighingStationManager:
         self.on_telemetry = on_telemetry
         self.on_station_removed = on_station_removed
         self.workers: dict[int, StationRuntime] = {}
+        self.configuration = DeviceConfiguration()
         self._sample_sequences: dict[int, int] = {}
         self.logger = get_logger()
 
@@ -61,7 +63,11 @@ class WeighingStationManager:
             return result
         return runtime.worker.request_zero()
 
-    def sync(self, stations: list[WeighingStation]):
+    def sync(
+        self, stations: list[WeighingStation], *, configuration: DeviceConfiguration | None = None,
+    ):
+        if configuration is not None:
+            self.configuration = configuration
         self.logger.info("sys.manager.station.sync_evalutaing", current_count=len(self.workers), target_count=len(stations))
 
         target_ids = {station.id for station in stations}
@@ -93,6 +99,7 @@ class WeighingStationManager:
                     self.start_worker(station)
                 else:
                     runtime.station_name = station.name
+                    runtime.worker.request_configuration(self.configuration)
         self.logger.info("sys.manager.station.sync_completed", running_workers=len(self.workers))
 
     def start_worker(self, station: WeighingStation):
@@ -118,7 +125,8 @@ class WeighingStationManager:
                 producer_name=info.producer_name,
                 species_name=info.species_name,
                 weight=event.weight,
-                measured_at=event.timestamp
+                measured_at=event.timestamp,
+                auction_name=runtime.worker.configuration.auction_name,
             )
             return ReceiptTemplate.render(receipt)
 
@@ -126,8 +134,12 @@ class WeighingStationManager:
             self.on_telemetry(station.id, snapshot)
 
         worker = WeighingStationWorker(
-            serial_client=SerialClient(port=station.serial_port),
+            serial_client=SerialClient(
+                port=station.serial_port, timeout=self.configuration.serial_read_timeout,
+                write_timeout=self.configuration.serial_write_timeout,
+            ),
             station_id=station.id,
+            configuration=self.configuration,
             on_event=self.on_event,
             rfid_validator=validate_rfid,
             receipt_builder=build_receipt,
@@ -157,10 +169,21 @@ class WeighingStationManager:
         runtime = self.workers[station_id]
         self.logger.info("sys.manager.station.stop_worker", station_id=station_id, port=runtime.port)
         runtime.worker.stop()
-        runtime.thread.join()
+        self._join_worker(runtime)
         self._remember_sample_sequence(station_id, runtime)
         del self.workers[station_id]
         self._notify_station_removed(station_id)
+
+    @staticmethod
+    def _join_worker(runtime: StationRuntime):
+        while True:
+            runtime.thread.join(timeout=0.1)
+            if not runtime.thread.is_alive():
+                return
+            # Windows only cancels I/O already submitted to its driver. Repeat
+            # across the check-to-read/write race until the owner exits. The
+            # worker protects the bounded zero OFF cleanup from cancellation.
+            runtime.worker.interrupt_pending_io()
 
     def _notify_station_removed(self, station_id: int):
         if self.on_station_removed is not None:
@@ -181,7 +204,7 @@ class WeighingStationManager:
             self.logger.info("sys.manager.station.stop_worker", station_id=station_id, port=runtime.port)
             runtime.worker.stop()
         for station_id, runtime in runtimes:
-            runtime.thread.join()
+            self._join_worker(runtime)
             self._remember_sample_sequence(station_id, runtime)
             del self.workers[station_id]
             self._notify_station_removed(station_id)

@@ -19,6 +19,7 @@ import serial
 import structlog
 from structlog.stdlib import get_logger
 
+from device_configuration import DeviceConfiguration
 from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog
 from weighing_cycle import CycleState, WeighingCycle
@@ -211,6 +212,10 @@ class PrinterRequestPacket(RequestPacket):
     copies: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9] = 1
     document_bytes: bytes = b""
 
+    def __post_init__(self):
+        if type(self.copies) is not int or not 1 <= self.copies <= 9:
+            raise ValueError("copies must be an integer between 1 and 9")
+
     def to_bytes(self) -> bytes:
         if len(self.document_bytes) > 9999:
             raise ValueError(f"Document exceeds 9999 bytes: {len(self.document_bytes)}")
@@ -364,6 +369,18 @@ class SerialClient:
         self.serial: serial.Serial | None = None
         self.logger = get_logger().bind(port=port)
         self._next_slow_log_at = 0.0
+        self._interrupted = threading.Event()
+
+    def configure_timeouts(self, read_timeout: float, write_timeout: float):
+        """Called by the port owner between exchanges, including before connect."""
+        if read_timeout != self.timeout:
+            if self.serial is not None and self.serial.is_open:
+                self.serial.timeout = read_timeout
+            self.timeout = read_timeout
+        if write_timeout != self.write_timeout:
+            if self.serial is not None and self.serial.is_open:
+                self.serial.write_timeout = write_timeout
+            self.write_timeout = write_timeout
 
     def connect(self):
         self.serial = serial.Serial(
@@ -378,12 +395,17 @@ class SerialClient:
             self.serial.close()
 
     def interrupt(self):
+        self._interrupted.set()
         if self.serial and self.serial.is_open:
             try:
                 self.serial.cancel_read()
                 self.serial.cancel_write()
             except Exception:
                 pass
+
+    def _check_interrupted(self):
+        if self._interrupted.is_set():
+            raise serial.SerialException("Serial exchange interrupted")
 
     def send_and_receive(
         self, request: RequestPacket, *, deadline: float | None = None,
@@ -398,6 +420,7 @@ class SerialClient:
         
         # Drop late or stray bytes so an earlier fault cannot shift this frame,
         # and read the fixed length: a field byte may itself equal ETX.
+        self._check_interrupted()
         self.serial.reset_input_buffer()
         data = request.to_bytes()
         started_at = time.monotonic()
@@ -412,6 +435,7 @@ class SerialClient:
                     min(self.write_timeout, remaining) if self.write_timeout is not None else remaining
                 )
             try:
+                self._check_interrupted()
                 written = self.serial.write(data)
                 if written != len(data):
                     raise serial.SerialTimeoutException(
@@ -430,6 +454,7 @@ class SerialClient:
                 if remaining <= 0:
                     raise DeviceResponseTimeout("Serial exchange deadline elapsed after write")
                 self.serial.timeout = min(self.timeout, remaining) if self.timeout is not None else remaining
+            self._check_interrupted()
             response = self.serial.read(RESPONSE_LENGTH)
             received_at = time.monotonic()
             if deadline is not None and received_at > deadline:
@@ -549,6 +574,7 @@ class WeighingStationWorker:
         voice_timeout: float = 15.0,
         *,
         station_id: int,
+        configuration: DeviceConfiguration | None = None,
     ):
         self.client = serial_client
         self.station_id = station_id
@@ -558,8 +584,24 @@ class WeighingStationWorker:
         self.polling_interval = polling_interval
         self.retry_interval = retry_interval
         self.on_telemetry = on_telemetry
+        if configuration is None and (
+            not isinstance(vehicle_threshold, Decimal) or not vehicle_threshold.is_finite()
+            or vehicle_threshold != vehicle_threshold.to_integral_value()
+        ):
+            raise ValueError("vehicle_threshold must be a whole Decimal kg value")
+        if configuration is not None and not isinstance(configuration, DeviceConfiguration):
+            raise TypeError("configuration must be a DeviceConfiguration")
+        self.configuration = configuration or DeviceConfiguration(
+            vehicle_threshold=int(vehicle_threshold),
+            vehicle_ready_seconds=vehicle_ready_seconds,
+            vehicle_empty_seconds=vehicle_empty_seconds,
+        )
+        self._configuration_lock = threading.Lock()
+        self._requested_configuration = configuration
         self.cycle = WeighingCycle(
-            vehicle_threshold, vehicle_ready_seconds, vehicle_empty_seconds,
+            Decimal(self.configuration.vehicle_threshold),
+            self.configuration.vehicle_ready_seconds,
+            self.configuration.vehicle_empty_seconds,
             max_sample_gap=5.0,
             max_sample_age=2.0,
         )
@@ -571,8 +613,8 @@ class WeighingStationWorker:
         self.voice_timeout = voice_timeout
         # Start-to-start periods of the reminders. They are set for people, not
         # for the voice lengths: no card, save or print ever waits for a voice.
-        self.card_prompt_interval = 5.0
-        self.completion_interval = 10.0
+        self.card_prompt_interval = self.configuration.card_prompt_interval
+        self.completion_interval = self.configuration.completion_interval
         # A thanks that cannot start right after the departure would only hold
         # up the next vehicle's guidance.
         self.farewell_wait = 1.0
@@ -606,6 +648,10 @@ class WeighingStationWorker:
         self._pending_save: WeighingCompletedEvent | None = None
         self._save_result: Future[None] | None = None
         self._saved_event_uuid: str | None = None
+        self._receipt_bytes: bytes | None = None
+        self._receipt_event_uuid: str | None = None
+        self._receipt_attempted = False
+        self._print_copies = self.configuration.print_copies
         self.save_retry_interval = 5.0
         self.save_warning_interval = 5.0
         self._save_retry_at = 0.0
@@ -626,6 +672,46 @@ class WeighingStationWorker:
         self.failures = RepeatedFailureLog(self.logger, "hw.station")
         self.telemetry_failures = RepeatedFailureLog(self.logger, "hw.station.telemetry")
 
+    def request_configuration(self, configuration: DeviceConfiguration):
+        """Publish only the latest snapshot; the network never changes live state."""
+        if not isinstance(configuration, DeviceConfiguration):
+            raise TypeError("configuration must be a DeviceConfiguration")
+        with self._configuration_lock:
+            self._requested_configuration = configuration
+
+    def _apply_configuration(self):
+        with self._configuration_lock:
+            configuration = self._requested_configuration
+        if configuration is None or self.stop_event.is_set():
+            return
+        if (
+            self.client.timeout != configuration.serial_read_timeout
+            or self.client.write_timeout != configuration.serial_write_timeout
+        ):
+            self.client.configure_timeouts(
+                configuration.serial_read_timeout, configuration.serial_write_timeout,
+            )
+        if configuration == self.configuration:
+            return
+        if (
+            self._processing or self._pending_save is not None or self._save_result is not None
+            or (self.last_event is not None and not (
+                self._receipt_attempted and self._has_saved_measurement()
+            ))
+            or self._zero_request is not None
+            or self._zero_active or self._zero_release_pending
+            or self.state in (WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.SAVE, WorkerState.PRINT)
+            or not self.cycle.can_reconfigure(now=time.monotonic())
+        ):
+            return
+        self.cycle.reconfigure(
+            Decimal(configuration.vehicle_threshold),
+            configuration.vehicle_ready_seconds, configuration.vehicle_empty_seconds,
+        )
+        self.configuration = configuration
+        self.card_prompt_interval = configuration.card_prompt_interval
+        self.completion_interval = configuration.completion_interval
+
     def stop(self):
         self.logger.info("sys.worker.stop_requested")
         self.stop_event.set()
@@ -639,7 +725,15 @@ class WeighingStationWorker:
             pending.future.set_exception(ZeroRequestError("stopped"))
         self._set_connection_status("disconnected")
         if interrupt:
-            self.client.interrupt()
+            self.interrupt_pending_io()
+
+    def interrupt_pending_io(self):
+        """Keep cancellation safe while shutdown waits for the port owner."""
+        if not self.stop_event.is_set():
+            return
+        with self._zero_lock:
+            if not self._zero_active:
+                self.client.interrupt()
 
     def request_zero(self) -> Future[ZeroResult]:
         """Request one pulse on the station thread; never open another port.
@@ -879,6 +973,7 @@ class WeighingStationWorker:
         while not self.stop_event.is_set():
             structlog.contextvars.bind_contextvars(state=self.state.name)
             try:
+                self._apply_configuration()
                 self._expire_observation(now=time.monotonic())
                 if self._run_zero_request():
                     continue
@@ -968,6 +1063,7 @@ class WeighingStationWorker:
         )
 
     def exchange(self, request: RequestPacket, *, deadline: float | None = None) -> ResponsePacket:
+        self._apply_configuration()
         voice = getattr(request, "voice_code", VoiceCode.NONE)
         if voice != VoiceCode.NONE:
             # Remember the command before I/O: a lost response does not prove
@@ -1300,6 +1396,7 @@ class WeighingStationWorker:
     def connect(self) -> WorkerState:
         # Reopening a serial port neither stops playback nor cancels a command.
         self._voice_status = None
+        self._apply_configuration()
         self.logger.debug("hw.serial.connecting")
         self.client.connect()
         self._set_connection_status("connected")
@@ -1374,6 +1471,18 @@ class WeighingStationWorker:
                 submit = True
         # User callbacks can re-enter the worker; do not invoke them under its lock.
         if submit:
+            self._print_copies = self.configuration.print_copies
+            self._receipt_event_uuid = self._pending_save.uuid
+            self._receipt_attempted = False
+            self._receipt_bytes = None
+            if self.receipt_builder is not None:
+                try:
+                    self._receipt_bytes = self.receipt_builder(self._pending_save)
+                except Exception:
+                    # A rendering failure must never prevent storing the measurement.
+                    self.logger.exception(
+                        "biz.receipt.render_failed", event_id=self._pending_save.uuid,
+                    )
             self._submit_save()
         return WorkerState.SAVE
 
@@ -1442,21 +1551,21 @@ class WeighingStationWorker:
         )
 
     def print(self) -> WorkerState:
-        if self.stop_event.is_set() or not self._has_saved_measurement():
+        if self.stop_event.is_set() or not self._has_saved_measurement() or self._receipt_attempted:
             return WorkerState.IDLE
+        # A lost response cannot prove that the device did not print this request.
+        self._receipt_attempted = True
         # The record is saved, so completion is announced even if output fails,
         # unless a delayed save outlasted the visit and the next one may begin.
         announce = self.cycle.state == CycleState.LOCKED
         if announce:
             self._completion_at = time.monotonic()
             self._completion_announced = False
-        receipt_bytes = None
-        if self.receipt_builder is not None and isinstance(self.last_event, WeighingCompletedEvent):
-            receipt_bytes = self.receipt_builder(self.last_event)
+        receipt_bytes = self._receipt_bytes if self._receipt_event_uuid == self.last_event.uuid else None
 
         if receipt_bytes:
             self.logger.info("hw.printer.command.sending", payload_length = len(receipt_bytes))
-            request = PrinterRequestPacket(document_bytes=receipt_bytes)
+            request = PrinterRequestPacket(document_bytes=receipt_bytes, copies=self._print_copies)
             response = self.exchange(request)
             self.logger.info("hw.printer.command.sent")
             if response.printer_status == PrinterStatus.NO_PAPER:
@@ -1471,6 +1580,8 @@ class WeighingStationWorker:
         self.last_plate = ""
         self.last_event = None
         self._saved_event_uuid = None
+        self._receipt_bytes = None
+        self._receipt_event_uuid = None
         self._processing = False
         return WorkerState.IDLE
 

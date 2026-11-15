@@ -14,6 +14,24 @@ class Gateway(Model):
         return f"<Gateway(id={self.id}, name={self.name})>"
 
 
+class CachedDeviceConfiguration(Model):
+    # One common configuration per server cache, not a copy per station.
+    id = fields.IntField(primary_key=True, default=1)
+    auction_name = fields.CharField(max_length=100, default="")
+    vehicle_threshold = fields.IntField(default=50)
+    vehicle_ready_seconds = fields.FloatField(default=1.0)
+    vehicle_empty_seconds = fields.FloatField(default=1.0)
+    card_prompt_interval = fields.FloatField(default=5.0)
+    completion_interval = fields.FloatField(default=10.0)
+    print_copies = fields.IntField(default=1)
+    serial_read_timeout = fields.FloatField(default=2.0)
+    serial_write_timeout = fields.FloatField(default=2.0)
+    updated_at = fields.DatetimeField(null=True)
+
+    class Meta:
+        table = "device_configuration"
+
+
 class WeighingStation(Model):
     id = fields.IntField(primary_key=True)
     gateway = fields.ForeignKeyField("models.Gateway", related_name="weighing_stations")

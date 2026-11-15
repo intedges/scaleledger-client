@@ -56,7 +56,6 @@ class StationSaveTests(unittest.TestCase):
             or (request.green_blink and not request.red_blink)
             for request in self.requests if isinstance(request, DisplayRequestPacket)
         ))
-        self.receipt_builder.assert_not_called()
 
     def test_pending_save_keeps_one_future_and_ignores_new_cards_after_delay_warning(self):
         with patch("suwol1000.time.monotonic", return_value=10):

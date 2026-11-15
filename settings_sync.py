@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from uuid import UUID
 
@@ -6,7 +6,18 @@ from tortoise.models import Model
 from tortoise.transactions import in_transaction
 
 from cache import RFIDInfo
-from models import Gateway, Producer, RFIDCard, Species, WeighingStation
+from device_configuration import DeviceConfiguration
+from models import CachedDeviceConfiguration, Gateway, Producer, RFIDCard, Species, WeighingStation
+
+
+async def load_configuration() -> DeviceConfiguration:
+    """Existing installations have no common-settings row until their first sync."""
+    cached = await CachedDeviceConfiguration.get_or_none(id=1)
+    if cached is None:
+        return DeviceConfiguration()
+    return DeviceConfiguration(**{
+        item.name: getattr(cached, item.name) for item in fields(DeviceConfiguration)
+    })
 
 
 def _identifier(value, label: str) -> int:
@@ -55,6 +66,7 @@ class SettingsSnapshot:
     _producers: list[Producer]
     _rfid_cards: list[RFIDCard]
     rfid_map: dict[str, RFIDInfo]
+    configuration: DeviceConfiguration = field(default_factory=DeviceConfiguration)
 
     @property
     def gateway_id(self) -> int:
@@ -65,9 +77,17 @@ class SettingsSnapshot:
         return self._gateway.name
 
     @classmethod
-    def from_responses(cls, gateway, stations, species, producers, rfid_cards):
+    def from_responses(
+        cls, gateway, stations, species, producers, rfid_cards,
+        *, fallback_configuration: DeviceConfiguration | None = None,
+    ):
         if not isinstance(gateway, dict):
             raise ValueError("Gateway must be an object")
+        configuration = (
+            DeviceConfiguration.from_response(gateway["configuration"])
+            if "configuration" in gateway
+            else fallback_configuration if fallback_configuration is not None else DeviceConfiguration()
+        )
         # The credential selects the Gateway; keep only what offline restarts need.
         gateway_model = _validate(Gateway,
             id=_identifier(gateway["id"], "Gateway ID"), name=gateway["name"],
@@ -128,10 +148,14 @@ class SettingsSnapshot:
 
         return cls(
             gateway_model, station_models, species_models, producer_models, card_models, rfid_map,
+            configuration,
         )
 
     async def persist(self):
         async with in_transaction() as connection:
+            await CachedDeviceConfiguration.update_or_create(
+                id=1, defaults=asdict(self.configuration), using_db=connection,
+            )
             await RFIDCard.all().using_db(connection).delete()
             await Producer.all().using_db(connection).delete()
             await Species.all().using_db(connection).delete()

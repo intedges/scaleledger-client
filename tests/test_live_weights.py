@@ -100,6 +100,8 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
         completed = WeighingCompletedEvent(rfid_card_uid="12345678", station_id=7, weight=3)
         self.worker.last_event = completed
         self.worker._saved_event_uuid = completed.uuid
+        self.worker._receipt_event_uuid = completed.uuid
+        self.worker._receipt_bytes = b"receipt"
         self.worker._processing = True
         self.worker.print()
         self.worker.idle()

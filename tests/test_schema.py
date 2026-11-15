@@ -13,9 +13,11 @@ from tortoise.connection import get_connection
 from tortoise.exceptions import IntegrityError
 
 from main import HeadlessClient
-from models import Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from device_configuration import DeviceConfiguration
+from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
 from schema import migrate_optional_card_species
-from settings_sync import SettingsSnapshot
+from settings_sync import SettingsSnapshot, load_configuration
+from tests.test_device_configuration import configuration_response
 
 
 OLD_CARD_SCHEMA = '''CREATE TABLE "rfid_card" (
@@ -90,6 +92,38 @@ class OptionalCardSpeciesMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def foreign_keys_enabled(self):
         rows = await get_connection("default").execute_query_dict("PRAGMA foreign_keys")
         return rows[0]["foreign_keys"]
+
+    async def test_startup_adds_common_configuration_cache_without_replacing_existing_data(self):
+        # This temporary test DB represents an installation predating the new table.
+        await get_connection("default").execute_query('DROP TABLE "device_configuration"')
+        before = await self.stored_data()
+        await Tortoise.close_connections()
+        client = HeadlessClient(base_url=None, db_path=self.db_path)
+        client.logger = Mock()
+        client.station_manager = Mock()
+        try:
+            await client.setup()
+            self.assertEqual(await self.stored_data(), before)
+            self.assertEqual(await load_configuration(), DeviceConfiguration())
+            self.assertEqual(await CachedDeviceConfiguration.all().count(), 0)
+        finally:
+            await client.close()
+
+    async def test_common_configuration_survives_database_close_and_reopen(self):
+        self.responses["gateway"]["configuration"] = configuration_response()
+        expected = SettingsSnapshot.from_responses(**self.responses)
+        await expected.persist()
+        before = await self.stored_data()
+        await Tortoise.close_connections()
+        client = HeadlessClient(base_url=None, db_path=self.db_path)
+        client.logger = Mock()
+        client.station_manager = Mock()
+        try:
+            await client.setup()
+            self.assertEqual(await load_configuration(), expected.configuration)
+            self.assertEqual(await self.stored_data(), before)
+        finally:
+            await client.close()
 
     async def test_migration_preserves_rows_indexes_triggers_and_sequence(self):
         connection = get_connection("default")

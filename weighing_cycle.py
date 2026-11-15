@@ -39,6 +39,8 @@ class WeighingCycle:
         self._empty_since: float | None = None
         self._last_sample_at: float | None = None
         self._last_sample_high = False
+        self._has_observations = False
+        self._configuration_empty_since: float | None = None
 
     @staticmethod
     def _finite_seconds(value: float, name: str) -> float:
@@ -66,6 +68,7 @@ class WeighingCycle:
         self._empty_since = None
         self._last_sample_at = None
         self._last_sample_high = False
+        self._configuration_empty_since = None
         if self.state in (CycleState.READY, CycleState.RESERVED):
             self.state = CycleState.WAIT_ENTRY
 
@@ -89,6 +92,32 @@ class WeighingCycle:
         self.state = CycleState.READY
         self.ready_sequence += 1
 
+    def can_reconfigure(self, *, now: float) -> bool:
+        """Only cross settings at startup or a freshly confirmed empty platform."""
+        if not self._has_observations:
+            return self.state == CycleState.WAIT_EMPTY
+        return (
+            self.state == CycleState.WAIT_ENTRY
+            and self._high_since is None
+            and not self._last_sample_high
+            and self._last_sample_at is not None
+            and 0 <= now - self._last_sample_at <= self.max_sample_age
+            and self._configuration_empty_since is not None
+            and now - self._configuration_empty_since >= self.empty_seconds
+        )
+
+    def reconfigure(self, threshold: Decimal, ready_seconds: float, empty_seconds: float):
+        if not isinstance(threshold, Decimal) or not threshold.is_finite() or threshold <= 0:
+            raise ValueError("threshold must be a finite positive Decimal")
+        ready_seconds = self._positive_seconds(ready_seconds, "ready_seconds")
+        empty_seconds = self._positive_seconds(empty_seconds, "empty_seconds")
+        values = threshold, ready_seconds, empty_seconds
+        if values == (self.threshold, self.ready_seconds, self.empty_seconds):
+            return
+        self.threshold, self.ready_seconds, self.empty_seconds = values
+        # No part of an observation interval belongs to two configurations.
+        self.invalidate()
+
     def observe(self, weight: Decimal | None, *, now: float):
         now = self._finite_seconds(now, "now")
         self.expire_observation(now=now)
@@ -97,8 +126,10 @@ class WeighingCycle:
             return
 
         self._last_sample_at = now
+        self._has_observations = True
         self._last_sample_high = weight > self.threshold
         if self._last_sample_high:
+            self._configuration_empty_since = None
             self._empty_since = None
             if self.state == CycleState.WAIT_ENTRY:
                 if self._high_since is None:
@@ -107,6 +138,8 @@ class WeighingCycle:
                     self._become_ready()
             return
 
+        if self._configuration_empty_since is None:
+            self._configuration_empty_since = now
         self._high_since = None
         if self.state in (CycleState.READY, CycleState.RESERVED):
             self.state = CycleState.WAIT_ENTRY
