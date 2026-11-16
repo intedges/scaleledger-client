@@ -1514,11 +1514,13 @@ class WeighingStationWorker:
         self._voice_status = None
         self._apply_configuration()
         self.logger.debug("hw.serial.connecting")
+        if self.get_telemetry().connection_status == "connected":
+            self._set_connection_status("disconnected")
         self.client.connect()
-        self._set_connection_status("connected")
+        # Only exchange() can confirm connectivity by receiving a valid response.
         # Reconnects repeat with every retry while failing; the failure summary covers them.
         log = self.logger.debug if self.failures.failing else self.logger.info
-        log("hw.serial.connected", next_state="IDLE")
+        log("hw.serial.opened", next_state="IDLE")
         return self._resume_state()
 
     def idle(self) -> WorkerState:

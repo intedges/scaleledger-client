@@ -132,7 +132,7 @@ class PrinterObservationTests(unittest.TestCase):
         self.assertEqual(self.worker.get_telemetry().connection_status, "disconnected")
         self.worker.connect()
         self.assert_unobserved(self.worker.get_telemetry())
-        self.assertEqual(self.worker.get_telemetry().connection_status, "connected")
+        self.assertEqual(self.worker.get_telemetry().connection_status, "disconnected")
         self.assertIn(("warning", {"previous": "no_paper", "status": "unknown"}), self.printer_logs())
         self.serial.send_and_receive.side_effect = None
         self.assertEqual(self.observe(b"0", second=1).printer_status, PrinterStatus.NORMAL)
@@ -141,6 +141,7 @@ class PrinterObservationTests(unittest.TestCase):
         self.observe(b"0")
         self.worker.connect()
         self.assert_unobserved(self.worker.get_telemetry())
+        self.assertEqual(self.worker.get_telemetry().connection_status, "disconnected")
         self.assertEqual(len(self.snapshots), 2)
 
     def test_stop_clears_printer_and_late_responses_cannot_restore_it(self):
