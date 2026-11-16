@@ -67,9 +67,9 @@ class VoiceCode(IntEnum):
     COMMUNICATION_ERROR = 18          # 통신에러입니다
 
 
-# Length of each uploaded voice file in seconds. It only bounds how long a notice
-# may wait behind a playing voice: a voice has ended when the device reports
-# Busy -> 00, never when this time has passed, and reminders do not follow it.
+# Length of each uploaded voice file in seconds. These bound notice validity
+# and the idle observation window for resynchronization, not playback itself.
+# Only Busy -> 00 confirms completion; reminders use their own intervals.
 VOICE_SECONDS = {
     VoiceCode.FIRST_WEIGHT_COMPLETE: 2.50,
     VoiceCode.SECOND_WEIGHT_COMPLETE: 2.38,
@@ -567,6 +567,9 @@ class _ReprintRequest:
 class WeighingStationWorker:
     ZERO_HOLD_SECONDS = 1.5
     ZERO_RELEASE_TIMEOUT = 2.0
+    # An operational recovery policy, not a firmware maximum start delay.
+    # After this grace period, an unobserved start also needs a full idle window.
+    VOICE_RECOVERY_GRACE_SECONDS = 15.0
 
     def __init__(
         self,
@@ -635,6 +638,8 @@ class WeighingStationWorker:
         self._voice_started = False
         self._voice_fault_reported = False
         self._voice_sent_at = 0.0
+        self._voice_idle_since: float | None = None
+        self._voice_observed_at: float | None = None
         self._processing = False
         self._indicator_fault = False
         self._save_fault = False
@@ -1153,6 +1158,10 @@ class WeighingStationWorker:
         self.logger.info("sys.worker.terminated")
 
     def _expire_observation(self, *, now: float):
+        if self._voice_observed_at is not None and (
+            now - self._voice_observed_at >= self.cycle.max_sample_gap
+        ):
+            self._forget_voice_observation()
         if self.cycle.expire_observation(now=now):
             self._indicator_fault = True
             self._set_connection_status("error")
@@ -1188,13 +1197,14 @@ class WeighingStationWorker:
             self._voice_started = False
             self._voice_fault_reported = False
             self._voice_sent_at = time.monotonic()
+            self._voice_idle_since = None
         try:
             if deadline is None:
                 response = self.client.send_and_receive(request)
             else:
                 response = self.client.send_and_receive(request, deadline=deadline)
         except Exception as exc:
-            self._voice_status = None
+            self._forget_voice_observation()
             self.cycle.invalidate()
             self._indicator_fault = True
             if not self.stop_event.is_set():
@@ -1203,7 +1213,7 @@ class WeighingStationWorker:
                     self._voice_fault_reported = True
                     self.logger.warning(
                         "hw.speaker.playback_uncertain", voice_code=self._pending_voice.name,
-                        reason="response_lost", action="suppress_voice_until_busy_then_idle",
+                        reason="response_lost", action="suppress_voice_until_completion_or_idle_resync",
                     )
             raise
         sampled_at = datetime.now(UTC)
@@ -1276,29 +1286,61 @@ class WeighingStationWorker:
         self.failures.success()
         return response
 
+    def _forget_voice_observation(self):
+        # A gap is not idle time and reopening the port does not cancel playback.
+        self._voice_status = None
+        self._voice_idle_since = None
+        self._voice_observed_at = None
+
     def _observe_voice(self, voice: VoiceCode | None, now: float):
+        if self._voice_observed_at is not None and (
+            now - self._voice_observed_at >= self.cycle.max_sample_gap
+        ):
+            self._voice_idle_since = None
         self._voice_status = voice
+        self._voice_observed_at = now
         if self._pending_voice is None:
             return
+        reason = None
+        if voice != VoiceCode.NONE:
+            # None (unreadable) and every Busy code interrupt idle confirmation.
+            self._voice_idle_since = None
         if voice == self._pending_voice:
             self._voice_started = True
         elif voice == VoiceCode.NONE and self._voice_started:
-            if self._voice_fault_reported:
-                self.logger.info("hw.speaker.recovered", voice_code=self._pending_voice.name)
+            reason = "busy_then_idle"
+        elif voice == VoiceCode.NONE and (
+            now - self._voice_sent_at >= self.VOICE_RECOVERY_GRACE_SECONDS
+        ):
+            if self._voice_idle_since is None:
+                self._voice_idle_since = now
+            elif now - self._voice_idle_since >= self.notice_wait:
+                # Abandon the uncertain command, never replay it. The device's
+                # latest idle observations permit fresh guidance, but cannot
+                # rule out a start delayed beyond this operational window.
+                reason = "idle_resynchronized"
+        if reason is not None:
+            if self._voice_fault_reported or reason == "idle_resynchronized":
+                self.logger.info(
+                    "hw.speaker.recovered", voice_code=self._pending_voice.name,
+                    reason=reason, elapsed=round(now - self._voice_sent_at, 3),
+                )
             self._pending_voice = None
             self._voice_started = False
             self._voice_fault_reported = False
+            self._voice_idle_since = None
             return
         if not self._voice_fault_reported and now - self._voice_sent_at >= self.voice_timeout:
             self._voice_fault_reported = True
             self.logger.warning(
                 "hw.speaker.timeout", voice_code=self._pending_voice.name,
                 reason="still_busy" if self._voice_started else "start_unobserved",
-                action="continue_weighing_suppress_voice_until_busy_then_idle",
+                action="continue_weighing_suppress_voice_until_completion_or_idle_resync",
             )
 
     def _vehicle_ready(self, now: float):
         # A new visit: guidance left over from the previous vehicle is stale.
+        self._rejected_until = self._rejection_notice_until = 0.0
         self._tag_prompt_at = now
         self._tag_prompted = False
         self._completion_at = None
@@ -1313,6 +1355,8 @@ class WeighingStationWorker:
         return self._weighed_vehicle_on
 
     def _weighed_vehicle_left(self, now: float):
+        # A rejected load can also leave before its notice gets a chance to play.
+        self._rejected_until = self._rejection_notice_until = 0.0
         # Thanks only for an observed departure, after the first completion notice
         # and only while it still follows the departure.
         if self._weighed_vehicle_present():
@@ -1430,9 +1474,8 @@ class WeighingStationWorker:
         """Exchange the current lamps, adding guidance only while the speaker is idle.
 
         The device accepts a voice only while reporting 00 and has no stop
-        command. An unobserved start is ambiguous: 00 can precede delayed
-        playback, so that command stays outstanding until its Busy -> 00 is
-        observed, even across reconnects. Weighing never waits for playback.
+        command. Unobserved starts need a grace period followed by continuous
+        idle observations before resynchronizing. Weighing never waits for this.
         """
         # Lamps reflect the state before this poll's guidance updates it.
         request = self._display_request()
@@ -1445,6 +1488,20 @@ class WeighingStationWorker:
         return self.exchange(request)
 
     def _next_guidance(self, now: float) -> VoiceCode:
+        if self.cycle.state != CycleState.READY:
+            # A rejection is valid only while the same load still accepts cards.
+            self._rejected_until = self._rejection_notice_until = 0.0
+        present = self._weighed_vehicle_present()
+        departing = (
+            self.cycle.invalidations == self._weighed_invalidations
+            and self._farewell_until is not None and now < self._farewell_until
+        )
+        if not present and not departing:
+            # Completion and paper notices belong to the measured load. A gap
+            # or an expired departure must not release them into a later visit.
+            self._completion_at = None
+            self._no_paper_pending = False
+            self._farewell_until = None
         if self._save_fault and now >= self._next_save_announcement:
             self._next_save_announcement = now + 30.0
             return self._announce(VoiceCode.CONTACT_ADMIN)
@@ -1458,9 +1515,9 @@ class WeighingStationWorker:
             # Once per receipt, ahead of the completion notice for the same visit.
             self._no_paper_pending = False
             return self._announce(VoiceCode.NO_PAPER)
-        # Announce completion at least once, then until the weighed vehicle leaves.
+        # Complete the current visit, allowing its first notice just after departure.
         if self._completion_at is not None and now >= self._completion_at and (
-            self._weighed_vehicle_present() or not self._completion_announced
+            present or departing and not self._completion_announced
         ):
             repeated = self._completion_announced
             self._completion_announced = True
@@ -1511,7 +1568,7 @@ class WeighingStationWorker:
 
     def connect(self) -> WorkerState:
         # Reopening a serial port neither stops playback nor cancels a command.
-        self._voice_status = None
+        self._forget_voice_observation()
         self._apply_configuration()
         self.logger.debug("hw.serial.connecting")
         if self.get_telemetry().connection_status == "connected":
