@@ -27,13 +27,14 @@ class Clock:
 
 
 class SimulatedStop:
-    def __init__(self, clock):
+    def __init__(self, clock, *, limit=10):
         self.clock = clock
+        self.limit = limit
         self.stopped = False
         self.after_wait = None
 
     def is_set(self):
-        return self.stopped or self.clock.now >= 10
+        return self.stopped or self.clock.now >= self.limit
 
     def set(self):
         self.stopped = True
@@ -533,9 +534,9 @@ class StationZeroTests(unittest.TestCase):
         self.assertEqual(voices[on + 1], VoiceCode.NONE)
         self.assertIsNone(self.worker._zero_alert_until)
 
-        self.worker._rejection_notice_until = self.clock.now + 1
+        self.worker._save_fault = True
         self.worker._poll()
-        self.assertEqual(self.scale.calls[-1][2].voice_code, VoiceCode.UNREGISTERED_CARD)
+        self.assertEqual(self.scale.calls[-1][2].voice_code, VoiceCode.CONTACT_ADMIN)
 
     def test_alert_outlasting_the_pulse_finishes_on_a_later_poll_without_resending(self):
         self.assertGreater(VOICE_SECONDS[VoiceCode.PLEASE_WAIT], self.worker.ZERO_HOLD_SECONDS)
@@ -549,7 +550,8 @@ class StationZeroTests(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertEqual(self.worker._pending_voice, VoiceCode.PLEASE_WAIT)
         self.assertTrue(self.worker._voice_started)
-        self.worker._rejection_notice_until = self.clock.now + 5
+        # A current storage fault remains relevant even on the empty platform.
+        self.worker._save_fault = True
         self.worker._poll()
         self.assertEqual(self.scale.calls[-1][2].voice_code, VoiceCode.NONE)
         self.scale.off_voice = VoiceCode.NONE
@@ -559,9 +561,9 @@ class StationZeroTests(unittest.TestCase):
 
         voices = [call[2].voice_code for call in self.scale.calls]
         self.assertEqual(voices.count(VoiceCode.PLEASE_WAIT), 1)
-        self.assertEqual(voices[-1], VoiceCode.UNREGISTERED_CARD)
+        self.assertEqual(voices[-1], VoiceCode.CONTACT_ADMIN)
 
-    def test_unobserved_or_lost_on_voice_reply_keeps_tracking_without_resending_alert(self):
+    def test_unobserved_or_lost_on_voice_reply_recovers_without_resending_old_alert(self):
         for feedback, error in (
             (VoiceCode.NONE, None),
             (None, None),
@@ -569,6 +571,8 @@ class StationZeroTests(unittest.TestCase):
         ):
             with self.subTest(feedback=feedback, error=error):
                 self.reset_station()
+                self.stop = SimulatedStop(self.clock, limit=60)
+                self.worker.stop_event = self.stop
                 self.prime()
                 self.scale.on_voice = feedback
                 self.scale.on_error = error
@@ -585,6 +589,31 @@ class StationZeroTests(unittest.TestCase):
                 self.assertNotIn(VoiceCode.UNREGISTERED_CARD, voices)
                 self.assertEqual(self.worker._pending_voice, VoiceCode.PLEASE_WAIT)
                 self.assertFalse(self.worker._voice_started)
+
+                # OFF was confirmed without waiting for audio recovery. The
+                # expired notice must not be replayed when idle is reconciled.
+                self.assertFalse(self.worker._zero_release_pending)
+                for at in range(3, 25):
+                    self.clock.now = at
+                    self.worker._poll()
+                self.assertIsNone(self.worker._pending_voice)
+                voices = [call[2].voice_code for call in self.scale.calls]
+                self.assertEqual(voices.count(VoiceCode.PLEASE_WAIT), 1)
+                self.assertNotIn(VoiceCode.UNREGISTERED_CARD, voices)
+                self.assertEqual(sum(call[2].zero_output for call in self.scale.calls), 1)
+
+                # A later, explicitly requested zero gets its own valid alert.
+                self.scale.on_voice = VoiceCode.PLEASE_WAIT
+                self.scale.on_error = None
+                result = self.execute_queued_zero()
+                self.assertTrue(result.output_released)
+                self.assertIsNone(result.error)
+                self.assertIsNone(self.worker._pending_voice)
+                voices = [call[2].voice_code for call in self.scale.calls]
+                self.assertEqual(voices.count(VoiceCode.PLEASE_WAIT), 2)
+                self.assertEqual(sum(call[2].zero_output for call in self.scale.calls), 2)
+                self.events.assert_not_called()
+                self.assertIsNone(self.worker._zero_alert_until)
 
     def test_busy_speaker_finishing_in_on_reply_allows_alert_with_off(self):
         self.prime()

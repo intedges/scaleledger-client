@@ -11,7 +11,8 @@ import serial
 
 from events import RFIDTaggedEvent, WeighingCompletedEvent
 from suwol1000 import (
-    VOICE_SECONDS, DisplayRequestPacket, PrinterRequestPacket, VoiceCode, WeighingStationWorker,
+    VOICE_SECONDS, DeviceResponseTimeout, DisplayRequestPacket, PrinterRequestPacket,
+    VoiceCode, WeighingStationWorker,
 )
 from tests.test_station_liveness import (
     BoundedSimulationStop, ContinuousScale, SimulatedClock, simulated_wait,
@@ -34,7 +35,7 @@ class VoiceProtocolScale(ContinuousScale):
     def __init__(self, clock, *, missing_voices=(), long_voice=None,
                  long_seconds=20.0, long_once=False, first_start_delay=0.0,
                  tag_while_playing=False, tag_after=0.0, blind_tags=False, fault=None,
-                 response_filter=None, initial_busy_until=0.0):
+                 response_filter=None, initial_busy_until=0.0, first_voice_loss=None):
         super().__init__(clock, repeat_tags=False, fault=fault)
         # A driver who taps on every poll of a visit, whatever the lamps show.
         self.blind_tags = blind_tags
@@ -44,6 +45,9 @@ class VoiceProtocolScale(ContinuousScale):
         self.long_once = long_once
         self.long_played = False
         self.first_start_delay = first_start_delay
+        self.first_voice_loss = first_voice_loss
+        self.response_blackout_until = 0.0
+        self.lost_responses = []
         self.tag_while_playing = tag_while_playing
         self.tag_after = tag_after
         self.response_filter = response_filter
@@ -68,14 +72,19 @@ class VoiceProtocolScale(ContinuousScale):
             raise
         at = self.clock.now
         voice = getattr(request, "voice_code", VoiceCode.NONE)
+        lose_request = False
+        lose_response = at < self.response_blackout_until
         if voice != VoiceCode.NONE:
             command = (at, self.visit_at(), voice)
             self.voice_commands.append(command)
+            first_voice = len(self.voice_commands) == 1
+            lose_request = first_voice and self.first_voice_loss == "request"
+            lose_response |= first_voice and self.first_voice_loss is not None
             if previous_voice != VoiceCode.NONE:
                 self.commands_without_idle.append(command)
             if at < self.ends_at:
                 self.overlaps.append(command)
-            else:
+            elif not lose_request:
                 use_long = voice == self.long_voice and not (self.long_once and self.long_played)
                 duration = self.long_seconds if use_long else VOICE_SECONDS[voice]
                 self.long_played |= use_long
@@ -84,6 +93,10 @@ class VoiceProtocolScale(ContinuousScale):
                 self.starts_at = at + delay
                 self.ends_at = self.starts_at + duration
                 self.playbacks.append((at, self.starts_at, self.ends_at, voice))
+                if first_voice and self.first_voice_loss == "response":
+                    # The device plays normally, but no response from its entire
+                    # Busy interval reaches the worker.
+                    self.response_blackout_until = self.ends_at + 0.1
         current_voice = (
             self.playing
             if self.starts_at <= at < self.ends_at
@@ -104,7 +117,11 @@ class VoiceProtocolScale(ContinuousScale):
         response = replace(response, voice_code=current_voice, rfid_card_uid=card)
         if self.response_filter is not None:
             response = self.response_filter(at, response)
-        self.last_reported_voice = current_voice
+        if lose_response:
+            self.last_reported_voice = None
+            self.lost_responses.append(at)
+            raise DeviceResponseTimeout("simulated wireless voice response loss")
+        self.last_reported_voice = response.voice_code
         self.responses.append((at, response))
         if response.rfid_card_uid != "00000000":
             self.tag_requests.append((at, self.visit_at(), request))
@@ -112,7 +129,7 @@ class VoiceProtocolScale(ContinuousScale):
 
 
 class StationVoiceRecoveryTests(unittest.TestCase):
-    def simulate(self, **device_options):
+    def run_simulation(self, **device_options):
         clock = SimulatedClock()
         scale = VoiceProtocolScale(clock, **device_options)
         submissions = []
@@ -141,6 +158,10 @@ class StationVoiceRecoveryTests(unittest.TestCase):
             worker.stop_event = BoundedSimulationStop(clock, 88)
             scale.worker = worker
             worker.run()
+        return scale, submissions, accepted
+
+    def simulate(self, **device_options):
+        scale, submissions, accepted = self.run_simulation(**device_options)
         self.assertLess(len(scale.requests), 2000)
         self.assertTrue(scale.responses)
         gaps = [
@@ -148,6 +169,8 @@ class StationVoiceRecoveryTests(unittest.TestCase):
             for earlier, later in zip(scale.responses, scale.responses[1:])
         ]
         max_gap = 0.51 if scale.fault_used else 0.21
+        if scale.first_voice_loss is not None:
+            max_gap = VOICE_SECONDS[VoiceCode.TAG_CARD] + 0.61
         self.assertLessEqual(max(gaps), max_gap, "voice handling stopped weight polling")
         self.assertEqual(scale.commands_without_idle, [], "a new voice needs a prior 00 response")
         self.assertEqual(scale.overlaps, [], "a new command overlapped outstanding playback")
@@ -295,8 +318,52 @@ class StationVoiceRecoveryTests(unittest.TestCase):
                 self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
                 commands = [code for _, _, code in scale.voice_commands]
                 self.assertIn(missing_voice, commands)
-                self.assertEqual(commands[-1], missing_voice)
-                self.assertEqual(commands.count(missing_voice), 1)
+                first_missing = commands.index(missing_voice)
+                self.assertGreater(len(commands), first_missing + 1)
+                first_sent = scale.voice_commands[first_missing][0]
+                resumed_at = scale.voice_commands[first_missing + 1][0]
+                self.assertGreaterEqual(resumed_at - first_sent, 20.49)
+                # A completion can recover after departure, with no valid
+                # guidance to send until the next visit becomes ready.
+                self.assertLessEqual(resumed_at, max(first_sent + 21.0, VISIT_STARTS[2] + 1.5))
+                recoveries = [
+                    call for call in scale.worker.logger.info.call_args_list
+                    if call.args[0] == "hw.speaker.recovered"
+                    and call.kwargs.get("reason") == "idle_resynchronized"
+                ]
+                self.assertTrue(recoveries)
+
+    def test_lost_request_recovers_without_replaying_the_old_card_prompt(self):
+        scale, submissions, accepted = self.simulate(first_voice_loss="request", tag_after=3)
+        self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
+        first_sent, _, voice = scale.voice_commands[0]
+        self.assertEqual(voice, VoiceCode.TAG_CARD)
+        self.assertEqual(len(scale.lost_responses), 1)
+        self.assertFalse([playback for playback in scale.playbacks if playback[0] == first_sent])
+        self.assertEqual(len(self.voice_times(scale, VoiceCode.TAG_CARD, 1)), 1)
+        next_sent, visit, next_voice = scale.voice_commands[1]
+        self.assertEqual((visit, next_voice), (1, VoiceCode.WEIGHT_COMPLETE_THANKS))
+        self.assertGreaterEqual(next_sent - first_sent, 20.49)
+        self.assertLess(next_sent - first_sent, 21.0)
+        self.assertLess(submissions[0][0] - first_sent, 5)
+
+    def test_lost_responses_covering_the_entire_busy_interval_resume_current_guidance(self):
+        scale, submissions, accepted = self.simulate(first_voice_loss="response", tag_after=3)
+        self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
+        first_sent, first_started, first_ended, voice = scale.playbacks[0]
+        self.assertEqual(voice, VoiceCode.TAG_CARD)
+        self.assertGreater(len(scale.lost_responses), 1)
+        self.assertFalse([
+            response for at, response in scale.responses
+            if first_started <= at < first_ended
+        ])
+        self.assertGreater(scale.connect_calls, 2)
+        next_sent, visit, next_voice = scale.voice_commands[1]
+        self.assertEqual((visit, next_voice), (1, VoiceCode.WEIGHT_COMPLETE_THANKS))
+        self.assertGreaterEqual(next_sent - first_sent, 20.49)
+        self.assertLess(next_sent - first_sent, 21.0)
+        self.assertEqual(len(self.voice_times(scale, VoiceCode.TAG_CARD, 1)), 1)
+        self.assertLess(submissions[0][0] - first_sent, 5)
 
     def test_twenty_second_busy_keeps_work_moving_without_another_voice(self):
         scale, submissions, accepted = self.simulate(long_voice=VoiceCode.TAG_CARD)
@@ -375,6 +442,25 @@ class StationVoiceRecoveryTests(unittest.TestCase):
         self.assertTrue(resumed)
         self.assertEqual(set(resumed), {VoiceCode.WEIGHT_COMPLETE_THANKS})
 
+    def test_start_delayed_beyond_recovery_window_exposes_the_protocol_limit(self):
+        # The protocol supplies no maximum start delay or cancellation command.
+        # This deliberately exceeds the operating recovery window: unlike the
+        # regular simulations, an attempted overlap is the documented outcome.
+        scale, submissions, accepted = self.run_simulation(first_start_delay=30)
+        self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
+        self.assertEqual(scale.commands_without_idle, [])
+        first_sent, first_started, first_ended, _ = scale.playbacks[0]
+        self.assertEqual(len(scale.overlaps), 1)
+        attempted_at, visit, voice = scale.overlaps[0]
+        self.assertEqual((visit, voice), (1, VoiceCode.WEIGHT_COMPLETE_THANKS))
+        self.assertGreaterEqual(attempted_at - first_sent, 20.49)
+        self.assertLess(attempted_at, first_started)
+        self.assertFalse([
+            command for command in scale.voice_commands
+            if first_started <= command[0] < first_ended
+        ], "observed Busy must still block all new commands")
+        self.assertTrue(self.voice_times(scale, VoiceCode.WEIGHT_COMPLETE_THANKS, 2))
+
     def test_suppressed_guidance_does_not_admit_cards_without_a_valid_vehicle(self):
         for condition in ("invalid_weight", "empty_platform"):
             with self.subTest(condition=condition):
@@ -384,15 +470,17 @@ class StationVoiceRecoveryTests(unittest.TestCase):
                         return replace(response, weight_value=weight)
                     return response
 
-                # The first completion notice is never seen to play, so guidance stays
-                # suppressed while the second visit's tags keep arriving.
+                # The first completion's Busy is missed. Its suppression clears,
+                # but neither recovery nor repeated tags make invalid weight usable.
                 scale, submissions, accepted = self.simulate(
                     missing_voices={VoiceCode.WEIGHT_COMPLETE_THANKS}, blind_tags=True,
                     response_filter=filter_response,
                 )
-                self.assertEqual([voice for _, _, voice in scale.voice_commands], [
+                self.assertGreater(len(scale.voice_commands), 1)
+                self.assertEqual({voice for _, _, voice in scale.voice_commands}, {
                     VoiceCode.WEIGHT_COMPLETE_THANKS,
-                ])
+                })
+                self.assertTrue(all(at < VISIT_STARTS[2] for at, _, _ in scale.voice_commands))
                 self.assertGreater(len([at for at, visit, _ in scale.tag_requests if visit == 2]), 100)
                 self.assertEqual(Counter(visit for _, visit, _ in accepted), {1: 1})
                 self.assertEqual(Counter(visit for _, visit, _ in submissions), {1: 1})
@@ -404,22 +492,25 @@ class StationVoiceRecoveryTests(unittest.TestCase):
                 ]
                 self.assertEqual(bool(faults), condition == "invalid_weight")
 
-    def test_reconnect_keeps_unobserved_voice_pending_and_saved_receipt_unchanged(self):
+    def test_reconnect_recovers_unobserved_voice_without_changing_saved_receipts(self):
         scale, submissions, accepted = self.simulate(
             missing_voices={VoiceCode.TAG_CARD},
-            fault=lambda request, scale: scale.clock.now >= 30,
+            fault=lambda request, scale: scale.clock.now >= 24,
         )
         self.assertTrue(scale.fault_used)
         self.assertEqual(scale.connect_calls, 2)
         self.assert_two_visits_saved_and_printed(scale, submissions, accepted)
-        self.assertEqual([voice for _, _, voice in scale.voice_commands], [VoiceCode.TAG_CARD])
+        self.assertEqual(self.voice_times(scale, VoiceCode.TAG_CARD, 1), [scale.voice_commands[0][0]])
+        self.assertTrue(self.voice_times(scale, VoiceCode.TAG_CARD, 2))
+        self.assertTrue(self.voice_times(scale, VoiceCode.WEIGHT_COMPLETE_THANKS, 2))
+        self.assertFalse(self.voice_times(scale, VoiceCode.WEIGHT_COMPLETE_THANKS, 1))
         first_saved_at = next(at for at, visit, _ in submissions if visit == 1)
         first_print_at = next(
             at for at, visit, _, request in scale.requests
             if visit == 1 and isinstance(request, PrinterRequestPacket)
         )
-        self.assertLess(first_saved_at, 30)
-        self.assertLess(first_print_at, 30)
+        self.assertLess(first_saved_at, 24)
+        self.assertLess(first_print_at, 24)
 
     def test_existing_busy_at_startup_only_suppresses_audio_not_station_health(self):
         scale, submissions, accepted = self.simulate(initial_busy_until=float("inf"))

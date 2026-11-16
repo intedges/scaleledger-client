@@ -360,7 +360,7 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(self.commands_since(0), [VoiceCode.TAG_CARD, "print"])
         self.worker.logger.warning.assert_called_once_with(
             "hw.speaker.timeout", voice_code="TAG_CARD", reason="still_busy",
-            action="continue_weighing_suppress_voice_until_busy_then_idle",
+            action="continue_weighing_suppress_voice_until_completion_or_idle_resync",
         )
 
     def test_unregistered_card_keeps_red_until_its_notice_ends_then_accepts_another_card(self):
@@ -683,7 +683,7 @@ class StationCycleTests(unittest.TestCase):
         self.assertFalse(self.voices(VoiceCode.WEIGHT_COMPLETE_THANKS))
         self.assertEqual(self.prints(), 0)
 
-    def test_unobserved_voice_start_suppresses_guidance_but_not_weighing(self):
+    def test_unobserved_voice_start_recovers_current_guidance_without_delaying_weighing(self):
         self.ready()
         self.scale.fixed_voice = VoiceCode.NONE
         start = self.clock.now
@@ -692,7 +692,7 @@ class StationCycleTests(unittest.TestCase):
 
         self.worker.logger.warning.assert_called_once_with(
             "hw.speaker.timeout", voice_code="TAG_CARD", reason="start_unobserved",
-            action="continue_weighing_suppress_voice_until_busy_then_idle",
+            action="continue_weighing_suppress_voice_until_completion_or_idle_resync",
         )
         self.idle_at(*(start + offset for offset in (3, 5, 6, 7)))
         self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 1)
@@ -706,8 +706,18 @@ class StationCycleTests(unittest.TestCase):
         self.idle_at(start + 8)
         self.assertEqual(self.prints(), 1)
         self.assertEqual(self.commands_since(0), [VoiceCode.TAG_CARD, "print"])
+        original = self.measurements()[0]
 
-    def test_lost_prompt_response_is_not_resent_after_requalifying(self):
+        self.idle_at(*(start + offset for offset in range(9, 24)))
+
+        self.assertEqual(self.commands_since(0), [
+            VoiceCode.TAG_CARD, "print", VoiceCode.WEIGHT_COMPLETE_THANKS,
+        ])
+        self.assertEqual(self.measurements(), [original])
+        self.assertEqual(self.prints(), 1)
+        self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
+
+    def test_lost_prompt_waits_for_idle_resync_before_current_prompt_resumes(self):
         self.ready()
         self.scale.responses.append((0, ValueError("truncated response")))
 
@@ -729,8 +739,144 @@ class StationCycleTests(unittest.TestCase):
         self.assertEqual(len(voice_warnings), 1)
         self.worker.logger.warning.assert_any_call(
             "hw.speaker.playback_uncertain", voice_code="TAG_CARD",
-            reason="response_lost", action="suppress_voice_until_busy_then_idle",
+            reason="response_lost", action="suppress_voice_until_completion_or_idle_resync",
         )
+        self.idle_at(*(self.clock.now + offset for offset in range(1, 24)))
+        self.assertGreaterEqual(len(self.voices(VoiceCode.TAG_CARD)), 2)
+        self.assertFalse(self.measurements())
+        self.assertEqual(self.prints(), 0)
+
+    def test_idle_resync_drops_unannounced_completion_and_paper_after_departure(self):
+        self.ready()
+        self.scale.fixed_voice = VoiceCode.NONE
+        self.accept()
+        self.measure()
+        self.scale.printer_status = PrinterStatus.NO_PAPER
+        self.finish()
+        original = self.measurements()[0]
+        start = self.clock.now
+        self.sustain("0")
+        self.idle_at(*(start + offset for offset in range(5, 25)))
+
+        self.assertIsNone(self.worker._pending_voice)
+        self.assertEqual(self.commands_since(0), [VoiceCode.TAG_CARD, "print"])
+        self.assertEqual(self.measurements(), [original])
+        self.assertEqual(self.prints(), 1)
+
+        self.sustain("120")
+        self.accept(SECOND_CARD)
+        self.measure()
+        self.scale.fixed_voice = None
+        self.scale.printer_status = PrinterStatus.NORMAL
+        self.finish()
+        self.idle_at(self.clock.now, self.clock.now + 1)
+        self.assertEqual(self.prints(), 2)
+        self.assertEqual(len(self.measurements()), 2)
+        self.assertFalse(self.voices(VoiceCode.NO_PAPER))
+        self.assertFalse(self.voices(VoiceCode.THANK_YOU))
+
+    def test_idle_resync_announces_paper_and_completion_for_the_current_load(self):
+        self.ready()
+        self.scale.fixed_voice = VoiceCode.NONE
+        self.accept()
+        self.measure()
+        self.scale.printer_status = PrinterStatus.NO_PAPER
+        self.finish()
+        start = self.clock.now
+        self.idle_at(*(start + offset for offset in range(1, 22)))
+        self.scale.fixed_voice = None
+        self.idle_at(start + 22, start + 22.1, start + 22.2)
+
+        self.assertEqual(self.commands_since(0), [
+            VoiceCode.TAG_CARD, "print", VoiceCode.NO_PAPER, VoiceCode.WEIGHT_COMPLETE_THANKS,
+        ])
+        self.assertEqual(self.prints(), 1)
+        self.assertEqual(len(self.measurements()), 1)
+
+    def assert_rejected_load_leaves_before_idle_resync(self):
+        self.ready()
+        self.scale.fixed_voice = VoiceCode.NONE
+        start = self.clock.now
+        self.idle_at(*(start + offset for offset in range(18)))
+        self.validator.return_value = False
+        self.clock.now = start + 18
+        self.accept()
+        self.assertEqual(self.invoke("verify"), WorkerState.IDLE)
+        self.observe("0", start + 18.1)
+        self.observe("0", start + 19.1)
+        return start
+
+    def test_idle_resync_drops_previous_loads_unregistered_card_warning(self):
+        start = self.assert_rejected_load_leaves_before_idle_resync()
+        self.observe("120", start + 19.2)
+        self.observe("120", start + 20.2)
+        self.assertEqual(self.worker.cycle.state, CycleState.READY)
+        self.idle_at(start + 21, start + 21.1)
+
+        self.assertFalse(self.voices(VoiceCode.UNREGISTERED_CARD))
+        self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 2)
+        self.assertEqual(self.lights(), (True, False))
+
+    def test_idle_resync_drops_unregistered_card_warning_on_empty_platform(self):
+        start = self.assert_rejected_load_leaves_before_idle_resync()
+        self.idle_at(start + 20, start + 21, start + 21.1)
+
+        self.assertFalse(self.voices(VoiceCode.UNREGISTERED_CARD))
+        self.assertEqual(len(self.voices(VoiceCode.TAG_CARD)), 1)
+        self.assertEqual(self.lights(), (False, False))
+
+    def test_idle_resync_drops_unregistered_card_warning_after_invalid_weight(self):
+        self.ready()
+        self.scale.fixed_voice = VoiceCode.NONE
+        start = self.clock.now
+        self.idle_at(*(start + offset for offset in range(18)))
+        self.validator.return_value = False
+        self.clock.now = start + 18
+        self.accept()
+        self.assertEqual(self.invoke("verify"), WorkerState.IDLE)
+        self.observe("NaN", start + 18.1)
+        self.idle_at(start + 19, start + 20, start + 21, start + 21.1)
+
+        self.assertFalse(self.voices(VoiceCode.UNREGISTERED_CARD))
+        self.assertEqual(self.worker.cycle.state, CycleState.WAIT_ENTRY)
+        self.assertEqual(self.lights(), (False, True))
+
+    def assert_observation_break_discards_unannounced_receipt_guidance(self, kind):
+        self.ready()
+        self.scale.fixed_voice = VoiceCode.NONE
+        self.accept()
+        self.measure()
+        self.scale.printer_status = PrinterStatus.NO_PAPER
+        self.finish()
+        original = self.measurements()[0]
+        start = self.clock.now
+        if kind == "disconnect":
+            self.scale.responses.append((0, serial.SerialException("link lost")))
+            with self.assertRaises(serial.SerialException):
+                self.invoke("idle")
+            self.invoke("connect")
+        elif kind == "invalid_weight":
+            self.observe("NaN", start + 1)
+            self.scale.weight = Decimal("120")
+        else:
+            self.clock.now += self.worker.cycle.max_sample_gap
+            self.worker._expire_observation(now=self.clock.now)
+        self.idle_at(*(start + offset for offset in range(6, 31)))
+
+        self.assertIsNone(self.worker._pending_voice)
+        self.assertEqual(self.commands_since(0), [VoiceCode.TAG_CARD, "print"])
+        self.assertEqual(self.measurements(), [original])
+        self.assertEqual(self.prints(), 1)
+        self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
+
+    def test_disconnect_discards_unannounced_receipt_guidance(self):
+        self.assert_observation_break_discards_unannounced_receipt_guidance("disconnect")
+
+    def test_invalid_weight_discards_unannounced_receipt_guidance(self):
+        self.assert_observation_break_discards_unannounced_receipt_guidance("invalid_weight")
+
+    def test_observation_gap_discards_unannounced_receipt_guidance(self):
+        self.assert_observation_break_discards_unannounced_receipt_guidance("gap")
 
     def test_saved_vehicle_departure_skips_stale_guidance_but_prints_original(self):
         self.ready()
