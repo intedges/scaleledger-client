@@ -144,8 +144,8 @@ class PoweredOffStationTests(unittest.TestCase):
         self.assertNotIn("exc_info", logger.log.call_args.kwargs)
         self.assertEqual(self.events(logger.warning), ["hw.station.failure_repeating"])
         self.assertNotIn("sys.worker.recovery_scheduled", self.events(logger.info))
-        self.assertNotIn("hw.serial.connected", self.events(logger.info))
-        self.assertIn("hw.serial.connected", self.events(logger.debug))
+        self.assertNotIn("hw.serial.opened", self.events(logger.info))
+        self.assertIn("hw.serial.opened", self.events(logger.debug))
         self.assertIn("hw.station.recovered", self.events(logger.info))
 
     def test_failed_print_during_a_failure_episode_is_logged_with_its_card(self):
@@ -192,10 +192,10 @@ class PoweredOffStationTests(unittest.TestCase):
         logger.log.assert_not_called()
         self.assertIn("sys.worker.terminated", self.events(logger.info))
 
-    def test_healthy_start_logs_the_connection(self):
+    def test_healthy_start_logs_the_opened_port(self):
         logger = self.run_worker(ScriptedSerialClient())
 
-        self.assertIn("hw.serial.connected", self.events(logger.info))
+        self.assertIn("hw.serial.opened", self.events(logger.info))
         logger.log.assert_not_called()
         logger.warning.assert_not_called()
 
@@ -317,6 +317,36 @@ class SerialClientRecoveryTests(unittest.TestCase):
             self.assertNotIn("exc_info", logger.log.call_args.kwargs)
             self.assertIn(str(failure), logger.log.call_args.kwargs["error"])
 
+    def test_repeated_incomplete_responses_do_not_publish_a_connected_status(self):
+        ports = [Mock(is_open=True) for _ in range(3)]
+        for port, response in zip(ports, (b"", frame()[:-1], frame()), strict=True):
+            port.write.side_effect = len
+            port.read.return_value = response
+        samples = []
+
+        def receive_sample(snapshot):
+            samples.append(snapshot)
+            if snapshot.sample_valid:
+                worker.stop_event.set()
+
+        with patch("suwol1000.get_logger"), patch(
+            "suwol1000.serial.Serial", side_effect=ports,
+        ) as open_serial:
+            worker = WeighingStationWorker(
+                SerialClient("test-port"), station_id=7, polling_interval=0,
+                retry_interval=0, on_telemetry=receive_sample,
+            )
+            worker.run()
+
+        self.assertEqual(open_serial.call_count, 3)
+        for port in ports:
+            port.read.assert_called_once_with(53)
+            port.close.assert_called_once_with()
+        self.assertEqual(
+            [(sample.connection_status, sample.sample_valid, sample.sample_seq) for sample in samples],
+            [("disconnected", False, 0), ("connected", True, 1), ("disconnected", False, 1)],
+        )
+
     def test_empty_read_closes_and_reopens_port_before_publishing_fresh_weight(self):
         old_port = Mock(is_open=True)
         new_port = Mock(is_open=True)
@@ -359,8 +389,8 @@ class SerialClientRecoveryTests(unittest.TestCase):
         self.assertEqual(
             [(sample.connection_status, sample.sample_valid) for sample in samples],
             [
-                ("connected", False), ("connected", True), ("disconnected", False),
-                ("connected", False), ("connected", True), ("disconnected", False),
+                ("connected", True), ("disconnected", False),
+                ("connected", True), ("disconnected", False),
             ],
         )
         self.assertEqual(
@@ -396,6 +426,8 @@ class SerialClientRecoveryTests(unittest.TestCase):
             thread.start()
             try:
                 self.assertTrue(reading.wait(timeout=5))
+                self.assertEqual(worker.get_telemetry().connection_status, "waiting")
+                self.assertFalse(worker.get_telemetry().sample_valid)
             finally:
                 worker.stop()
                 thread.join(timeout=5)

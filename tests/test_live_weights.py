@@ -58,11 +58,8 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
         self.assertIsNone(sample.fan_trigger_temp)
         self.assertIsNone(sample.heater_trigger_temp)
         self.worker.connect()
-        connected = self.worker.get_telemetry()
-        self.assertEqual(connected.connection_status, "connected")
-        self.assertFalse(connected.sample_valid)
-        self.assertIsNone(connected.sampled_at)
-        self.assertEqual(self.samples, [connected])
+        self.assertIs(self.worker.get_telemetry(), sample)
+        self.assertEqual(self.samples, [])
 
     def test_serial_reconnect_invalidates_previous_sample_until_new_response(self):
         self.serial.send_and_receive.return_value = ResponsePacket(weight_value=Decimal("5"), inner_temperature=28)
@@ -71,20 +68,21 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
 
         self.worker.connect()
 
-        connected = self.worker.get_telemetry()
-        self.assertEqual(connected.connection_status, "connected")
-        self.assertFalse(connected.sample_valid)
-        self.assertIsNone(connected.weight)
-        self.assertIsNone(connected.sampled_at)
-        self.assertIsNone(connected.sampled_monotonic)
-        self.assertIsNone(connected.temperature)
-        self.assertIsNone(connected.fan_trigger_temp)
-        self.assertIsNone(connected.heater_trigger_temp)
-        self.assertEqual(connected.sample_seq, previous.sample_seq)
+        disconnected = self.worker.get_telemetry()
+        self.assertEqual(disconnected.connection_status, "disconnected")
+        self.assertFalse(disconnected.sample_valid)
+        self.assertIsNone(disconnected.weight)
+        self.assertIsNone(disconnected.sampled_at)
+        self.assertIsNone(disconnected.sampled_monotonic)
+        self.assertIsNone(disconnected.temperature)
+        self.assertIsNone(disconnected.fan_trigger_temp)
+        self.assertIsNone(disconnected.heater_trigger_temp)
+        self.assertEqual(disconnected.sample_seq, previous.sample_seq)
 
         self.worker.exchange(DisplayRequestPacket())
         self.assertEqual([sample.sample_valid for sample in self.samples], [True, False, True])
         self.assertEqual(self.worker.get_telemetry().sample_seq, 2)
+        self.assertEqual(self.worker.get_telemetry().connection_status, "connected")
 
     def test_idle_voice_and_print_responses_all_refresh_snapshot(self):
         self.serial.send_and_receive.side_effect = [
@@ -288,7 +286,7 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
         self.assertEqual(self.worker.get_telemetry().connection_status, "disconnected")
         self.assertFalse(self.worker.get_telemetry().sample_valid)
         self.worker.connect()
-        self.assertEqual(self.worker.get_telemetry().connection_status, "connected")
+        self.assertEqual(self.worker.get_telemetry().connection_status, "disconnected")
         self.assertFalse(self.worker.get_telemetry().sample_valid)
         self.assertIsNone(self.worker.get_telemetry().sampled_at)
         self.serial.send_and_receive.side_effect = None
@@ -301,9 +299,9 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
         self.worker.stop()
         self.assertEqual(
             [sample.connection_status for sample in self.samples],
-            ["connected", "error", "disconnected", "connected", "connected", "disconnected"],
+            ["connected", "error", "disconnected", "connected", "disconnected"],
         )
-        self.assertEqual([sample.sample_valid for sample in self.samples], [True, False, False, False, True, False])
+        self.assertEqual([sample.sample_valid for sample in self.samples], [True, False, False, True, False])
 
     def test_non_numeric_overload_keeps_frame_observation_with_no_false_measurement(self):
         self.serial.send_and_receive.side_effect = lambda request: ResponsePacket.from_bytes(response_bytes(b"     OL"))
