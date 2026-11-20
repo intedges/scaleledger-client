@@ -9,8 +9,10 @@ import unittest
 from unittest.mock import Mock, patch
 from uuid import UUID
 
+from serial import SerialException
+
 from device_configuration import DeviceConfiguration
-from events import RFIDTaggedEvent
+from events import RFIDTaggedEvent, WeighingCompletedEvent
 from printer import Receipt, ReceiptTemplate
 from reprint import ReprintRequestError
 from suwol1000 import (
@@ -282,6 +284,114 @@ class StationReprintTests(unittest.TestCase):
         self.assertEqual(len(self.print_requests()), 1)
         self.assertIsNone(self.worker._reprint_request)
         self.events.assert_not_called()
+
+    def prepare_automatic_weighing(self):
+        saved = Future()
+        saved.set_result(None)
+        self.events.return_value = saved
+        self.builder.side_effect = None
+        self.builder.return_value = b"automatic receipt"
+        prepare_vehicle(self.worker, reserve=False)
+        self.scale.response = replace(self.scale.response, rfid_card_uid="12345678")
+
+    def run_until_stopped(self):
+        thread = threading.Thread(target=self.worker.run)
+        thread.start()
+        try:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        finally:
+            self.worker.stop()
+            thread.join(timeout=2)
+
+    def test_disconnect_after_save_before_automatic_print_allows_manual_reprint(self):
+        self.prepare_automatic_weighing()
+        self.assertEqual(self.worker.idle(), WorkerState.VERIFY)
+        self.assertEqual(self.worker.verify(), WorkerState.MEASURE)
+        self.assertEqual(self.worker.measure(), WorkerState.SAVE)
+        self.worker.state = self.worker.save()
+        self.assertEqual(self.worker.state, WorkerState.PRINT)
+        original = self.events.call_args.args[0]
+        receipt = replace(
+            self.receipt, record_uuid=UUID(original.uuid), rfid_card_uid=original.rfid_card_uid,
+            weight=Decimal(original.weight),
+        )
+
+        def configure_timeouts(read, write):
+            if self.worker.state == WorkerState.PRINT:
+                raise SerialException("port disconnected before the automatic print command")
+            self.scale.timeout, self.scale.write_timeout = read, write
+
+        self.scale.configure_timeouts = configure_timeouts
+        self.worker.request_configuration(replace(self.worker.configuration, serial_read_timeout=3))
+        manual = []
+
+        def request_after_reconnect(_):
+            if self.worker.get_telemetry().connection_status == "connected":
+                future = self.worker.request_reprint(receipt, copies=1)
+                manual.append(future)
+                future.add_done_callback(lambda _: self.worker.stop())
+
+        self.scale.on_display = request_after_reconnect
+        self.run_until_stopped()
+
+        self.assertEqual(self.scale.connections, 1)
+        self.assertEqual(len(manual), 1)
+        self.assertEqual(manual[0].result(timeout=0), PrinterStatus.NORMAL)
+        self.assertEqual([(p.copies, p.document_bytes) for p in self.print_requests()], [
+            (1, ReceiptTemplate.render(receipt)),
+        ])
+        events = [call.args[0] for call in self.events.call_args_list]
+        self.assertEqual([type(event) for event in events], [RFIDTaggedEvent, WeighingCompletedEvent])
+        self.assertEqual(events[1], original)
+
+    def test_lost_automatic_print_allows_only_an_explicit_reprint_after_recovery(self):
+        self.prepare_automatic_weighing()
+        rejected = []
+        manual = []
+        recovery_polls = 0
+
+        def print_once(request):
+            if len(self.print_requests()) == 1:
+                event = self.events.call_args.args[0]
+                self.receipt = replace(
+                    self.receipt, record_uuid=UUID(event.uuid),
+                    rfid_card_uid=event.rfid_card_uid, weight=Decimal(event.weight),
+                )
+                raise DeviceResponseTimeout("automatic print response lost")
+
+        def recover_printer(_):
+            nonlocal recovery_polls
+            if not self.print_requests():
+                return
+            recovery_polls += 1
+            if recovery_polls <= 2:
+                # The first poll still has no fresh response after reconnect.
+                rejected.append(self.worker.request_reprint(self.receipt, copies=3))
+                status = PrinterStatus.NO_PAPER if recovery_polls == 1 else PrinterStatus.NORMAL
+                self.scale.response = replace(self.scale.response, printer_status=status)
+            elif recovery_polls == 3:
+                manual.append(self.worker.request_reprint(self.receipt, copies=3))
+            elif recovery_polls == 5:
+                self.worker.stop()
+
+        self.scale.on_print = print_once
+        self.scale.on_display = recover_printer
+        self.run_until_stopped()
+
+        self.assertEqual(len(manual), 1)
+        self.assertEqual(manual[0].result(timeout=0), PrinterStatus.NORMAL)
+        self.assertEqual([future.exception(timeout=0).reason for future in rejected], [
+            "disconnected", "printer_no_paper",
+        ])
+        prints = self.print_requests()
+        self.assertEqual([(request.copies, request.document_bytes) for request in prints], [
+            (9, b"automatic receipt"), (3, ReceiptTemplate.render(self.receipt)),
+        ])
+        events = [call.args[0] for call in self.events.call_args_list]
+        self.assertEqual([type(event) for event in events], [RFIDTaggedEvent, WeighingCompletedEvent])
+        self.assertEqual(str(self.receipt.record_uuid), events[1].uuid)
+        self.assertEqual(self.scale.connections, 1)
 
     def test_worker_loop_prints_on_only_the_existing_owner_thread(self):
         future = self.worker.request_reprint(self.receipt, copies=3)

@@ -714,9 +714,7 @@ class WeighingStationWorker:
             return
         if (
             self._processing or self._pending_save is not None or self._save_result is not None
-            or (self.last_event is not None and not (
-                self._receipt_attempted and self._has_saved_measurement()
-            ))
+            or self.last_event is not None
             or self._zero_request is not None
             or self._zero_active or self._zero_release_pending
             or self._reprint_request is not None
@@ -1180,6 +1178,8 @@ class WeighingStationWorker:
             context = {"rfid_card_uid": self.last_plate}
             if isinstance(self.last_event, WeighingCompletedEvent):
                 context["event_id"] = self.last_event.uuid
+            if self.state == WorkerState.PRINT and isinstance(exc, DeviceResponseTimeout):
+                context["print_outcome"] = "unknown"
         expected_serial_failure = isinstance(exc, serial.SerialException)
         self.failures.failure(
             event, exc, always_log=during_weighing,
@@ -1465,9 +1465,12 @@ class WeighingStationWorker:
         # Never resume a card interrupted by an I/O fault, or recreate a saved record.
         if self.cycle.state == CycleState.RESERVED:
             self.cycle.invalidate()
-        if not self._has_saved_measurement():
-            self.last_plate = ""
-            self.last_event = None
+        # Manual reprints use the saved record, so IDLE can release the working copy.
+        self.last_plate = ""
+        self.last_event = None
+        self._saved_event_uuid = None
+        self._receipt_bytes = None
+        self._receipt_event_uuid = None
         return WorkerState.IDLE
 
     def _poll(self) -> ResponsePacket:
@@ -1752,13 +1755,7 @@ class WeighingStationWorker:
                 # Spoken with this visit's completion, which a delayed save skips.
                 self._no_paper_pending = announce
 
-        self.last_plate = ""
-        self.last_event = None
-        self._saved_event_uuid = None
-        self._receipt_bytes = None
-        self._receipt_event_uuid = None
-        self._processing = False
-        return WorkerState.IDLE
+        return self._resume_state()
 
     def recover(self) -> WorkerState:
         self.logger.debug("sys.worker.recovery_scheduled", retry_in=self.retry_interval, next_state="CONNECT")

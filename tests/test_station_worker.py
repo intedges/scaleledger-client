@@ -170,6 +170,7 @@ class PoweredOffStationTests(unittest.TestCase):
         self.assertEqual(len(failures), 2)
         self.assertEqual(failures[1].kwargs["rfid_card_uid"], "12345678")
         self.assertEqual(failures[1].kwargs["event_id"], completed[0].uuid)
+        self.assertEqual(failures[1].kwargs["print_outcome"], "unknown")
         self.assertEqual([call.args[0] for call in failures], [logging.WARNING, logging.ERROR])
         self.assertNotIn("exc_info", failures[1].kwargs)
         self.assertIn("3/53 bytes", failures[1].kwargs["error"])
