@@ -23,6 +23,19 @@ class MismatchedRecordResponse(InvalidRecordResponse):
     """The returned UUID or station identifies a different measurement."""
 
 
+def parse_daily_number(body: dict) -> tuple[int, date]:
+    daily_number = body.get("daily_number")
+    if type(daily_number) is not int or not 1 <= daily_number <= 2_147_483_647:
+        raise InvalidRecordResponse("Invalid daily_number in record response")
+    try:
+        number_date = date.fromisoformat(body.get("number_date"))
+    except (TypeError, ValueError):
+        raise InvalidRecordResponse("Invalid number_date in record response") from None
+    if number_date.isoformat() != body["number_date"]:
+        raise InvalidRecordResponse("Expected YYYY-MM-DD for number_date in record response")
+    return daily_number, number_date
+
+
 def _receipt_timestamp(value, field: str) -> datetime:
     try:
         timestamp = datetime.fromisoformat(value)
@@ -77,15 +90,7 @@ class RecordReceiptDTO:
         if "daily_number" in body or "number_date" in body:
             if "cancelled_at" not in body:
                 raise InvalidRecordResponse("Missing cancelled_at in record response")
-            daily_number = body.get("daily_number")
-            if type(daily_number) is not int or not 1 <= daily_number <= 2_147_483_647:
-                raise InvalidRecordResponse("Invalid daily_number in record response")
-            try:
-                number_date = date.fromisoformat(body.get("number_date"))
-            except (TypeError, ValueError):
-                raise InvalidRecordResponse("Invalid number_date in record response") from None
-            if number_date.isoformat() != body["number_date"]:
-                raise InvalidRecordResponse("Expected YYYY-MM-DD for number_date in record response")
+            daily_number, number_date = parse_daily_number(body)
         return cls(response_uuid, station_id, weight, measured_at, cancelled_at, daily_number, number_date)
 
 

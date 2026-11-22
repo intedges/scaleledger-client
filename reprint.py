@@ -3,6 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
+from api import InvalidRecordResponse, parse_daily_number
 from printer import Receipt
 
 
@@ -33,6 +34,17 @@ class ReprintRequest:
         receipt = payload.get("receipt")
         if not isinstance(receipt, dict):
             raise ReprintRequestError("invalid_receipt")
+        source_station_id = daily_number = number_date = None
+        # Older reprint messages supplied only the destination. A corrected
+        # station may differ from the original, so it cannot identify the QR.
+        if receipt.keys() & {"source_station_id", "daily_number", "number_date"}:
+            source_station_id = receipt.get("source_station_id")
+            if type(source_station_id) is not int or not 1 <= source_station_id <= 9_223_372_036_854_775_807:
+                raise ReprintRequestError("invalid_source_station_id")
+            try:
+                daily_number, number_date = parse_daily_number(receipt)
+            except InvalidRecordResponse as exc:
+                raise ReprintRequestError("invalid_daily_number") from exc
         text_fields = (
             "gateway_name", "station_name", "rfid_card_uid", "producer_name",
             "species_name", "auction_name",
@@ -73,6 +85,7 @@ class ReprintRequest:
             copies=copies,
             receipt=Receipt(
                 record_uuid=record_uuid, weight=Decimal(weight), measured_at=measured_at,
+                source_station_id=source_station_id, daily_number=daily_number, number_date=number_date,
                 **{field: receipt[field] for field in text_fields},
             ),
         )

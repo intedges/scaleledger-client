@@ -1,6 +1,6 @@
 from concurrent.futures import Future
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import unittest
 from unittest.mock import Mock, patch
@@ -31,7 +31,29 @@ class ConfigurationReceiptTests(unittest.TestCase):
         self.assertIn("동해수산물경매장", named)
         self.assertIn("현장 PC", named)
         self.assertIn("저울 1", named)
-        self.assertLess(named.index("동해수산물경매장"), named.index("전표번호"))
+        self.assertLess(named.index("동해수산물경매장"), named.index("계량번호"))
+
+    def test_receipts_print_the_full_original_uuid_as_text_and_in_the_qr(self):
+        receipt = self.receipt(source_station_id=11)
+        record_id = str(receipt.record_uuid).encode("ascii")
+        qr = b'{"uuid":"' + record_id + b'","station_id":11}'
+        for number, day, label in (
+            (None, None, "계량번호 미확인"),
+            (18, date(2026, 11, 14), "계량번호 18번"),
+        ):
+            with self.subTest(number=number):
+                raw = ReceiptTemplate.render(replace(receipt, daily_number=number, number_date=day))
+                self.assertIn(label.encode("cp949"), raw)
+                self.assertIn(b"\n" + record_id + b"\n", raw)
+                self.assertIn(
+                    b"\x1d(k" + (len(qr) + 3).to_bytes(2, "little") + b"1P0" + qr
+                    + b"\x1d(k\x03\x001Q0", raw,
+                )
+                if day:
+                    self.assertIn("기준일 2026-11-14".encode("cp949"), raw)
+                    self.assertNotIn("미확인".encode("cp949"), raw)
+                else:
+                    self.assertNotIn("기준일".encode("cp949"), raw)
 
     def test_long_korean_header_wraps_without_splitting_characters(self):
         name = ("가나다라마바ABC " * 10)[:100]

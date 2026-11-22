@@ -26,7 +26,7 @@ from credential import CredentialError, CredentialStore
 from device_configuration import DeviceConfiguration
 from paths import AppPaths, program_dir
 from reprint import ReprintRequest, ReprintRequestError
-from events import BaseEvent, WeighingCompletedEvent
+from events import BaseEvent, SaveFuture, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
 from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
@@ -90,7 +90,8 @@ class HeadlessClient:
         self.market_cache = MarketDataCache()
         self.configuration = DeviceConfiguration()
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
-        self.event_queue: asyncio.Queue[tuple[BaseEvent, Future[None]]] = asyncio.Queue()
+        self._active_uploader: RecordUploadWorker | None = None
+        self.event_queue: asyncio.Queue[tuple[BaseEvent, SaveFuture]] = asyncio.Queue()
         self.telemetry_updates = LatestTelemetryBuffer()
         self.station_manager = WeighingStationManager(
             on_event=self.handle_hardware_event,
@@ -106,8 +107,8 @@ class HeadlessClient:
         log = self.logger.debug if self.network_failures.failing else self.logger.info
         log(event, **kw)
 
-    def handle_hardware_event(self, event: BaseEvent) -> Future[None]:
-        result: Future[None] = Future()
+    def handle_hardware_event(self, event: BaseEvent) -> SaveFuture:
+        result: SaveFuture = Future()
         # A station stopping must not cancel a write already handed to the queue.
         result.set_running_or_notify_cancel()
         self.main_loop.call_soon_threadsafe(self.event_queue.put_nowait, (event, result))
@@ -128,9 +129,12 @@ class HeadlessClient:
                 )
             else:
                 # No await between commit, upload handoff and acknowledgement.
+                confirmation = None
                 if isinstance(event, WeighingCompletedEvent):
+                    if self._active_uploader is not None:
+                        confirmation = self._active_uploader.expect_receipt(event.uuid)
                     self.upload_queue.put_nowait(event.uuid)
-                result.set_result(None)
+                result.set_result(confirmation)
                 if isinstance(event, WeighingCompletedEvent):
                     self.logger.info("biz.record.saved", uuid=event.uuid, weight=event.weight)
             finally:
@@ -384,6 +388,7 @@ class HeadlessClient:
         finally:
             self._cleanup_started = True
             await asyncio.to_thread(self.station_manager.stop_all)
+            self._end_upload_session()
             # Deliver callbacks already submitted by the stopped hardware threads.
             await asyncio.sleep(0)
             await self.event_queue.join()
@@ -511,11 +516,24 @@ class HeadlessClient:
             upload_queue=self.upload_queue,
             access_token=self.access_token,
         )
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self.run_settings_sync_worker())
-            tg.create_task(self.run_active_ws_loop())
-            tg.create_task(upload_worker.run())
-            tg.create_task(self.run_telemetry_loop())
+        self._active_uploader = upload_worker
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self.run_settings_sync_worker())
+                tg.create_task(self.run_active_ws_loop())
+                tg.create_task(upload_worker.run())
+                tg.create_task(self.run_telemetry_loop())
+        finally:
+            # Losing an authenticated session releases waiting stations to
+            # print offline. Process shutdown must stop the serial owners first.
+            if not asyncio.current_task().cancelling():
+                self._end_upload_session()
+
+    def _end_upload_session(self):
+        uploader = self._active_uploader
+        self._active_uploader = None
+        if uploader is not None:
+            uploader.release_receipt_waiters()
 
     async def run_telemetry_loop(self):
         if self._telemetry_stop_code is not None:

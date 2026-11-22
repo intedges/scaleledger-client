@@ -194,7 +194,9 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
             httpx2.ReadTimeout("Response lost after server save"),
             httpx2.Response(200, json=self.body | {"cancelled_at": cancelled_at}),
         ]
+        initial_print = self.worker.expect_receipt(self.record_uuid)
         await self.process_queue()
+        self.assertIsNone(initial_print.result(timeout=0))
         payloads = [json.loads(call.args[0].content) for call in self.post.await_args_list]
         original = {
             "uuid": self.record_uuid, "station_id": 7, "rfid_card_uid": "test-card",
@@ -208,6 +210,18 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.daily_number, result.number_date), (18, date(2026, 11, 23)))
         self.assertIsNone(result.error)
         self.assertEqual((await Record.get(uuid=self.record.uuid)).weight, 85)
+
+        # A duplicate local save after this commit must see the cancellation too.
+        duplicate = self.worker.expect_receipt(self.record_uuid)
+        self.queue.put_nowait(self.record_uuid)
+        await self.process_queue()
+        confirmation = duplicate.result(timeout=0)
+        self.assertGreaterEqual(confirmation.received_at, duplicate.saved_at)
+        self.assertEqual(confirmation.receipt.uuid, self.record.uuid)
+        self.assertEqual(confirmation.receipt.station_id, self.record.station_id)
+        self.assertEqual(confirmation.receipt.cancelled_at, result.cancelled_at)
+        self.assertEqual(confirmation.receipt.daily_number, result.daily_number)
+        self.assertEqual(self.post.await_count, 2)
 
     async def test_legacy_success_completes_without_a_number(self):
         body = self.body.copy()
@@ -246,7 +260,12 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
                 "uuid": str(following.uuid), "station_id": 8, "weight": 32,
             }),
         ]
+        first_print = self.worker.expect_receipt(self.record_uuid)
+        following_print = self.worker.expect_receipt(str(following.uuid))
         await self.process_queue()
+        self.assertIsNone(first_print.result(timeout=0))
+        self.assertEqual(following_print.result(timeout=0).receipt.uuid, following.uuid)
+        self.assertEqual(following_print.result(timeout=0).receipt.weight, 32)
         rejected = await RecordUploadResult.get(record_id=self.record_uuid)
         self.assertIn("conflict", rejected.error)
         self.assertIsNone(rejected.daily_number)
@@ -294,6 +313,42 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.post.assert_awaited_once()
         self.assertEqual(await RecordUploadResult.all().count(), 1)
         self.assertEqual((await RecordUploadResult.get(record_id=self.record_uuid)).daily_number, 18)
+
+    async def check_print_result_before_cache_commit(self, cancelled_at):
+        save_result = RecordUploadResult.create
+        self.post.return_value = httpx2.Response(200, json=self.body | {"cancelled_at": cancelled_at})
+        writing_result = asyncio.Event()
+        allow_failure = asyncio.Event()
+
+        async def fail_first_cache_write(**fields):
+            if not writing_result.is_set():
+                writing_result.set()
+                await allow_failure.wait()
+                raise OperationalError("response cache is locked")
+            return await save_result(**fields)
+
+        ticket = self.worker.expect_receipt(self.record_uuid)
+        with patch.object(RecordUploadResult, "create", side_effect=fail_first_cache_write):
+            async with self.running_worker():
+                await asyncio.wait_for(writing_result.wait(), timeout=1)
+                confirmation = ticket.result(timeout=0)
+                self.assertEqual(confirmation.receipt.daily_number, 18)
+                self.assertEqual(confirmation.receipt.cancelled_at, (
+                    datetime.fromisoformat(cancelled_at) if cancelled_at else None
+                ))
+                self.assertFalse(await RecordUploadResult.filter(record_id=self.record_uuid).exists())
+                allow_failure.set()
+                await asyncio.wait_for(self.queue.join(), timeout=2)
+
+        persisted = await RecordUploadResult.get(record_id=self.record_uuid)
+        self.assertEqual(persisted.cancelled_at, confirmation.receipt.cancelled_at)
+        self.assertEqual(self.post.await_count, 2)
+
+    async def test_validated_number_reaches_station_before_result_cache_commit(self):
+        await self.check_print_result_before_cache_commit(None)
+
+    async def test_validated_cancellation_reaches_station_before_result_cache_commit(self):
+        await self.check_print_result_before_cache_commit("2026-11-24T02:00:00+09:00")
 
     async def test_missing_record_does_not_requeue_or_upload(self):
         await self.record.delete()

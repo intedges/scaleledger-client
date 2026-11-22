@@ -136,13 +136,13 @@ class WeighingStationManagerTests(unittest.TestCase):
             self.manager.sync([cached])
             runtime = self.manager.workers[1]
             build_receipt = worker.call_args.kwargs["receipt_builder"]
-            self.assertIn(b"Cached station", build_receipt(event))
+            original = build_receipt(event)
 
             self.manager.sync([updated])
             receipt = build_receipt(event)
 
-        self.assertIn(b"Updated station", receipt)
-        self.assertNotIn(b"Cached station", receipt)
+        self.assertEqual(original.station_name, "Cached station")
+        self.assertEqual(receipt.station_name, "Updated station")
         self.assertIs(self.manager.workers[1], runtime)
         self.assertEqual(worker.call_count, 1)
         self.assertEqual(thread.call_count, 1)
@@ -173,11 +173,11 @@ class WeighingStationManagerTests(unittest.TestCase):
         threads[1].start.assert_called_once_with()
         self.assertIs(self.manager.workers[1].worker, workers[1])
         self.assertEqual(self.manager.workers[1].port, "new-port")
-        self.assertIn(b"Updated station", receipt)
+        self.assertEqual(receipt.station_name, "Updated station")
         self.assertEqual(worker.call_args.kwargs["initial_sample_seq"], 12)
         self.assertEqual(worker.call_args.kwargs["station_id"], 1)
 
-    def test_receipt_prints_the_measurement_time_in_local_time(self):
+    def test_receipt_preserves_measurement_time_and_source_station(self):
         self.manager.market_cache.update_rfid_data({
             "12345678": RFIDInfo(True, "Producer", "Species"),
         })
@@ -193,10 +193,12 @@ class WeighingStationManagerTests(unittest.TestCase):
             self.manager.sync([station])
             receipt = worker.call_args.kwargs["receipt_builder"](event)
 
-        local_time = event.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        self.assertIn(local_time.encode(), receipt)
+        self.assertEqual(receipt.measured_at, event.timestamp)
+        self.assertEqual(receipt.source_station_id, event.station_id)
+        self.assertEqual(str(receipt.record_uuid), event.uuid)
+        self.assertIsInstance(receipt.weight, Decimal)
 
-    def test_card_without_species_is_accepted_and_prints_a_blank_species(self):
+    def test_accepted_card_survives_a_settings_refresh_before_the_receipt(self):
         self.manager.market_cache.update_rfid_data({
             "12345678": RFIDInfo(True, "Producer", ""),
             "87654321": RFIDInfo(False, "Inactive producer", ""),
@@ -208,15 +210,13 @@ class WeighingStationManagerTests(unittest.TestCase):
             worker.return_value.configuration = DeviceConfiguration()
             self.manager.sync([station])
             validate = worker.call_args.kwargs["rfid_validator"]
-            self.assertTrue(validate(RFIDTaggedEvent(rfid_card_uid="12345678")))
             self.assertFalse(validate(RFIDTaggedEvent(rfid_card_uid="87654321")))
-            receipt = worker.call_args.kwargs["receipt_builder"](event).decode("cp949")
+            self.assertTrue(validate(RFIDTaggedEvent(rfid_card_uid="12345678")))
+            self.manager.market_cache.update_rfid_data({})
+            receipt = worker.call_args.kwargs["receipt_builder"](event)
 
-        species_line = next(line for line in receipt.splitlines() if line.startswith("품 목 명"))
-        self.assertEqual(species_line.rstrip(), "품 목 명")
-        self.assertIn("Producer", receipt)
-        self.assertIn("12345678", receipt)
-        self.assertIn("23 kg", receipt)
+        self.assertEqual((receipt.producer_name, receipt.species_name), ("Producer", ""))
+        self.assertEqual((receipt.rfid_card_uid, receipt.weight), ("12345678", 23))
 
     def test_stop_all_signals_every_worker_before_waiting_for_threads(self):
         actions = []

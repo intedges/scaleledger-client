@@ -330,14 +330,16 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(isinstance(request, PrinterRequestPacket) for request in self.scale.requests), 1)
         self.assertTrue(await Record.filter(uuid=event.uuid).exists())
 
-    async def test_confirmation_before_station_observes_ack_prints_once_and_preserves_original(self):
+    async def test_offline_save_followed_by_upload_before_print_does_not_queue_an_extra_copy(self):
         self.start_consumer()
         api = Mock(create_record=AsyncMock(side_effect=accepted_receipt))
         uploader = RecordUploadWorker(api, self.client.upload_queue, "cached-token")
         uploader.logger = Mock()
-        self.start(uploader.run())
         event, acknowledgment = await self.start_measurement()
         await self.drain()
+        # This save was acknowledged while offline; a later HTTP worker only
+        # reconciles the original, even if it finishes before the station prints.
+        self.start(uploader.run())
         await asyncio.wait_for(self.client.upload_queue.join(), timeout=2)
         self.assertIsNone(acknowledgment.result(timeout=0))
         result = await RecordUploadResult.get(record_id=event.uuid)

@@ -1,7 +1,7 @@
 import asyncio
 from concurrent.futures import Future
 from copy import deepcopy
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 import json
 import sys
@@ -31,6 +31,9 @@ def reprint_payload(*, station_id=7, copies=3):
         "copies": copies,
         "receipt": {
             "record_uuid": "55a7c359-8524-469b-8c13-c447f8eaadf9",
+            "source_station_id": 11,
+            "daily_number": 18,
+            "number_date": "2026-11-14",
             "gateway_name": "변경된 경매장 PC",
             "station_name": "지정한 계량대",
             "rfid_card_uid": "미지정",
@@ -53,13 +56,29 @@ class ReprintPayloadTests(unittest.TestCase):
         self.assertEqual(request.station_id, 7)
         self.assertEqual(request.copies, 3)
         self.assertEqual(receipt.record_uuid, UUID(payload["receipt"]["record_uuid"]))
+        self.assertEqual(receipt.source_station_id, 11)
+        self.assertEqual(receipt.daily_number, 18)
+        self.assertEqual(receipt.number_date, date(2026, 11, 14))
         self.assertEqual(receipt.measured_at.isoformat(), payload["receipt"]["measured_at"])
         self.assertEqual(receipt.measured_at.utcoffset(), timedelta(hours=9))
         self.assertEqual(receipt.weight, Decimal(240))
         text = ReceiptTemplate.render(receipt).decode("cp949")
-        for value in ("55A7C359", "서버의 생산자", "미지정", "변경된 경매장 PC", "지정한 계량대", "240 kg"):
+        for value in (str(receipt.record_uuid), "기준일 2026-11-14", "계량번호 18번",
+                      "서버의 생산자", "미지정", "변경된 경매장 PC", "지정한 계량대", "240 kg"):
             self.assertIn(value, text)
+        self.assertIn(f'1P0{{"uuid":"{receipt.record_uuid}","station_id":11}}', text)
         self.assertIn(payload["receipt"]["auction_name"], text.replace("\n", ""))
+
+    def test_legacy_request_uses_only_the_uuid_when_original_station_is_unknown(self):
+        payload = reprint_payload()
+        for key in ("source_station_id", "daily_number", "number_date"):
+            del payload["receipt"][key]
+        request = ReprintRequest.from_payload(payload)
+        self.assertIsNone(request.receipt.source_station_id)
+        text = ReceiptTemplate.render(request.receipt).decode("cp949")
+        self.assertIn("계량번호 미확인", text)
+        self.assertIn("1P0" + str(request.receipt.record_uuid), text)
+        self.assertNotIn('"station_id"', text)
 
     def test_required_fields_and_types_are_not_defaulted_or_coerced(self):
         valid = reprint_payload()
@@ -86,6 +105,9 @@ class ReprintPayloadTests(unittest.TestCase):
                 invalid.append(payload)
         for field, values in {
             "record_uuid": [1, "", "not-a-uuid"],
+            "source_station_id": [0, -1, 7.0, "7", 2**63],
+            "daily_number": [0, -1, 1.0, "1", 2**31],
+            "number_date": [1, "", "20261114", "2026-02-31", "2026-11-14T00:00:00Z"],
             "weight": ["240", 240.0, 240.5, float("nan"), float("inf")],
             "measured_at": [1, "", "2026-11-15", "2026-11-15T09:34:56", "2026-13-01T00:00:00Z"],
             "gateway_name": [1], "station_name": [1], "rfid_card_uid": [1],
