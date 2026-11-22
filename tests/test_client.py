@@ -850,7 +850,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         pending = await Record.create(
             uuid=uuid.uuid4(), station_id=1, rfid_card_uid="12345678", weight=19, measured_at=self.now,
         )
-        with patch.object(self.client.credentials, "create", side_effect=OSError("read-only credential file")):
+        with patch("credential.os.replace", side_effect=OSError("read-only credential file")):
             self.start(self.client.run())
             await self.wait_for(self.started.wait())
             saved_offline = await self.emit_and_save()

@@ -14,7 +14,7 @@ from tortoise.connection import get_connection
 from api import RecordReceiptDTO
 from events import WeighingCompletedEvent
 from main import HeadlessClient
-from models import Gateway, Record, RecordUploadResult, ServerBinding, WeighingStation
+from models import CachedDeviceConfiguration, Gateway, Record, RecordUploadResult, ServerBinding, WeighingStation
 from settings_sync import SettingsSnapshot
 from workers import RecordUploadWorker
 
@@ -233,6 +233,89 @@ class DatabaseServerBindingTests(unittest.IsolatedAsyncioTestCase):
         for model in (Gateway, Record, RecordUploadResult):
             self.assertEqual(await model.all().count(), 0, model.__name__)
 
+    async def switch_with_previous_client(self):
+        event = WeighingCompletedEvent(station_id=2, rfid_card_uid="new-card", weight=125)
+        async with self.open_client(self.new_url) as client:
+            # Version 407c892 deletes these on address changes without knowing about server_binding.
+            await CachedDeviceConfiguration.all().delete()
+            await Record.all().delete()
+            await Gateway.all().delete()
+            client.credentials.create(self.new_url)
+            await SettingsSnapshot.from_responses({"id": 2, "name": "New gateway"}, [], [], [], []).persist()
+            await client.save_record(event)
+        return event
+
+    async def test_same_server_after_downgrade_keeps_the_previous_clients_new_records(self):
+        event = await self.switch_with_previous_client()
+        async with self.open_client(self.new_url) as client:
+            self.assertTrue(await client.prepare_credential())
+            await client.restore_local_state()
+            self.assertEqual(client.upload_queue.get_nowait(), event.uuid)
+            self.assertEqual((await Record.get(uuid=event.uuid)).weight, event.weight)
+            self.assertEqual(client.gateway_id, 2)
+            self.assertEqual((await ServerBinding.get(id=1)).server_url, self.new_url)
+
+    async def test_switch_back_after_downgrade_does_not_upload_previous_clients_records(self):
+        await self.switch_with_previous_client()
+        async with self.open_client(self.old_url) as client:
+            self.assertTrue(await client.prepare_credential())
+            await client.restore_local_state()
+            self.assertTrue(client.upload_queue.empty())
+            self.assertEqual(await Record.all().count(), 0)
+            self.assertIsNone(client.gateway_id)
+            self.assertEqual((await ServerBinding.get(id=1)).server_url, self.old_url)
+
+    async def test_unidentified_records_after_downgrade_remain_offline_across_restarts(self):
+        event = await self.switch_with_previous_client()
+        (self.root / "credential.json").write_text("{broken", encoding="utf-8")
+        for url in (self.old_url, self.new_url):
+            async with self.open_client(url) as client:
+                self.assertFalse(await client.prepare_credential())
+                self.assertIsNone(client.access_token)
+                self.assertFalse(await ServerBinding.all().exists())
+                self.assertEqual((await Record.get(uuid=event.uuid)).weight, event.weight)
+
+    async def test_standalone_development_binding_with_conflicting_credential_stays_offline(self):
+        async with self.open_client(self.new_url) as client:
+            await get_connection("default").execute_query("DROP TRIGGER forget_settings_server")
+            client.credentials.create(self.new_url)
+
+        for url in (self.new_url, self.old_url):
+            async with self.open_client(url) as restarted:
+                self.assertFalse(await restarted.prepare_credential())
+                self.assertIsNone(restarted.access_token)
+                self.assertEqual(restarted.credentials.load().server_url, self.new_url)
+                await self.assert_old_data()
+
+    async def test_verified_development_binding_survives_settings_updates_and_expires_on_switch(self):
+        async with self.open_client(self.old_url) as client:
+            await get_connection("default").execute_query("DROP TRIGGER forget_settings_server")
+            await CachedDeviceConfiguration.all().delete()
+            self.assertTrue(await client.prepare_credential())
+            await SettingsSnapshot.from_responses({"id": 1, "name": "Synced"}, [], [], [], []).persist()
+            await self.assert_old_data()
+            await CachedDeviceConfiguration.all().delete()
+            self.assertFalse(await ServerBinding.all().exists())
+
+    async def test_interrupted_first_binding_keeps_legacy_recovery_available(self):
+        async with self.open_client(self.old_url) as client:
+            database = get_connection("default")
+            await database.execute_query("DROP TRIGGER forget_settings_server")
+            await ServerBinding.all().delete()
+            await CachedDeviceConfiguration.all().delete()
+            (self.root / "credential.json").unlink()
+            with patch.object(SqliteTransactionWrapper, "commit", side_effect=sqlite3.OperationalError("I/O error")):
+                self.assertFalse(await client.prepare_credential())
+            self.assertFalse(await CachedDeviceConfiguration.all().exists())
+            self.assertFalse(await ServerBinding.all().exists())
+            self.assertEqual(await database.execute_query_dict(
+                "SELECT name FROM sqlite_master WHERE name='forget_settings_server'"
+            ), [])
+
+        async with self.open_client(self.old_url) as restarted:
+            self.assertTrue(await restarted.prepare_credential())
+            await self.assert_old_data()
+
     async def test_damaged_credential_cannot_move_previous_records_to_another_server(self):
         (self.root / "credential.json").write_text("{broken", encoding="utf-8")
         async with self.open_client(self.new_url) as client:
@@ -276,11 +359,13 @@ class DatabaseServerBindingTests(unittest.IsolatedAsyncioTestCase):
             client.retry_interval = 0.01
 
             async def commit_after_lock(connection):
-                attempts.append(client.credentials.load().credential)
-                if len(attempts) == 1:
-                    error = sqlite3.OperationalError("table is locked")
-                    error.sqlite_errorcode = sqlite3.SQLITE_LOCKED_SHAREDCACHE
-                    raise error
+                stored = client.credentials.load()
+                if stored.pending is not None:
+                    attempts.append(stored.pending.credential)
+                    if len(attempts) == 1:
+                        error = sqlite3.OperationalError("table is locked")
+                        error.sqlite_errorcode = sqlite3.SQLITE_LOCKED_SHAREDCACHE
+                        raise error
                 await commit(connection)
 
             with patch.object(SqliteTransactionWrapper, "commit", new=commit_after_lock):
@@ -294,7 +379,8 @@ class DatabaseServerBindingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(await client.prepare_credential())
 
             stored = client.credentials.load()
-            self.assertEqual(stored.server_url, self.new_url)
+            self.assertEqual(stored.server_url, self.old_url)
+            self.assertEqual(stored.pending.server_url, self.new_url)
             self.assertIsNone(client.access_token)
             await self.assert_old_data()
             await client.restore_local_state()
@@ -302,10 +388,10 @@ class DatabaseServerBindingTests(unittest.IsolatedAsyncioTestCase):
 
         async with self.open_client(self.new_url) as restarted:
             self.assertTrue(await restarted.prepare_credential())
-            self.assertEqual(restarted.access_token, stored.credential)
+            self.assertEqual(restarted.access_token, stored.pending.credential)
             await self.assert_new_database()
 
-    async def test_lost_ack_after_switch_commit_does_not_repeat_cleanup(self):
+    async def test_lost_ack_after_switch_commit_leaves_no_records_or_binding(self):
         commit = SqliteTransactionWrapper.commit
 
         async def commit_then_fail(connection):
@@ -316,11 +402,40 @@ class DatabaseServerBindingTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(SqliteTransactionWrapper, "commit", new=commit_then_fail):
                 self.assertFalse(await client.prepare_credential())
             self.assertIsNone(client.access_token)
-            await self.assert_new_database()
-            new_event = WeighingCompletedEvent(station_id=2, rfid_card_uid="12345678", weight=125)
-            await client.save_record(new_event)
+            for model in (Record, RecordUploadResult, Gateway, ServerBinding):
+                self.assertEqual(await model.all().count(), 0, model.__name__)
+            stored = client.credentials.load()
+            self.assertEqual(stored.server_url, self.old_url)
+            self.assertEqual(stored.pending.server_url, self.new_url)
 
         async with self.open_client(self.new_url) as restarted:
             self.assertTrue(await restarted.prepare_credential())
+            self.assertEqual(restarted.access_token, stored.pending.credential)
+            await self.assert_new_database()
             await restarted.restore_local_state()
-            self.assertEqual(restarted.upload_queue.get_nowait(), new_event.uuid)
+            self.assertTrue(restarted.upload_queue.empty())
+
+    async def test_failed_activation_recovers_staged_credential_after_restart(self):
+        async with self.open_client(self.new_url) as client:
+            old = client.credentials.load()
+            save = client.credentials.save
+
+            def fail_activation(active, pending=None):
+                if pending is None:
+                    raise OSError("credential locked")
+                save(active, pending)
+
+            with patch.object(client.credentials, "save", side_effect=fail_activation):
+                self.assertFalse(await client.prepare_credential())
+            stored = client.credentials.load()
+            self.assertEqual((stored.server_url, stored.credential), (self.old_url, old.credential))
+            self.assertIsNone(client.access_token)
+            self.assertFalse(await ServerBinding.all().exists())
+            self.assertFalse(await Record.all().exists())
+            self.assertFalse(await Gateway.all().exists())
+
+        async with self.open_client(self.new_url) as restarted:
+            self.assertTrue(await restarted.prepare_credential())
+            self.assertEqual(restarted.access_token, stored.pending.credential)
+            self.assertEqual(restarted.credentials.load(), stored.pending)
+            await self.assert_new_database()

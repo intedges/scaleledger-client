@@ -29,8 +29,8 @@ from reprint import ReprintRequest, ReprintRequestError
 from events import BaseEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
-from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, ServerBinding, Species, WeighingStation
-from schema import migrate_optional_card_species
+from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from schema import load_server_binding, migrate_optional_card_species
 from settings_sync import SettingsSnapshot, load_configuration
 from suwol1000 import PrinterStatus, ZeroRequestError, ZeroResult
 from telemetry import LatestTelemetryBuffer, StationTelemetryPublisher
@@ -413,7 +413,7 @@ class HeadlessClient:
         while True:
             try:
                 self.access_token = await self._credential_for_server(server_url)
-                return True
+                return self.access_token is not None
             except OSError as exc:
                 # Keep weighing; an unreadable file may still hold the approved credential.
                 self.logger.error(
@@ -430,31 +430,34 @@ class HeadlessClient:
                 self.logger.warning("sys.db.server_binding.locked", retry_in=self.retry_interval)
                 await asyncio.sleep(self.retry_interval)
 
-    async def _credential_for_server(self, server_url: str) -> str:
+    async def _credential_for_server(self, server_url: str) -> str | None:
         try:
             stored = self.credentials.load()
         except CredentialError as exc:
             self.logger.warning("sys.auth.credential.invalid", error=str(exc))
             stored = None
-        binding = await ServerBinding.get_or_none(id=1)
+        binding = await load_server_binding(stored.server_url if stored else None, server_url)
         if binding is None:
-            # Older databases only had the credential file to identify their server.
-            # With neither source available, retain the existing enrollment policy.
-            binding = await ServerBinding.create(id=1, server_url=stored.server_url if stored else server_url)
-        if stored is not None and stored.server_url == server_url:
-            token = stored.credential
-        else:
-            token = self.credentials.create(server_url)
-            self.logger.info("sys.auth.credential.created")
+            self.logger.error("sys.db.server_binding.unverified", action="verify_database_and_credential_server")
+            return None
         if binding.server_url != server_url:
-            discarded = await self.discard_server_data(new_server_url=server_url)
+            pending = self.credentials.stage_switch(stored, binding.server_url, server_url)
+            discarded = await self.discard_server_data()
             self.logger.warning(
                 "sys.auth.server_changed", previous=binding.server_url, current=server_url,
                 discarded_records=discarded,
             )
+            self.credentials.save(pending)
+            # A restart or a downgrade between these steps sees an empty, unbound DB.
+            await load_server_binding(server_url, server_url)
+            return pending.credential
+        if stored is not None and stored.server_url == server_url:
+            return stored.credential
+        token = self.credentials.create(server_url)
+        self.logger.info("sys.auth.credential.created")
         return token
 
-    async def discard_server_data(self, *, new_server_url: str | None = None) -> int:
+    async def discard_server_data(self) -> int:
         async with in_transaction() as connection:
             # Children first, as in a settings snapshot.
             for model in (RFIDCard, Producer, Species, WeighingStation, Gateway, CachedDeviceConfiguration):
@@ -463,8 +466,6 @@ class HeadlessClient:
             records = Record.all().using_db(connection)
             discarded = await records.count()
             await records.delete()
-            if new_server_url is not None:
-                await ServerBinding.filter(id=1).using_db(connection).update(server_url=new_server_url)
             # Keep a failed SQLite COMMIT inside the transaction's rollback path.
             await connection.commit()
         self.configuration = DeviceConfiguration()

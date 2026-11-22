@@ -3,7 +3,7 @@ from tortoise import fields
 
 
 class ServerBinding(Model):
-    # The server that owns this database, independent of replaceable credentials.
+    # Removing the shared settings on a server change also clears this ownership.
     id = fields.IntField(primary_key=True, default=1)
     server_url = fields.TextField()
 
