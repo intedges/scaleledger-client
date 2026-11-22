@@ -134,6 +134,21 @@ class StationReceiptWaitTests(unittest.TestCase):
         self.assertIsNone(self.worker.last_event)
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
 
+    def test_cancellation_during_fallback_render_prevents_print_and_completion(self):
+        self.clock.now = 2.1
+        self.assertEqual(self.step("wait_receipt"), WorkerState.PRINT)
+
+        def render(receipt):
+            self.confirm(at=self.clock.now, cancelled_at=self.event.timestamp)
+            return b"unnumbered receipt"
+
+        with patch("suwol1000.ReceiptTemplate.render", side_effect=render):
+            self.assertEqual(self.step("print"), WorkerState.IDLE)
+        self.assertEqual(self.documents(), [])
+        self.assertIsNone(self.worker._completion_at)
+        self.assertIsNone(self.worker.last_event)
+        self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
+
     def test_unrelated_cancellation_cannot_suppress_or_number_this_receipt(self):
         self.confirm(at=0.1, uuid=uuid4(), cancelled_at=self.event.timestamp)
         self.finish()

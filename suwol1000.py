@@ -1784,20 +1784,24 @@ class WeighingStationWorker:
             return None
         return response
 
+    def _skip_cancelled_receipt(self) -> WorkerState:
+        self._completion_at = None
+        self.logger.warning("biz.receipt.cancelled", event_id=self.last_event.uuid)
+        return self._resume_state()
+
     def print(self) -> WorkerState:
         if self.stop_event.is_set() or not self._has_saved_measurement() or self._receipt_attempted:
             return WorkerState.IDLE
         receipt = self._receipt if self._receipt_event_uuid == self.last_event.uuid else None
         result = self._receipt_result
-        if (result is not None and not result.done()
-                and time.monotonic() < result.saved_at + self.RECEIPT_WAIT_SECONDS):
+        pending = result is not None and not result.done()
+        if pending and time.monotonic() < result.saved_at + self.RECEIPT_WAIT_SECONDS:
             return WorkerState.WAIT_RECEIPT
         # A lost response cannot prove that the device did not print this request.
         self._receipt_attempted = True
         server_record = self._confirmed_receipt(result) if result is not None else None
         if server_record is not None and server_record.cancelled_at is not None:
-            self.logger.warning("biz.receipt.cancelled", event_id=self.last_event.uuid)
-            return self._resume_state()
+            return self._skip_cancelled_receipt()
         if server_record is not None and isinstance(receipt, Receipt):
             receipt = dataclasses.replace(
                 receipt, daily_number=server_record.daily_number, number_date=server_record.number_date,
@@ -1821,6 +1825,12 @@ class WeighingStationWorker:
                 daily_number=server_record.daily_number if server_record else None,
             )
             request = PrinterRequestPacket(document_bytes=receipt, copies=self._print_copies)
+            # A cancellation can arrive while rendering the unnumbered receipt.
+            # Check once more at handoff without extending the numbering deadline.
+            if pending:
+                latest = self._confirmed_receipt(result)
+                if latest is not None and latest.cancelled_at is not None:
+                    return self._skip_cancelled_receipt()
             response = self.exchange(request)
             self.logger.info("hw.printer.command.sent")
             if response.printer_status == PrinterStatus.NO_PAPER:
