@@ -246,6 +246,24 @@ class WeighingStationManagerTests(unittest.TestCase):
         for runtime in runtimes:
             runtime.thread.join.assert_called_once_with(timeout=0.1)
 
+    def test_shutdown_during_settings_sync_prevents_another_station_from_starting(self):
+        first = WeighingStation(id=7, name="A", serial_port="COM7")
+        second = WeighingStation(id=8, name="B", serial_port="COM8")
+        with patch("managers.threading.Thread") as thread:
+            self.manager.sync([first])
+            first_worker = self.manager.workers[7].worker
+            # Shutdown lands while sync is constructing station B, before it
+            # publishes B in the registry that the shutdown signal visits.
+            def request_shutdown(**kwargs):
+                self.manager.begin_shutdown()
+                return Mock()
+
+            with patch("managers.SerialClient", side_effect=request_shutdown):
+                self.manager.sync([first, second])
+            self.assertTrue(first_worker.stop_event.is_set())
+            self.assertNotIn(8, self.manager.workers)
+            thread.return_value.start.assert_called_once_with()
+
     def test_stop_worker_remains_registered_until_thread_terminates(self):
         runtime = StationRuntime(Mock(), Mock(is_alive=Mock(return_value=False)), "test-port", "Station")
         runtime.worker.get_telemetry.return_value = StationTelemetrySnapshot()

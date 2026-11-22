@@ -42,6 +42,7 @@ class WeighingStationManager:
         self.on_telemetry = on_telemetry
         self.on_station_removed = on_station_removed
         self.workers: dict[int, StationRuntime] = {}
+        self._shutdown_requested = threading.Event()
         self.configuration = DeviceConfiguration()
         self._sample_sequences: dict[int, int] = {}
         self.logger = get_logger()
@@ -180,6 +181,11 @@ class WeighingStationManager:
             gateway_id=getattr(station, "gateway_id", None),
         )
         self.workers[station.id] = runtime
+        # Register before checking the flag. A concurrent shutdown either sees
+        # this worker in its snapshot or prevents this thread from starting.
+        if self._shutdown_requested.is_set():
+            del self.workers[station.id]
+            return
         if self.on_telemetry is not None:
             try:
                 on_telemetry(worker.get_telemetry())
@@ -223,6 +229,13 @@ class WeighingStationManager:
         self._sample_sequences[station_id] = max(
             self._sample_sequences.get(station_id, 0), runtime.worker.get_telemetry().sample_seq,
         )
+
+    def begin_shutdown(self):
+        # Signal only: settings sync may still own the registry and be joining
+        # a different station. Port interruption and joins run in stop_all().
+        self._shutdown_requested.set()
+        for runtime in self.workers.copy().values():
+            runtime.worker.stop_event.set()
 
     def stop_all(self):
         self.logger.info("sys.manager.station.stop_all.requested")

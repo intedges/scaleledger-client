@@ -1721,10 +1721,8 @@ class WeighingStationWorker:
                     self._save_fault = False
                     self._pending_save = None
                     self._save_result = None
-                    next_state = (
-                        WorkerState.WAIT_RECEIPT if self._receipt_result is not None
-                        else WorkerState.PRINT
-                    )
+                    waiting = self._receipt_result is not None and not self._receipt_result.done()
+                    next_state = WorkerState.WAIT_RECEIPT if waiting else WorkerState.PRINT
                     self.logger.info("hw.weighing.completed", event_id=self._saved_event_uuid, next_state=next_state.name)
                     return next_state
             elif not self._save_delay_reported and (
@@ -1764,13 +1762,7 @@ class WeighingStationWorker:
         return WorkerState.WAIT_RECEIPT
 
     def _confirmed_receipt(self, result: ReceiptFuture) -> RecordReceiptDTO | None:
-        if not result.done():
-            return None
-        try:
-            confirmation = result.result()
-        except Exception:
-            self.logger.exception("biz.receipt.confirmation_failed", event_id=self.last_event.uuid)
-            return None
+        confirmation = result.confirmation
         if confirmation is None:
             return None
         response = confirmation.receipt
@@ -1827,10 +1819,12 @@ class WeighingStationWorker:
             request = PrinterRequestPacket(document_bytes=receipt, copies=self._print_copies)
             # A cancellation can arrive while rendering the unnumbered receipt.
             # Check once more at handoff without extending the numbering deadline.
-            if pending:
+            if result is not None:
                 latest = self._confirmed_receipt(result)
                 if latest is not None and latest.cancelled_at is not None:
                     return self._skip_cancelled_receipt()
+            if self.stop_event.is_set():
+                return self._resume_state()
             response = self.exchange(request)
             self.logger.info("hw.printer.command.sent")
             if response.printer_status == PrinterStatus.NO_PAPER:

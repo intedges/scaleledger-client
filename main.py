@@ -35,7 +35,7 @@ from settings_sync import SettingsSnapshot, load_configuration
 from suwol1000 import PrinterStatus, ZeroRequestError, ZeroResult
 from telemetry import LatestTelemetryBuffer, StationTelemetryPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, scan_peripherals
-from workers import RecordUploadWorker
+from workers import ReceiptWaiters, RecordUploadWorker
 from windows_runtime import WindowsStopEvent, request_stop
 
 
@@ -90,6 +90,7 @@ class HeadlessClient:
         self.market_cache = MarketDataCache()
         self.configuration = DeviceConfiguration()
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._receipt_waiters = ReceiptWaiters()
         self._active_uploader: RecordUploadWorker | None = None
         self.event_queue: asyncio.Queue[tuple[BaseEvent, SaveFuture]] = asyncio.Queue()
         self.telemetry_updates = LatestTelemetryBuffer()
@@ -131,8 +132,7 @@ class HeadlessClient:
                 # No await between commit, upload handoff and acknowledgement.
                 confirmation = None
                 if isinstance(event, WeighingCompletedEvent):
-                    if self._active_uploader is not None:
-                        confirmation = self._active_uploader.expect_receipt(event.uuid)
+                    confirmation = self._receipt_waiters.expect(event.uuid, online=self._active_uploader is not None)
                     self.upload_queue.put_nowait(event.uuid)
                 result.set_result(confirmation)
                 if isinstance(event, WeighingCompletedEvent):
@@ -374,12 +374,16 @@ class HeadlessClient:
 
         # Network restarts must never cancel a local write in progress.
         consumer = asyncio.create_task(self.event_consumer_worker())
+        network = None
         try:
             # A previous server's settings and records must be gone before restoring them.
             ready = self.api_client is not None and await self.prepare_credential()
             await self.restore_local_state()
             if ready:
-                await self.run_network_loop()
+                network = asyncio.create_task(self.run_network_loop())
+                # A pending settings sync can take time to finish on shutdown.
+                # Receive cancellation here before it reaches that task group.
+                await asyncio.shield(network)
             else:
                 if self.api_client is None:
                     self.logger.warning("sys.network.disabled", reason="no_server_url")
@@ -387,14 +391,21 @@ class HeadlessClient:
                 await asyncio.Future()
         finally:
             self._cleanup_started = True
-            await asyncio.to_thread(self.station_manager.stop_all)
-            self._end_upload_session()
-            # Deliver callbacks already submitted by the stopped hardware threads.
-            await asyncio.sleep(0)
-            await self.event_queue.join()
-            consumer.cancel()
-            with suppress(asyncio.CancelledError):
-                await consumer
+            self.station_manager.begin_shutdown()
+            try:
+                if network is not None:
+                    network.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await network
+            finally:
+                await asyncio.to_thread(self.station_manager.stop_all)
+                self._end_upload_session()
+                # Deliver callbacks already submitted by the stopped hardware threads.
+                await asyncio.sleep(0)
+                await self.event_queue.join()
+                consumer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await consumer
 
     async def run_network_loop(self):
         while True:
@@ -515,6 +526,7 @@ class HeadlessClient:
             api_client=self.api_client,
             upload_queue=self.upload_queue,
             access_token=self.access_token,
+            receipt_waiters=self._receipt_waiters,
         )
         self._active_uploader = upload_worker
         try:

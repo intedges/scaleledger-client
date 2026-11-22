@@ -4,6 +4,7 @@ from decimal import Decimal
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
@@ -12,7 +13,8 @@ import httpx2
 
 from main import HeadlessClient
 from models import CachedDeviceConfiguration, Gateway, Producer, Record, RecordUploadResult, RFIDCard, WeighingStation
-from suwol1000 import PrinterRequestPacket, ResponsePacket
+from printer import ReceiptTemplate
+from suwol1000 import PrinterRequestPacket, ResponsePacket, WorkerState
 from weighing_cycle import CycleState
 
 
@@ -173,3 +175,86 @@ class FirstReceiptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await Record.all().count(), 1)
         self.assertEqual(len(self.printed(7)), 1)
         self.assertEqual(self.printed(8), [])
+
+    async def test_shutdown_prevents_print_and_new_weighing_during_slow_settings_cleanup(self):
+        # The fixture has already restored the DB and started the stations.
+        # Let run() own the consumer and network tasks for this shutdown.
+        consumer, = self.tasks
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        self.tasks.clear()
+        self.client.setup = AsyncMock()
+        self.client.restore_local_state = AsyncMock()
+        self.client.prepare_credential = AsyncMock(return_value=True)
+        self.client.wait_for_approval = AsyncMock()
+        self.client.run_active_ws_loop = AsyncMock()
+        self.client.run_telemetry_loop = AsyncMock()
+        posting, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def stalled_upload(request):
+            posting.set()
+            await asyncio.Future()
+
+        async def settings_worker():
+            try:
+                await asyncio.Future()
+            finally:
+                # A cancelled settings refresh waits for its sync thread.
+                cleaning.set()
+                await release.wait()
+
+        self.post.side_effect = stalled_upload
+        self.client.run_settings_sync_worker = settings_worker
+        self.workers[7].RECEIPT_WAIT_SECONDS = 60
+        running = asyncio.create_task(self.client.run())
+        try:
+            await self.wait_until(lambda: self.workers[8].cycle.state == CycleState.WAIT_ENTRY)
+            await self.tag(7, 85)
+            await asyncio.wait_for(posting.wait(), 4)
+            running.cancel()
+            await asyncio.wait_for(cleaning.wait(), 4)
+            self.assertTrue(all(worker.stop_event.is_set() for worker in self.workers.values()))
+            self.workers[7].RECEIPT_WAIT_SECONDS = 0
+            await self.tag(8, 120)
+            runtimes = self.client.station_manager.workers.values()
+            await self.wait_until(lambda: all(not runtime.thread.is_alive() for runtime in runtimes))
+            self.assertEqual(self.printed(7), [])
+            self.assertEqual(await Record.all().values_list("station_id", flat=True), [7])
+        finally:
+            release.set()
+            if not running.cancelling():
+                running.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(running, 4)
+
+    async def test_upload_recovery_during_offline_receipt_render_can_still_cancel_print(self):
+        loop = asyncio.get_running_loop()
+        rendering = asyncio.Event()
+        release = threading.Event()
+        render_original = ReceiptTemplate.render
+
+        def delay_render(receipt):
+            loop.call_soon_threadsafe(rendering.set)
+            if not release.wait(4):
+                raise TimeoutError("offline receipt render was not released")
+            return render_original(receipt)
+
+        def cancelled(request):
+            record = self.confirm(request).json()
+            return httpx2.Response(200, json=record | {"cancelled_at": record["measured_at"]})
+
+        self.post.side_effect = cancelled
+        with patch.object(ReceiptTemplate, "render", side_effect=delay_render):
+            try:
+                await self.tag(7, 85)
+                await asyncio.wait_for(rendering.wait(), 4)
+                self.start_uploads()
+                await asyncio.wait_for(self.client.upload_queue.join(), 4)
+                result = await RecordUploadResult.get()
+                self.assertIsNotNone(result.cancelled_at)
+            finally:
+                release.set()
+            await self.wait_until(lambda: self.workers[7].state == WorkerState.IDLE)
+        self.assertEqual(self.printed(7), [])
+        self.assertIsNone(self.workers[7]._completion_at)
+        self.assertEqual(self.workers[7].cycle.state, CycleState.LOCKED)

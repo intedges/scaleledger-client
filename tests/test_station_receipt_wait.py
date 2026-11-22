@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
 
 from api import RecordReceiptDTO
-from events import ReceiptConfirmation, ReceiptFuture
+from events import ReceiptFuture
 from printer import Receipt
 from suwol1000 import (
     DeviceResponseTimeout, PrinterRequestPacket, VoiceCode, WeighingStationWorker, WorkerState,
@@ -58,7 +58,8 @@ class StationReceiptWaitTests(unittest.TestCase):
         return self.worker.state
 
     def confirm(self, at, **changes):
-        self.confirmation.set_result(ReceiptConfirmation(replace(self.response, **changes), at))
+        with patch("events.time.monotonic", return_value=at):
+            self.confirmation.observe(replace(self.response, **changes))
 
     def finish(self):
         self.assertEqual(self.step("wait_receipt"), WorkerState.PRINT)
@@ -195,4 +196,11 @@ class StationReceiptWaitTests(unittest.TestCase):
         self.confirm(at=0.1)
         self.worker.run()
         self.worker.print()
+        self.assertEqual(self.documents(), [])
+
+    def test_shutdown_signal_during_printer_preparation_suppresses_handoff(self):
+        self.confirm(at=0.1)
+        self.assertEqual(self.step("wait_receipt"), WorkerState.PRINT)
+        self.worker.logger.info.side_effect = lambda *args, **kwargs: self.worker.stop_event.set()
+        self.assertEqual(self.step("print"), WorkerState.IDLE)
         self.assertEqual(self.documents(), [])
