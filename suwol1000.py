@@ -19,8 +19,9 @@ import serial
 import structlog
 from structlog.stdlib import get_logger
 
+from api import RecordReceiptDTO
 from device_configuration import DeviceConfiguration
-from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
+from events import BaseEvent, ReceiptFuture, RFIDTaggedEvent, SaveFuture, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog
 from printer import Receipt, ReceiptTemplate
 from reprint import ReprintRequestError
@@ -498,6 +499,7 @@ class WorkerState(Enum):
     VERIFY = auto()
     MEASURE = auto()
     SAVE = auto()
+    WAIT_RECEIPT = auto()
     PRINT = auto()
     RECOVER = auto()
 
@@ -565,6 +567,7 @@ class _ReprintRequest:
 
 
 class WeighingStationWorker:
+    RECEIPT_WAIT_SECONDS = 2.0
     ZERO_HOLD_SECONDS = 1.5
     ZERO_RELEASE_TIMEOUT = 2.0
     # An operational recovery policy, not a firmware maximum start delay.
@@ -574,9 +577,9 @@ class WeighingStationWorker:
     def __init__(
         self,
         serial_client: SerialClient,
-        on_event: Callable[[BaseEvent], Future[None] | None] | None = None,
+        on_event: Callable[[BaseEvent], SaveFuture | None] | None = None,
         rfid_validator: Callable[[RFIDTaggedEvent], bool] | None = None,
-        receipt_builder: Callable[[WeighingCompletedEvent], bytes | None] | None = None,
+        receipt_builder: Callable[[WeighingCompletedEvent], Receipt | bytes | None] | None = None,
         polling_interval: float = 0.1,
         retry_interval: float = 1.0,
         initial_sample_seq: int = 0,
@@ -661,9 +664,10 @@ class WeighingStationWorker:
         self.last_plate = ""
         self.last_event: BaseEvent | None = None
         self._pending_save: WeighingCompletedEvent | None = None
-        self._save_result: Future[None] | None = None
+        self._save_result: SaveFuture | None = None
         self._saved_event_uuid: str | None = None
-        self._receipt_bytes: bytes | None = None
+        self._receipt: Receipt | bytes | None = None
+        self._receipt_result: ReceiptFuture | None = None
         self._receipt_event_uuid: str | None = None
         self._receipt_attempted = False
         self._print_copies = self.configuration.print_copies
@@ -718,7 +722,10 @@ class WeighingStationWorker:
             or self._zero_request is not None
             or self._zero_active or self._zero_release_pending
             or self._reprint_request is not None
-            or self.state in (WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.SAVE, WorkerState.PRINT)
+            or self.state in (
+                WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.SAVE,
+                WorkerState.WAIT_RECEIPT, WorkerState.PRINT,
+            )
             or not self.cycle.can_reconfigure(now=time.monotonic())
         ):
             return
@@ -1109,6 +1116,8 @@ class WeighingStationWorker:
                         self.state = self.measure()
                     case WorkerState.SAVE:
                         self.state = self.save()
+                    case WorkerState.WAIT_RECEIPT:
+                        self.state = self.wait_receipt()
                     case WorkerState.PRINT:
                         self.state = self.print()
                     case WorkerState.RECOVER:
@@ -1151,6 +1160,8 @@ class WeighingStationWorker:
                 event_id=self._pending_save.uuid,
                 action="check_local_save_result_before_reweighing",
             )
+        elif self._has_saved_measurement() and not self._receipt_attempted:
+            self.logger.warning("biz.receipt.interrupted_before_print", event_id=self._saved_event_uuid)
         self.client.disconnect()
         self._set_connection_status("disconnected")
         self.logger.info("sys.worker.terminated")
@@ -1170,7 +1181,8 @@ class WeighingStationWorker:
             return
         self._set_connection_status("disconnected" if isinstance(exc, serial.SerialException) else "error")
         during_weighing = self.state in (
-            WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.SAVE, WorkerState.PRINT,
+            WorkerState.VERIFY, WorkerState.MEASURE, WorkerState.SAVE,
+            WorkerState.WAIT_RECEIPT, WorkerState.PRINT,
         )
         context = {}
         if during_weighing:
@@ -1461,6 +1473,10 @@ class WeighingStationWorker:
         if self._pending_save is not None:
             self._processing = True
             return WorkerState.SAVE
+        # Port recovery abandons an interrupted first issue. An old receipt
+        # must not come out for a different load when the scale is reconnected.
+        if self._receipt_result is not None and not self._receipt_attempted:
+            self.logger.warning("biz.receipt.interrupted_before_print", event_id=self._saved_event_uuid)
         self._processing = False
         # Never resume a card interrupted by an I/O fault, or recreate a saved record.
         if self.cycle.state == CycleState.RESERVED:
@@ -1469,7 +1485,8 @@ class WeighingStationWorker:
         self.last_plate = ""
         self.last_event = None
         self._saved_event_uuid = None
-        self._receipt_bytes = None
+        self._receipt = None
+        self._receipt_result = None
         self._receipt_event_uuid = None
         return WorkerState.IDLE
 
@@ -1652,10 +1669,10 @@ class WeighingStationWorker:
             self._print_copies = self.configuration.print_copies
             self._receipt_event_uuid = self._pending_save.uuid
             self._receipt_attempted = False
-            self._receipt_bytes = None
+            self._receipt = None
             if self.receipt_builder is not None:
                 try:
-                    self._receipt_bytes = self.receipt_builder(self._pending_save)
+                    self._receipt = self.receipt_builder(self._pending_save)
                 except Exception:
                     # A rendering failure must never prevent storing the measurement.
                     self.logger.exception(
@@ -1692,11 +1709,11 @@ class WeighingStationWorker:
         if self._save_result is None and time.monotonic() >= self._save_retry_at:
             self._submit_save()
         if self._save_result is not None:
-            # The local write usually takes milliseconds; print as soon as it is confirmed.
+            # An upload outcome can never acknowledge the local write.
             wait((self._save_result,), timeout=self.polling_interval)
             if self._save_result.done():
                 try:
-                    self._save_result.result()
+                    self._receipt_result = self._save_result.result()
                 except Exception as exc:
                     self._save_failed(exc)
                 else:
@@ -1704,8 +1721,10 @@ class WeighingStationWorker:
                     self._save_fault = False
                     self._pending_save = None
                     self._save_result = None
-                    self.logger.info("hw.weighing.completed", next_state="PRINT")
-                    return WorkerState.PRINT
+                    waiting = self._receipt_result is not None and not self._receipt_result.done()
+                    next_state = WorkerState.WAIT_RECEIPT if waiting else WorkerState.PRINT
+                    self.logger.info("hw.weighing.completed", event_id=self._saved_event_uuid, next_state=next_state.name)
+                    return next_state
             elif not self._save_delay_reported and (
                 time.monotonic() - self._save_started_at >= self.save_warning_interval
             ):
@@ -1728,22 +1747,84 @@ class WeighingStationWorker:
             and self._saved_event_uuid == self.last_event.uuid
         )
 
+    def wait_receipt(self) -> WorkerState:
+        result = self._receipt_result
+        if result is None:
+            return WorkerState.PRINT
+        deadline = result.saved_at + self.RECEIPT_WAIT_SECONDS
+        # Wake for an early reply. Between checks keep sampling the scale and
+        # updating lamps/voice, without accepting a second tag for this visit.
+        wait((result,), timeout=max(0, min(self.polling_interval, deadline - time.monotonic())))
+        if result.done() or time.monotonic() >= deadline:
+            return WorkerState.PRINT
+        if not self.stop_event.is_set():
+            self._poll()
+        return WorkerState.WAIT_RECEIPT
+
+    def _confirmed_receipt(self, result: ReceiptFuture) -> RecordReceiptDTO | None:
+        confirmation = result.confirmation
+        if confirmation is None:
+            return None
+        response = confirmation.receipt
+        if str(response.uuid) != self.last_event.uuid or response.station_id != self.last_event.station_id:
+            self.logger.error("biz.receipt.confirmation_mismatch", event_id=self.last_event.uuid)
+            return None
+        # A slow serial poll can finish after the cutoff. Use the time the
+        # result was published. Always honor a known cancellation before I/O.
+        deadline = result.saved_at + self.RECEIPT_WAIT_SECONDS
+        if response.cancelled_at is None and confirmation.received_at > deadline:
+            return None
+        return response
+
+    def _skip_cancelled_receipt(self) -> WorkerState:
+        self._completion_at = None
+        self.logger.warning("biz.receipt.cancelled", event_id=self.last_event.uuid)
+        return self._resume_state()
+
     def print(self) -> WorkerState:
         if self.stop_event.is_set() or not self._has_saved_measurement() or self._receipt_attempted:
             return WorkerState.IDLE
+        receipt = self._receipt if self._receipt_event_uuid == self.last_event.uuid else None
+        result = self._receipt_result
+        pending = result is not None and not result.done()
+        if pending and time.monotonic() < result.saved_at + self.RECEIPT_WAIT_SECONDS:
+            return WorkerState.WAIT_RECEIPT
         # A lost response cannot prove that the device did not print this request.
         self._receipt_attempted = True
+        server_record = self._confirmed_receipt(result) if result is not None else None
+        if server_record is not None and server_record.cancelled_at is not None:
+            return self._skip_cancelled_receipt()
+        if server_record is not None and isinstance(receipt, Receipt):
+            receipt = dataclasses.replace(
+                receipt, daily_number=server_record.daily_number, number_date=server_record.number_date,
+            )
         # The record is saved, so completion is announced even if output fails,
         # unless a delayed save outlasted the visit and the next one may begin.
         announce = self.cycle.state == CycleState.LOCKED
         if announce:
             self._completion_at = time.monotonic()
             self._completion_announced = False
-        receipt_bytes = self._receipt_bytes if self._receipt_event_uuid == self.last_event.uuid else None
+        if isinstance(receipt, Receipt):
+            try:
+                receipt = ReceiptTemplate.render(receipt)
+            except Exception:
+                self.logger.exception("biz.receipt.render_failed", event_id=self.last_event.uuid)
+                return self._resume_state()
 
-        if receipt_bytes:
-            self.logger.info("hw.printer.command.sending", payload_length = len(receipt_bytes))
-            request = PrinterRequestPacket(document_bytes=receipt_bytes, copies=self._print_copies)
+        if receipt and not self.stop_event.is_set():
+            self.logger.info(
+                "hw.printer.command.sending", event_id=self.last_event.uuid, payload_length=len(receipt),
+                daily_number=server_record.daily_number if server_record else None,
+            )
+            request = PrinterRequestPacket(document_bytes=receipt, copies=self._print_copies)
+            # A cancellation can arrive while rendering the unnumbered receipt.
+            # Check once more at handoff without extending the numbering deadline.
+            if result is not None:
+                latest = self._confirmed_receipt(result)
+                if latest is not None and latest.cancelled_at is not None:
+                    return self._skip_cancelled_receipt()
+            if self.stop_event.is_set():
+                return self._resume_state()
             response = self.exchange(request)
             self.logger.info("hw.printer.command.sent")
             if response.printer_status == PrinterStatus.NO_PAPER:

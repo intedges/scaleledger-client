@@ -1,10 +1,14 @@
 import asyncio
+from weakref import WeakValueDictionary
 
 import httpx2
 from structlog.stdlib import get_logger
 from tortoise.exceptions import OperationalError
 
-from api import APIClient, AuthDegradedError, InvalidRecordResponse, MismatchedRecordResponse, RecordCreateDTO
+from api import (
+    APIClient, AuthDegradedError, InvalidRecordResponse, MismatchedRecordResponse, RecordCreateDTO, RecordReceiptDTO,
+)
+from events import ReceiptFuture
 from models import Record, RecordUploadResult
 
 
@@ -27,14 +31,43 @@ def _is_record_validation_error(response: httpx2.Response) -> bool:
     return False
 
 
+class ReceiptWaiters:
+    def __init__(self):
+        # Network sessions and upload retries may change before a station can print.
+        # Only that station's pending first issue keeps its ticket alive.
+        self.by_uuid: WeakValueDictionary[str, ReceiptFuture] = WeakValueDictionary()
+
+    def expect(self, record_uuid: str, *, online: bool) -> ReceiptFuture:
+        future = self.by_uuid.get(record_uuid)
+        if future is None:
+            future = ReceiptFuture()
+            self.by_uuid[record_uuid] = future
+        if not online:
+            future.observe(None)
+        return future
+
+    def publish(self, record_uuid: str, receipt: RecordReceiptDTO | None = None):
+        future = self.by_uuid.get(record_uuid)
+        if future is not None:
+            future.observe(receipt)
+
+
 class RecordUploadWorker:
-    def __init__(self, api_client: APIClient, upload_queue: asyncio.Queue[str], access_token: str):
+    def __init__(
+        self, api_client: APIClient, upload_queue: asyncio.Queue[str], access_token: str,
+        *, receipt_waiters: ReceiptWaiters | None = None,
+    ):
         self.api_client = api_client
         self.upload_queue = upload_queue
         self.access_token = access_token
         self.logger = get_logger()
         self.retry_delay = 5.0
         self.upload_timeout = 30.0
+        self.receipt_waiters = receipt_waiters if receipt_waiters is not None else ReceiptWaiters()
+
+    def release_receipt_waiters(self):
+        for future in self.receipt_waiters.by_uuid.values():
+            future.observe(None)
 
     async def run(self):
         self.logger.info("sys.worker.record_upload.started")
@@ -80,6 +113,18 @@ class RecordUploadWorker:
     async def _upload_pending(self, record_uuid: str):
         record = await Record.pending_uploads().get_or_none(uuid=record_uuid)
         if record is None:
+            # A previous enqueue may already have committed this UUID. Return
+            # its original confirmation to a current waiter without another POST.
+            if record_uuid in self.receipt_waiters.by_uuid:
+                saved = await RecordUploadResult.get_or_none(record_id=record_uuid).select_related("record")
+                receipt = None
+                if saved is not None and saved.error is None:
+                    receipt = RecordReceiptDTO(
+                        uuid=saved.record_id, station_id=saved.record.station_id,
+                        weight=saved.weight, measured_at=saved.measured_at, cancelled_at=saved.cancelled_at,
+                        daily_number=saved.daily_number, number_date=saved.number_date,
+                    )
+                self.receipt_waiters.publish(record_uuid, receipt)
             return
 
         request = RecordCreateDTO(
@@ -97,6 +142,9 @@ class RecordUploadWorker:
         except MismatchedRecordResponse as exc:
             error = str(exc)
         else:
+            # The server has committed this UUID. A slow or failed write to our
+            # response cache must not hide a known cancellation or issued number.
+            self.receipt_waiters.publish(record_uuid, receipt)
             await RecordUploadResult.create(
                 record_id=record.uuid,
                 weight=receipt.weight,
@@ -112,9 +160,11 @@ class RecordUploadWorker:
             )
             return
 
+        self.receipt_waiters.publish(record_uuid)
         await RecordUploadResult.create(record_id=record.uuid, error=error)
         self.logger.error("biz.record.upload_needs_review", uuid=record_uuid, error=error)
 
     async def _wait_before_retry(self, record_uuid: str):
+        self.receipt_waiters.publish(record_uuid)
         self.logger.info("sys.worker.record_upload.requeue", uuid=record_uuid, delay=self.retry_delay)
         await asyncio.sleep(self.retry_delay)

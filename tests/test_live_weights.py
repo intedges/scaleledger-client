@@ -99,7 +99,7 @@ class StationTelemetrySnapshotTests(unittest.TestCase):
         self.worker.last_event = completed
         self.worker._saved_event_uuid = completed.uuid
         self.worker._receipt_event_uuid = completed.uuid
-        self.worker._receipt_bytes = b"receipt"
+        self.worker._receipt = b"receipt"
         self.worker._processing = True
         self.worker.print()
         self.worker.idle()

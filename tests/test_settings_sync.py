@@ -352,7 +352,8 @@ class SettingsCommitFailureTests(unittest.IsolatedAsyncioTestCase):
             consumer = asyncio.create_task(client.event_consumer_worker())
             try:
                 ack = client.handle_hardware_event(event)
-                self.assertIsNone(await asyncio.wait_for(asyncio.wrap_future(ack), timeout=1))
+                receipt = await asyncio.wait_for(asyncio.wrap_future(ack), timeout=1)
+                self.assertIsNone(receipt.result(timeout=0))
                 self.assertEqual(client.upload_queue.get_nowait(), event.uuid)
             finally:
                 consumer.cancel()

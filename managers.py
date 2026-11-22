@@ -1,14 +1,16 @@
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
+from decimal import Decimal
 import threading
+from uuid import UUID
 
 from structlog.stdlib import get_logger
 
-from cache import MarketDataCache
+from cache import MarketDataCache, RFIDInfo
 from device_configuration import DeviceConfiguration
-from events import BaseEvent, RFIDTaggedEvent, WeighingCompletedEvent
-from printer import Receipt, ReceiptTemplate
+from events import BaseEvent, RFIDTaggedEvent, SaveFuture, WeighingCompletedEvent
+from printer import Receipt
 from reprint import ReprintRequestError
 from models import WeighingStation
 from suwol1000 import (
@@ -29,7 +31,7 @@ class StationRuntime:
 class WeighingStationManager:
     def __init__(
         self,
-        on_event: Callable[[BaseEvent], Future[None] | None],
+        on_event: Callable[[BaseEvent], SaveFuture | None],
         market_cache: MarketDataCache,
         *,
         on_telemetry: Callable[[int, StationTelemetrySnapshot], None] | None = None,
@@ -40,6 +42,7 @@ class WeighingStationManager:
         self.on_telemetry = on_telemetry
         self.on_station_removed = on_station_removed
         self.workers: dict[int, StationRuntime] = {}
+        self._shutdown_requested = threading.Event()
         self.configuration = DeviceConfiguration()
         self._sample_sequences: dict[int, int] = {}
         self.logger = get_logger()
@@ -124,31 +127,36 @@ class WeighingStationManager:
 
     def start_worker(self, station: WeighingStation):
         self.logger.info("sys.manager.station.start", station_id=station.id, port=station.serial_port)
-        
-        def validate_rfid(event: RFIDTaggedEvent) -> bool:
-            info = self.market_cache.get_rfid_info(event.rfid_card_uid)
-            if not info:
-                return False
-            return info.is_active
 
-        def build_receipt(event: WeighingCompletedEvent) -> bytes | None:
+        accepted_card: tuple[str, RFIDInfo] | None = None
+
+        def validate_rfid(event: RFIDTaggedEvent) -> bool:
+            nonlocal accepted_card
+            info = self.market_cache.get_rfid_info(event.rfid_card_uid)
+            accepted_card = (event.rfid_card_uid, info) if info and info.is_active else None
+            return accepted_card is not None
+
+        def build_receipt(event: WeighingCompletedEvent) -> Receipt:
+            nonlocal accepted_card
             snapshot = self.market_cache.snapshot
-            info = snapshot.get_rfid_info(event.rfid_card_uid)
-            if not info:
-                return None
-                
-            receipt = Receipt(
-                record_uuid=event.uuid,
+            # A settings refresh may change or remove the validated card before MEASURE.
+            if accepted_card and accepted_card[0] == event.rfid_card_uid:
+                info = accepted_card[1]
+            else:
+                info = snapshot.get_rfid_info(event.rfid_card_uid)
+            accepted_card = None
+            return Receipt(
+                record_uuid=UUID(event.uuid),
+                source_station_id=event.station_id,
                 gateway_name=snapshot.gateway_name,
                 station_name=runtime.station_name,
                 rfid_card_uid=event.rfid_card_uid,
-                producer_name=info.producer_name,
-                species_name=info.species_name,
-                weight=event.weight,
+                producer_name=info.producer_name if info else "",
+                species_name=info.species_name if info else "",
+                weight=Decimal(event.weight),
                 measured_at=event.timestamp,
                 auction_name=runtime.worker.configuration.auction_name,
             )
-            return ReceiptTemplate.render(receipt)
 
         def on_telemetry(snapshot: StationTelemetrySnapshot):
             self.on_telemetry(station.id, snapshot)
@@ -173,6 +181,11 @@ class WeighingStationManager:
             gateway_id=getattr(station, "gateway_id", None),
         )
         self.workers[station.id] = runtime
+        # Register before checking the flag. A concurrent shutdown either sees
+        # this worker in its snapshot or prevents this thread from starting.
+        if self._shutdown_requested.is_set():
+            del self.workers[station.id]
+            return
         if self.on_telemetry is not None:
             try:
                 on_telemetry(worker.get_telemetry())
@@ -216,6 +229,13 @@ class WeighingStationManager:
         self._sample_sequences[station_id] = max(
             self._sample_sequences.get(station_id, 0), runtime.worker.get_telemetry().sample_seq,
         )
+
+    def begin_shutdown(self):
+        # Signal only: settings sync may still own the registry and be joining
+        # a different station. Port interruption and joins run in stop_all().
+        self._shutdown_requested.set()
+        for runtime in self.workers.copy().values():
+            runtime.worker.stop_event.set()
 
     def stop_all(self):
         self.logger.info("sys.manager.station.stop_all.requested")

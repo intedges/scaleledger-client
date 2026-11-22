@@ -120,6 +120,10 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.locks.append(connection)
         return connection
 
+    def assert_offline_acknowledged(self, acknowledgment):
+        receipt = acknowledgment.result(timeout=0)
+        self.assertIsNone(receipt.result(timeout=0))
+
     def assert_no_completion(self):
         self.assertFalse(any(isinstance(request, PrinterRequestPacket) for request in self.scale.requests))
         for request in self.scale.requests:
@@ -170,7 +174,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         lock.rollback()
         await self.drain()
-        self.assertIsNone(acknowledgment.result(timeout=0))
+        self.assert_offline_acknowledged(acknowledgment)
         self.assert_committed_record(event)
         await self.finish_save()
         self.worker.print()
@@ -229,7 +233,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         acknowledgment = self.submit(event)
         await self.drain()
 
-        self.assertIsNone(acknowledgment.result(timeout=0))
+        self.assert_offline_acknowledged(acknowledgment)
         self.assert_committed_record(event)
         self.assertEqual(self.client.upload_queue.get_nowait(), event.uuid)
 
@@ -292,7 +296,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await self.drain()
 
         for event, acknowledgment in zip(events, acknowledgments):
-            self.assertIsNone(acknowledgment.result(timeout=0))
+            self.assert_offline_acknowledged(acknowledgment)
             self.assertEqual((await Record.get(uuid=event.uuid)).station_id, event.station_id)
         self.assertEqual(await Record.all().count(), 2)
         self.assertEqual(self.client.upload_queue.qsize(), 2)
@@ -305,7 +309,9 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
             return replace(receipt, daily_number=27)
 
         api = Mock(create_record=AsyncMock(side_effect=accept_record))
-        uploader = RecordUploadWorker(api, self.client.upload_queue, "cached-token")
+        uploader = RecordUploadWorker(
+            api, self.client.upload_queue, "cached-token", receipt_waiters=self.client._receipt_waiters,
+        )
         uploader.logger = Mock()
         self.start(uploader.run())
         await asyncio.wait_for(self.client.upload_queue.join(), timeout=2)
@@ -320,7 +326,7 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         event, acknowledgment = await self.start_measurement()
         await self.drain()
         self.assertIsNone(self.client.api_client)
-        self.assertIsNone(acknowledgment.result(timeout=0))
+        self.assert_offline_acknowledged(acknowledgment)
         self.assert_committed_record(event)
 
         await self.finish_save()
@@ -330,16 +336,18 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(isinstance(request, PrinterRequestPacket) for request in self.scale.requests), 1)
         self.assertTrue(await Record.filter(uuid=event.uuid).exists())
 
-    async def test_confirmation_before_station_observes_ack_prints_once_and_preserves_original(self):
+    async def test_offline_save_followed_by_upload_before_print_does_not_queue_an_extra_copy(self):
         self.start_consumer()
         api = Mock(create_record=AsyncMock(side_effect=accepted_receipt))
-        uploader = RecordUploadWorker(api, self.client.upload_queue, "cached-token")
+        uploader = RecordUploadWorker(
+            api, self.client.upload_queue, "cached-token", receipt_waiters=self.client._receipt_waiters,
+        )
         uploader.logger = Mock()
-        self.start(uploader.run())
         event, acknowledgment = await self.start_measurement()
         await self.drain()
+        self.start(uploader.run())
         await asyncio.wait_for(self.client.upload_queue.join(), timeout=2)
-        self.assertIsNone(acknowledgment.result(timeout=0))
+        self.assert_offline_acknowledged(acknowledgment)
         result = await RecordUploadResult.get(record_id=event.uuid)
         self.assertEqual(result.weight, event.weight)
         self.assertEqual(result.daily_number, 18)
@@ -395,6 +403,6 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         lock.rollback()
         with self.assertRaises(asyncio.CancelledError):
             await asyncio.wait_for(running, timeout=2)
-        self.assertIsNone(acknowledgment.result(timeout=0))
+        self.assert_offline_acknowledged(acknowledgment)
         self.assert_committed_record(event)
         await self.drain()

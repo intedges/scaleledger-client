@@ -1,8 +1,9 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Self
+import json
 import uuid
 
 
@@ -185,12 +186,20 @@ class Receipt:
     weight: Decimal
     measured_at: datetime
     auction_name: str = ""
+    source_station_id: int | None = None
+    daily_number: int | None = None
+    number_date: date | None = None
 
 
 class ReceiptTemplate:
     @staticmethod
     def render(receipt: Receipt) -> bytes:
-        short_uuid = str(receipt.record_uuid).split("-")[0].upper()
+        record_id = str(receipt.record_uuid)
+        qr_data = record_id
+        if receipt.source_station_id is not None:
+            qr_data = json.dumps(
+                {"uuid": record_id, "station_id": receipt.source_station_id}, separators=(",", ":"),
+            )
 
         builder = (
             EscPosBuilder()
@@ -207,13 +216,19 @@ class ReceiptTemplate:
         if receipt.auction_name:
             builder.add_wrapped_text(receipt.auction_name).feed_lines(1)
 
+        numbered = receipt.daily_number is not None and receipt.number_date is not None
+        number_label = f"계량번호 {receipt.daily_number}번" if numbered else "계량번호 미확인"
+        builder.set_quadruple(True).set_bold(True).add_text(number_label).feed_lines(1)
+        builder.set_quadruple(False).set_bold(False)
+        if numbered:
+            builder.add_text(f"기준일 {receipt.number_date.isoformat()}").feed_lines(1)
+
         builder = (
             builder
             # Meta Data
             .set_align(Alignment.LEFT)
             .add_separator("=", 42)
-            .add_kv("발행일시", receipt.measured_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
-            .add_kv("전표번호", short_uuid)
+            .add_kv("계량일시", receipt.measured_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
             .add_kv("계 량 기", receipt.gateway_name)
             .add_kv("계 근 대", receipt.station_name)
             .add_separator("-", 42)
@@ -235,6 +250,9 @@ class ReceiptTemplate:
             # Footer
             .set_align(Alignment.CENTER)
             .add_separator("=", 42)
+            .add_text("원본 UUID").feed_lines(1)
+            .add_text(record_id).feed_lines(2)
+            .add_qr_code(qr_data, size=4).feed_lines(2)
             .add_text("SUWOL ScaleLedger System")
 
             .cut()

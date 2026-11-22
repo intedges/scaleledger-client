@@ -26,7 +26,7 @@ from credential import CredentialError, CredentialStore
 from device_configuration import DeviceConfiguration
 from paths import AppPaths, program_dir
 from reprint import ReprintRequest, ReprintRequestError
-from events import BaseEvent, WeighingCompletedEvent
+from events import BaseEvent, SaveFuture, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
 from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
@@ -35,7 +35,7 @@ from settings_sync import SettingsSnapshot, load_configuration
 from suwol1000 import PrinterStatus, ZeroRequestError, ZeroResult
 from telemetry import LatestTelemetryBuffer, StationTelemetryPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, scan_peripherals
-from workers import RecordUploadWorker
+from workers import ReceiptWaiters, RecordUploadWorker
 from windows_runtime import WindowsStopEvent, request_stop
 
 
@@ -90,7 +90,9 @@ class HeadlessClient:
         self.market_cache = MarketDataCache()
         self.configuration = DeviceConfiguration()
         self.upload_queue: asyncio.Queue[str] = asyncio.Queue()
-        self.event_queue: asyncio.Queue[tuple[BaseEvent, Future[None]]] = asyncio.Queue()
+        self._receipt_waiters = ReceiptWaiters()
+        self._active_uploader: RecordUploadWorker | None = None
+        self.event_queue: asyncio.Queue[tuple[BaseEvent, SaveFuture]] = asyncio.Queue()
         self.telemetry_updates = LatestTelemetryBuffer()
         self.station_manager = WeighingStationManager(
             on_event=self.handle_hardware_event,
@@ -106,8 +108,8 @@ class HeadlessClient:
         log = self.logger.debug if self.network_failures.failing else self.logger.info
         log(event, **kw)
 
-    def handle_hardware_event(self, event: BaseEvent) -> Future[None]:
-        result: Future[None] = Future()
+    def handle_hardware_event(self, event: BaseEvent) -> SaveFuture:
+        result: SaveFuture = Future()
         # A station stopping must not cancel a write already handed to the queue.
         result.set_running_or_notify_cancel()
         self.main_loop.call_soon_threadsafe(self.event_queue.put_nowait, (event, result))
@@ -128,9 +130,11 @@ class HeadlessClient:
                 )
             else:
                 # No await between commit, upload handoff and acknowledgement.
+                confirmation = None
                 if isinstance(event, WeighingCompletedEvent):
+                    confirmation = self._receipt_waiters.expect(event.uuid, online=self._active_uploader is not None)
                     self.upload_queue.put_nowait(event.uuid)
-                result.set_result(None)
+                result.set_result(confirmation)
                 if isinstance(event, WeighingCompletedEvent):
                     self.logger.info("biz.record.saved", uuid=event.uuid, weight=event.weight)
             finally:
@@ -370,12 +374,16 @@ class HeadlessClient:
 
         # Network restarts must never cancel a local write in progress.
         consumer = asyncio.create_task(self.event_consumer_worker())
+        network = None
         try:
             # A previous server's settings and records must be gone before restoring them.
             ready = self.api_client is not None and await self.prepare_credential()
             await self.restore_local_state()
             if ready:
-                await self.run_network_loop()
+                network = asyncio.create_task(self.run_network_loop())
+                # A pending settings sync can take time to finish on shutdown.
+                # Receive cancellation here before it reaches that task group.
+                await asyncio.shield(network)
             else:
                 if self.api_client is None:
                     self.logger.warning("sys.network.disabled", reason="no_server_url")
@@ -383,13 +391,21 @@ class HeadlessClient:
                 await asyncio.Future()
         finally:
             self._cleanup_started = True
-            await asyncio.to_thread(self.station_manager.stop_all)
-            # Deliver callbacks already submitted by the stopped hardware threads.
-            await asyncio.sleep(0)
-            await self.event_queue.join()
-            consumer.cancel()
-            with suppress(asyncio.CancelledError):
-                await consumer
+            self.station_manager.begin_shutdown()
+            try:
+                if network is not None:
+                    network.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await network
+            finally:
+                await asyncio.to_thread(self.station_manager.stop_all)
+                self._end_upload_session()
+                # Deliver callbacks already submitted by the stopped hardware threads.
+                await asyncio.sleep(0)
+                await self.event_queue.join()
+                consumer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await consumer
 
     async def run_network_loop(self):
         while True:
@@ -510,12 +526,26 @@ class HeadlessClient:
             api_client=self.api_client,
             upload_queue=self.upload_queue,
             access_token=self.access_token,
+            receipt_waiters=self._receipt_waiters,
         )
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self.run_settings_sync_worker())
-            tg.create_task(self.run_active_ws_loop())
-            tg.create_task(upload_worker.run())
-            tg.create_task(self.run_telemetry_loop())
+        self._active_uploader = upload_worker
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self.run_settings_sync_worker())
+                tg.create_task(self.run_active_ws_loop())
+                tg.create_task(upload_worker.run())
+                tg.create_task(self.run_telemetry_loop())
+        finally:
+            # Losing an authenticated session releases waiting stations to
+            # print offline. Process shutdown must stop the serial owners first.
+            if not asyncio.current_task().cancelling():
+                self._end_upload_session()
+
+    def _end_upload_session(self):
+        uploader = self._active_uploader
+        self._active_uploader = None
+        if uploader is not None:
+            uploader.release_receipt_waiters()
 
     async def run_telemetry_loop(self):
         if self._telemetry_stop_code is not None:

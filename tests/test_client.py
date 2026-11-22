@@ -259,6 +259,85 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await RecordUploadResult.get(record_id=record.uuid)).daily_number, 18)
         self.manager.stop_all.assert_not_called()
 
+    async def test_local_ack_is_independent_of_the_committed_receipt_for_each_station(self):
+        await self.cached_setup()
+        self.online_responses()
+        allow_response = asyncio.Event()
+        posting = asyncio.Event()
+
+        async def delayed_response(**kwargs):
+            posting.set()
+            await allow_response.wait()
+            return accepted_receipt(**kwargs)
+
+        self.api.create_record.side_effect = delayed_response
+        self.start(self.client.run())
+        await self.wait_for(self.settings_synced.wait())
+        events = [
+            WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=23),
+            WeighingCompletedEvent(station_id=7, rfid_card_uid="87654321", weight=38),
+        ]
+        local_acks = [self.client.handle_hardware_event(event) for event in events]
+        tickets = [await self.wait_for(asyncio.wrap_future(ack)) for ack in local_acks]
+        await self.wait_for(posting.wait())
+        self.assertEqual(await Record.all().count(), 2)
+        self.assertEqual(await RecordUploadResult.all().count(), 0)
+        self.assertTrue(all(not ticket.done() for ticket in tickets))
+
+        allow_response.set()
+        await self.wait_for(self.client.upload_queue.join())
+        for ticket, event in zip(tickets, events):
+            confirmation = ticket.result(timeout=0)
+            self.assertLessEqual(ticket.saved_at, confirmation.received_at)
+            self.assertEqual(str(confirmation.receipt.uuid), event.uuid)
+            self.assertEqual(confirmation.receipt.station_id, event.station_id)
+            row = await RecordUploadResult.get(record_id=event.uuid)
+            self.assertEqual((row.weight, row.daily_number), (event.weight, confirmation.receipt.daily_number))
+
+    async def test_process_shutdown_stops_stations_before_releasing_print_waits(self):
+        await self.cached_setup()
+        self.online_responses()
+        posting = asyncio.Event()
+
+        async def stalled_post(**kwargs):
+            posting.set()
+            await asyncio.Future()
+
+        self.api.create_record.side_effect = stalled_post
+        running = self.start(self.client.run())
+        await self.wait_for(self.settings_synced.wait())
+        events = [WeighingCompletedEvent(station_id=i, rfid_card_uid="12345678", weight=23) for i in (1, 7)]
+        local_acks = [self.client.handle_hardware_event(event) for event in events]
+        tickets = [await self.wait_for(asyncio.wrap_future(ack)) for ack in local_acks]
+        await self.wait_for(posting.wait())
+        ready_at_station_stop = []
+        self.manager.stop_all.side_effect = lambda: ready_at_station_stop.extend(ticket.done() for ticket in tickets)
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.wait_for(running)
+
+        self.assertEqual(ready_at_station_stop, [False, False])
+        self.assertTrue(all(ticket.result(timeout=0) is None for ticket in tickets))
+        self.assertEqual(self.client.upload_queue.qsize(), 2)
+        self.assertEqual(await Record.pending_uploads().count(), 2)
+
+    async def test_lost_upload_authorization_releases_first_print_without_stopping_stations(self):
+        await self.cached_setup()
+        self.online_responses()
+        request = httpx2.Request("POST", SERVER_URL)
+        denied = httpx2.Response(403, request=request)
+        self.api.create_record.side_effect = httpx2.HTTPStatusError("rejected", request=request, response=denied)
+        self.client.retry_interval = 60
+        self.start(self.client.run())
+        await self.wait_for(self.settings_synced.wait())
+        event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=23)
+        saved = self.client.handle_hardware_event(event)
+        ticket = await self.wait_for(asyncio.wrap_future(saved))
+        self.assertIsNone(await self.wait_for(asyncio.wrap_future(ticket)))
+        self.assertIsNone(self.client._active_uploader)
+        self.assertEqual(await Record.pending_uploads().count(), 1)
+        self.manager.stop_all.assert_not_called()
+
     async def test_control_handshake_failure_does_not_interrupt_an_upload(self):
         await self.cached_setup()
         self.online_responses()

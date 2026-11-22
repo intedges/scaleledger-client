@@ -120,7 +120,7 @@ class StationReprintTests(unittest.TestCase):
         requests = self.print_requests()
         self.assertEqual([request.copies for request in requests], [1, 3, 9])
         self.assertTrue(all(request.document_bytes == ReceiptTemplate.render(self.receipt) for request in requests))
-        self.assertIn(b"55A7C359", requests[0].document_bytes)
+        self.assertIn(str(self.receipt.record_uuid).encode("ascii"), requests[0].document_bytes)
         self.assertIn(b"240 kg", requests[0].document_bytes)
         self.assertEqual(self.scale.connections, 0)
         self.assertFalse(self.worker._run_reprint_request())
@@ -129,7 +129,7 @@ class StationReprintTests(unittest.TestCase):
 
     def test_reprint_preserves_current_completion_and_automatic_receipt_state(self):
         self.worker._receipt_attempted = True
-        self.worker._receipt_bytes = b"previous automatic receipt"
+        self.worker._receipt = b"previous automatic receipt"
         self.worker._receipt_event_uuid = "previous automatic event"
         self.worker._saved_event_uuid = "previous saved event"
         self.worker._completion_at = self.now - 1
@@ -137,7 +137,7 @@ class StationReprintTests(unittest.TestCase):
         self.worker._weighed_vehicle_on = True
         fields = (
             "state", "last_event", "last_plate", "_pending_save", "_save_result", "_processing",
-            "_receipt_attempted", "_receipt_bytes", "_receipt_event_uuid", "_saved_event_uuid",
+            "_receipt_attempted", "_receipt", "_receipt_event_uuid", "_saved_event_uuid",
             "_completion_at", "_completion_announced", "_weighed_vehicle_on", "_no_paper_pending",
         )
         before = {name: getattr(self.worker, name) for name in fields}
