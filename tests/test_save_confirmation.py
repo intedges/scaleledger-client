@@ -14,12 +14,12 @@ from tortoise import connections
 
 from events import WeighingCompletedEvent
 from main import HeadlessClient
-from models import Record
+from models import Record, RecordUploadResult
 from suwol1000 import (
     DisplayRequestPacket, PrinterRequestPacket, ResponsePacket, VoiceCode,
     WeighingStationWorker, WorkerState,
 )
-from tests.helpers import prepare_vehicle
+from tests.helpers import accepted_receipt, prepare_vehicle
 from workers import RecordUploadWorker
 
 
@@ -282,11 +282,11 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(self.client.upload_queue.empty())
                 self.assert_committed_record(event)
 
-    async def test_measurements_from_two_stations_keep_their_source_ids(self):
+    async def test_measurements_from_two_stations_keep_their_originals_and_receipts(self):
         self.start_consumer()
         events = [
-            WeighingCompletedEvent(station_id=station_id, rfid_card_uid="12345678", weight=12)
-            for station_id in (7, 8)
+            WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=85),
+            WeighingCompletedEvent(station_id=8, rfid_card_uid="87654321", weight=120),
         ]
         acknowledgments = [self.submit(event) for event in events]
         await self.drain()
@@ -295,10 +295,25 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(acknowledgment.result(timeout=0))
             self.assertEqual((await Record.get(uuid=event.uuid)).station_id, event.station_id)
         self.assertEqual(await Record.all().count(), 2)
-        self.assertEqual(
-            {self.client.upload_queue.get_nowait() for _ in events},
-            {event.uuid for event in events},
-        )
+        self.assertEqual(self.client.upload_queue.qsize(), 2)
+
+        # The first UUID was entered manually before the offline device reconnected.
+        def accept_record(**kwargs):
+            receipt = accepted_receipt(**kwargs)
+            if receipt.uuid == uuid.UUID(events[0].uuid):
+                return replace(receipt, daily_number=3, weight=58)
+            return replace(receipt, daily_number=27)
+
+        api = Mock(create_record=AsyncMock(side_effect=accept_record))
+        uploader = RecordUploadWorker(api, self.client.upload_queue, "cached-token")
+        uploader.logger = Mock()
+        self.start(uploader.run())
+        await asyncio.wait_for(self.client.upload_queue.join(), timeout=2)
+
+        for event, daily_number, weight in ((events[0], 3, 58), (events[1], 27, 120)):
+            self.assertEqual((await Record.get(uuid=event.uuid)).weight, event.weight)
+            receipt = await RecordUploadResult.get(record_id=event.uuid)
+            self.assertEqual((receipt.daily_number, receipt.weight), (daily_number, weight))
 
     async def test_offline_local_commit_allows_completion_without_upload(self):
         self.start_consumer()
@@ -315,9 +330,9 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(isinstance(request, PrinterRequestPacket) for request in self.scale.requests), 1)
         self.assertTrue(await Record.filter(uuid=event.uuid).exists())
 
-    async def test_upload_purge_before_station_observes_ack_does_not_resave(self):
+    async def test_confirmation_before_station_observes_ack_prints_once_and_preserves_original(self):
         self.start_consumer()
-        api = Mock(create_record=AsyncMock(return_value={}))
+        api = Mock(create_record=AsyncMock(side_effect=accepted_receipt))
         uploader = RecordUploadWorker(api, self.client.upload_queue, "cached-token")
         uploader.logger = Mock()
         self.start(uploader.run())
@@ -325,14 +340,18 @@ class SaveConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         await asyncio.wait_for(self.client.upload_queue.join(), timeout=2)
         self.assertIsNone(acknowledgment.result(timeout=0))
-        self.assertFalse(await Record.filter(uuid=event.uuid).exists())
+        result = await RecordUploadResult.get(record_id=event.uuid)
+        self.assertEqual(result.weight, event.weight)
+        self.assertEqual(result.daily_number, 18)
 
         await self.finish_save()
         self.worker.print()
+        self.client.upload_queue.put_nowait(event.uuid)
+        await asyncio.wait_for(self.client.upload_queue.join(), timeout=2)
 
         self.assertEqual(len(self.submissions), 1)
         api.create_record.assert_awaited_once()
-        self.assertFalse(await Record.filter(uuid=event.uuid).exists())
+        self.assert_committed_record(event)
         self.assertEqual(sum(isinstance(request, PrinterRequestPacket) for request in self.scale.requests), 1)
 
     async def test_stop_during_locked_save_joins_station_and_drains_late_commit(self):

@@ -1,6 +1,43 @@
 from tortoise.connection import get_connection
 from tortoise.transactions import in_transaction
 
+from models import CachedDeviceConfiguration, Gateway, Record, ServerBinding
+
+
+async def load_server_binding(credential_url: str | None, configured_url: str) -> ServerBinding | None:
+    """Tie ownership to the settings row that older clients delete when switching servers."""
+    connection = get_connection("default")
+    guard = await connection.execute_query_dict(
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='forget_settings_server'"
+    )
+    binding = await ServerBinding.get_or_none(id=1)
+    if binding and guard:
+        return binding
+    if binding and binding.server_url != credential_url:
+        # A development build had a standalone binding. An older client may already
+        # have moved these records to another server. Keep both sources for recovery.
+        return None
+    if guard and credential_url is None and (
+        await CachedDeviceConfiguration.filter(id=1).exists() or await Gateway.all().exists() or await Record.all().exists()
+    ):
+        # A downgraded client cleared the binding, then saved another server's data.
+        # Its credential is the only remaining evidence of ownership.
+        return None
+
+    async with in_transaction() as transaction:
+        if not await CachedDeviceConfiguration.filter(id=1).using_db(transaction).exists():
+            await CachedDeviceConfiguration.create(id=1, using_db=transaction)
+        if not guard:
+            await transaction.execute_query(
+                "CREATE TRIGGER IF NOT EXISTS forget_settings_server AFTER DELETE ON device_configuration "
+                "WHEN OLD.id = 1 BEGIN DELETE FROM server_binding WHERE id = 1; END"
+            )
+        if binding is None:
+            # Released clients identified the server only in the credential file.
+            binding = await ServerBinding.create(id=1, server_url=credential_url or configured_url, using_db=transaction)
+        await transaction.commit()
+    return binding
+
 
 _CARD_TABLE_SQL = '''CREATE TABLE "{name}" (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,

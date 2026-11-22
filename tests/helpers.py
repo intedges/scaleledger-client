@@ -1,7 +1,17 @@
 from decimal import Decimal
 import time
+from zoneinfo import ZoneInfo
 
+from api import RecordCreateDTO, RecordReceiptDTO
 from weighing_cycle import CycleState
+
+
+def accepted_receipt(*, access_token: str, record: RecordCreateDTO) -> RecordReceiptDTO:
+    return RecordReceiptDTO(
+        uuid=record.uuid, station_id=record.station_id,
+        weight=record.weight, measured_at=record.measured_at, cancelled_at=None,
+        daily_number=18, number_date=record.measured_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+    )
 
 
 def prepare_vehicle(worker, *, reserve=True):

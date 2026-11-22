@@ -34,6 +34,23 @@ class CredentialStoreTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(self.store.load(), StoredCredential(SERVER, second))
 
+    def test_staged_switch_keeps_active_fields_and_reuses_pending_token(self):
+        previous_url = "http://previous-server:8000"
+        previous = self.store.create(previous_url)
+        pending = self.store.stage_switch(self.store.load(), previous_url, SERVER)
+        document = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual((document["server_url"], document["credential"]), (previous_url, previous))
+        self.assertEqual(self.store.load().pending, pending)
+        self.assertEqual(self.store.stage_switch(self.store.load(), previous_url, SERVER), pending)
+        self.store.save(pending)
+        self.assertEqual(self.store.load(), StoredCredential(SERVER, pending.credential))
+
+    def test_invalid_pending_entry_keeps_active_credential(self):
+        data = {"server_url": SERVER, "credential": "active", "pending": {"credential": "candidate"}}
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.store.load(), StoredCredential(SERVER, "active"))
+
     def test_stored_server_address_is_normalized(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text(
@@ -45,6 +62,7 @@ class CredentialStoreTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True)
         for content in (
             "", "not json", "[]", '{"server_url": "http://127.0.0.1:8000"}', '{"credential": "x"}',
+            "[" * 2000 + "]" * 2000,
             '{"server_url": "ftp://127.0.0.1", "credential": "x"}',
             '{"server_url": "http://127.0.0.1:8000", "credential": ""}',
             '{"server_url": 8000, "credential": "x"}',

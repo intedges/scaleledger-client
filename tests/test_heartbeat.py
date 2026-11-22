@@ -8,8 +8,9 @@ import httpx2
 from websockets.exceptions import ConnectionClosedError
 
 from api import APIClient
-from models import Record, RFIDCard, WeighingStation
+from models import Record, RecordUploadResult, RFIDCard, WeighingStation
 from tests import test_client as lifecycle
+from tests.helpers import accepted_receipt
 
 
 class ControlSocket:
@@ -142,6 +143,7 @@ class HeartbeatTests(unittest.IsolatedAsyncioTestCase):
         errors = (
             httpx2.ReadTimeout("heartbeat timed out"),
             httpx2.ConnectError("network unavailable"),
+            ValueError("heartbeat response is not JSON"),
             self.http_error(503),
             self.http_error(400),
         )
@@ -290,6 +292,7 @@ class HeartbeatTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(renewed_token, "cached-token")
         self.assertEqual(self.client.access_token, renewed_token)
         self.assertTrue(await Record.filter(uuid=record.uuid).exists())
+        self.assertFalse(await RecordUploadResult.filter(record_id=record.uuid).exists())
         self.assertEqual(self.client.upload_queue.qsize(), 1)
         self.assertEqual((await WeighingStation.get(id=1)).name, "Server station")
         self.assertEqual(await RFIDCard.all().count(), 1)
@@ -298,7 +301,7 @@ class HeartbeatTests(unittest.IsolatedAsyncioTestCase):
 
         self.connections.sockets = [recovered]
         self.api.send_heartbeat.side_effect = None
-        self.api.create_record.side_effect = None
+        self.api.create_record.side_effect = accepted_receipt
         approved.set()
         await self.wait_for(recovered.listening.wait())
         await self.wait_for(self.client.upload_queue.join())
@@ -307,7 +310,7 @@ class HeartbeatTests(unittest.IsolatedAsyncioTestCase):
 
         self.api.send_heartbeat.assert_awaited_with(renewed_token)
         self.assertEqual(self.api.send_heartbeat.await_count, 2)
-        self.assertFalse(await Record.filter(uuid=record.uuid).exists())
+        self.assertEqual((await RecordUploadResult.get(record_id=record.uuid)).daily_number, 18)
         self.assertEqual(self.api.create_record.call_args.kwargs["access_token"], renewed_token)
         self.assertFalse(running.done())
 
