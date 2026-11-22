@@ -6,7 +6,7 @@ import uuid
 
 import httpx2
 
-from api import APIClient, InvalidRecordResponse, RecordCreateDTO, RecordReceiptDTO
+from api import APIClient, InvalidRecordResponse, MismatchedRecordResponse, RecordCreateDTO, RecordReceiptDTO
 
 
 class EnrollmentRequestTests(unittest.IsolatedAsyncioTestCase):
@@ -148,8 +148,8 @@ class RecordCreationTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_acknowledgments_raise_record_response_error(self):
         invalid_bodies = [
             [], b"not JSON",
-            self.body | {"uuid": str(uuid.uuid4())}, self.body | {"uuid": 42},
-            self.body | {"uuid": "bad-uuid"}, self.body | {"station_id": 8},
+            self.body | {"uuid": 42}, self.body | {"uuid": "bad-uuid"},
+            self.body | {"station_id": -1}, self.body | {"station_id": 2**100},
             self.body | {"station_id": 7.0}, self.body | {"weight": False},
             self.body | {"weight": -2_147_483_649}, self.body | {"weight": 2_147_483_648},
             self.body | {"measured_at": "2026-10-25T09:34:56"},
@@ -167,7 +167,15 @@ class RecordCreationTests(unittest.IsolatedAsyncioTestCase):
         for body in invalid_bodies:
             with self.subTest(body=body):
                 api, _ = self.client_answering(200, body)
-                with self.assertRaises(InvalidRecordResponse):
+                with self.assertRaises(InvalidRecordResponse) as error:
+                    await api.create_record("secret", self.record)
+                self.assertNotIsInstance(error.exception, MismatchedRecordResponse)
+
+    async def test_another_record_or_station_is_an_identity_conflict(self):
+        for identity in ({"uuid": str(uuid.uuid4())}, {"station_id": 8}):
+            with self.subTest(identity=identity):
+                api, _ = self.client_answering(200, self.body | identity)
+                with self.assertRaises(MismatchedRecordResponse):
                     await api.create_record("secret", self.record)
 
     async def test_other_success_status_does_not_acknowledge_a_record(self):

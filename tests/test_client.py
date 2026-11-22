@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import ANY, AsyncMock, Mock, call, patch
 import uuid
 
 import httpx2
 from tortoise import Tortoise
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 from websockets.http11 import Response
@@ -47,8 +49,8 @@ class StubWebSocket:
 class RejectedConnections:
     """A handshake the server refuses; websockets raises it instead of retrying."""
 
-    def __init__(self, status):
-        self.error = InvalidStatus(Response(status, "Rejected", Headers()))
+    def __init__(self, status, process_exception):
+        self.error = process_exception(InvalidStatus(Response(status, "Rejected", Headers())))
 
     async def __aiter__(self):
         raise self.error
@@ -256,6 +258,104 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await Record.get(uuid=record.uuid)).weight, 19)
         self.assertEqual((await RecordUploadResult.get(record_id=record.uuid)).daily_number, 18)
         self.manager.stop_all.assert_not_called()
+
+    async def test_control_handshake_failure_does_not_interrupt_an_upload(self):
+        await self.cached_setup()
+        self.online_responses()
+        event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=100)
+        await self.client.save_record(event)
+        posting = asyncio.Event()
+        connected = asyncio.Event()
+        attempts = 0
+
+        async def refuse_once(connection, request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                await posting.wait()
+                return connection.respond(404, "Control route unavailable")
+
+        async def handler(ws):
+            connected.set()
+            await ws.wait_closed()
+
+        async def finish_upload(**kwargs):
+            posting.set()
+            await connected.wait()
+            return accepted_receipt(**kwargs)
+
+        self.api.create_record.side_effect = finish_upload
+        async with serve(handler, "127.0.0.1", 0, process_request=refuse_once) as server:
+            self.client.ws_url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+            with patch("main.websockets.connect", side_effect=lambda *a, **kw: websocket_connect(
+                *a, **kw, reconnect_delays=lambda: iter([0]),
+            )):
+                self.start(self.client.run())
+                await self.wait_for(connected.wait())
+                await self.wait_for(self.client.upload_queue.join())
+                self.api.create_record.assert_awaited_once()
+                self.api.request_enrollment.assert_awaited_once()
+                self.assertEqual((await RecordUploadResult.get(record_id=event.uuid)).weight, 100)
+
+    async def test_invalid_gateway_snapshot_does_not_block_pending_uploads(self):
+        await self.cached_setup()
+        self.online_responses()
+        retrying = asyncio.Event()
+
+        async def unavailable_gateway(token):
+            if self.api.retrieve_gateway_self.await_count == 1:
+                return {"detail": "Gateway temporarily unavailable"}
+            retrying.set()
+            await asyncio.Future()
+
+        self.api.retrieve_gateway_self.side_effect = unavailable_gateway
+        self.start(self.client.run())
+        await self.wait_for(retrying.wait())
+        event = await self.emit_and_save()
+        await self.wait_for(self.client.upload_queue.join())
+        self.assertEqual((await RecordUploadResult.get(record_id=event.uuid)).weight, event.weight)
+        self.assertEqual(self.client.market_cache.gateway_name, "Cached gateway")
+        self.api.request_enrollment.assert_awaited_once()
+
+    async def test_stalled_approval_and_gateway_lookup_recover_while_weighing(self):
+        await self.cached_setup()
+        self.online_responses()
+        self.client.gateway_request_timeout = 0.1
+        waiting_for_approval = asyncio.Event()
+        allow_approval = asyncio.Event()
+        lookup_timed_out = asyncio.Event()
+
+        async def approve_after_timeout(*args, **kwargs):
+            if self.api.request_enrollment.await_count == 1:
+                waiting_for_approval.set()
+                await asyncio.Future()
+            await allow_approval.wait()
+            return "approved"
+
+        async def lookup_after_timeout(token):
+            if self.api.retrieve_gateway_self.await_count == 1:
+                try:
+                    await asyncio.Future()
+                finally:
+                    lookup_timed_out.set()
+            return self.api.retrieve_gateway_self.return_value
+
+        self.api.request_enrollment.side_effect = approve_after_timeout
+        self.api.retrieve_gateway_self.side_effect = lookup_after_timeout
+        self.start(self.client.run())
+        await self.wait_for(waiting_for_approval.wait())
+        event = await self.emit_and_save()
+        self.assertEqual((await Record.pending_uploads().get(uuid=event.uuid)).weight, event.weight)
+        self.api.create_record.assert_not_awaited()
+        allow_approval.set()
+        await self.wait_for(self.client.upload_queue.join())
+        await self.wait_for(lookup_timed_out.wait())
+        await self.wait_for(self.settings_synced.wait())
+
+        self.api.create_record.assert_awaited_once()
+        self.assertGreaterEqual(self.api.request_enrollment.await_count, 2)
+        self.assertEqual((await RecordUploadResult.get(record_id=event.uuid)).weight, event.weight)
+        self.assertEqual(self.client.market_cache.gateway_name, "Server gateway")
 
     async def test_measurement_time_keeps_its_local_offset_through_storage_and_upload(self):
         await self.cached_setup()
@@ -518,6 +618,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             connect.assert_called_once_with(
                 "ws://127.0.0.1:8000/ws/devices/gateways/2/",
                 additional_headers={"Authorization": "Gateway cached-token"},
+                process_exception=ANY,
             )
             self.api.send_heartbeat.assert_awaited_once_with("cached-token")
 
@@ -743,6 +844,24 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sys.auth.credential.invalid", warnings)
         self.assertNotIn("sys.auth.server_changed", warnings)
 
+    async def test_unwritable_replacement_credential_keeps_previous_database_offline(self):
+        await self.cached_setup()
+        self.client.credentials.create("http://previous-server:8000")
+        pending = await Record.create(
+            uuid=uuid.uuid4(), station_id=1, rfid_card_uid="12345678", weight=19, measured_at=self.now,
+        )
+        with patch.object(self.client.credentials, "create", side_effect=OSError("read-only credential file")):
+            self.start(self.client.run())
+            await self.wait_for(self.started.wait())
+            saved_offline = await self.emit_and_save()
+
+        self.assertEqual((await Record.get(uuid=pending.uuid)).weight, 19)
+        self.assertEqual((await Record.get(uuid=saved_offline.uuid)).station_id, 1)
+        self.assertEqual(self.client.credentials.load().server_url, "http://previous-server:8000")
+        self.assertIsNone(self.client.access_token)
+        self.api.request_enrollment.assert_not_awaited()
+        self.api.create_record.assert_not_awaited()
+
     async def test_unreadable_credential_keeps_weighing_without_the_server(self):
         await self.cached_setup()
         self.credential_path.unlink()
@@ -771,7 +890,9 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             return "approved"
 
         self.api.request_enrollment.side_effect = approved
-        with patch("main.websockets.connect", return_value=RejectedConnections(403)):
+        with patch("main.websockets.connect", side_effect=lambda *args, **kw: RejectedConnections(
+            403, kw["process_exception"],
+        )):
             self.start(self.client.run())
             await self.wait_for(rechecked.wait())
 

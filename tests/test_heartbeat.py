@@ -143,6 +143,7 @@ class HeartbeatTests(unittest.IsolatedAsyncioTestCase):
         errors = (
             httpx2.ReadTimeout("heartbeat timed out"),
             httpx2.ConnectError("network unavailable"),
+            ValueError("heartbeat response is not JSON"),
             self.http_error(503),
             self.http_error(400),
         )

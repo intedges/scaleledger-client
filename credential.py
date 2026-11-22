@@ -32,7 +32,7 @@ class CredentialStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise CredentialError(f"{self.path} is not valid JSON: {exc}") from exc
         if not isinstance(data, dict):
             raise CredentialError(f"{self.path} must contain an object")

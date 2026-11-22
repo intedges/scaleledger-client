@@ -2,6 +2,15 @@ from tortoise.models import Model
 from tortoise import fields
 
 
+class ServerBinding(Model):
+    # The server that owns this database, independent of replaceable credentials.
+    id = fields.IntField(primary_key=True, default=1)
+    server_url = fields.TextField()
+
+    class Meta:
+        table = "server_binding"
+
+
 class Gateway(Model):
     # Cached for offline restarts; the credential file decides which Gateway this PC is.
     id = fields.IntField(primary_key=True)
@@ -76,7 +85,7 @@ class RecordUploadResult(Model):
     cancelled_at = fields.DatetimeField(null=True)
     daily_number = fields.IntField(null=True)
     number_date = fields.DateField(null=True)
-    # A rejection or invalid response needs review and ends automatic retries.
+    # A rejected input or conflicting identity needs review and ends automatic retries.
     error = fields.TextField(null=True)
     received_at = fields.DatetimeField(auto_now_add=True)
 

@@ -20,7 +20,6 @@ class WebSocketReconnectionTests(unittest.IsolatedAsyncioTestCase):
         client.ws_kwargs = {}
         client.retry_interval = 0.01
         client.gateway_id = 1
-        client._gateway_data = {"id": 1}
         client.access_token = "test-token"
         client.hostname = "test-gateway"
         client.server_host = "127.0.0.1"
@@ -58,7 +57,7 @@ class WebSocketReconnectionTests(unittest.IsolatedAsyncioTestCase):
                     try:
                         await asyncio.wait_for(command_received_again.wait(), timeout=2)
                         self.assertEqual(connections, ["/ws/devices/gateways/1/"] * 2)
-                        client.bootstrap.assert_not_awaited()
+                        client.bootstrap.assert_awaited_once()
                         self.assertEqual(client.request_settings_sync.call_count, 5)
                     finally:
                         task.cancel()

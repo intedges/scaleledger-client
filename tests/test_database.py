@@ -1,16 +1,20 @@
 import asyncio
-from contextlib import chdir, suppress
+from contextlib import asynccontextmanager, chdir, closing, suppress
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 import uuid
 
+from tortoise.backends.sqlite.client import SqliteTransactionWrapper
+from tortoise.connection import get_connection
+
 from api import RecordReceiptDTO
 from events import WeighingCompletedEvent
 from main import HeadlessClient
-from models import Record, RecordUploadResult, WeighingStation
+from models import Gateway, Record, RecordUploadResult, ServerBinding, WeighingStation
 from settings_sync import SettingsSnapshot
 from workers import RecordUploadWorker
 
@@ -190,3 +194,133 @@ class DatabaseLocationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(review.error, "HTTP 422")
         finally:
             await restarted.close()
+
+
+class DatabaseServerBindingTests(unittest.IsolatedAsyncioTestCase):
+    old_url = "http://first.test"
+    new_url = "http://second.test"
+
+    @asynccontextmanager
+    async def open_client(self, server_url):
+        client = HeadlessClient(server_url, self.root / "records.sqlite3", self.root / "credential.json")
+        client.logger = Mock()
+        client.station_manager = Mock()
+        try:
+            await client.setup()
+            yield client
+        finally:
+            await client.close()
+
+    async def asyncSetUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.pending = WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=85)
+        async with self.open_client(self.old_url) as client:
+            self.assertTrue(await client.prepare_credential())
+            await Gateway.create(id=1, name="Previous gateway")
+            await client.save_record(self.pending)
+            confirmed = WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=37)
+            await client.save_record(confirmed)
+            await RecordUploadResult.create(record_id=confirmed.uuid, weight=37, measured_at=confirmed.timestamp)
+
+    async def assert_old_data(self):
+        self.assertEqual((await ServerBinding.get(id=1)).server_url, self.old_url)
+        self.assertEqual(await Record.all().count(), 2)
+        self.assertEqual(await RecordUploadResult.all().count(), 1)
+        self.assertTrue(await Gateway.filter(id=1).exists())
+
+    async def assert_new_database(self):
+        self.assertEqual((await ServerBinding.get(id=1)).server_url, self.new_url)
+        for model in (Gateway, Record, RecordUploadResult):
+            self.assertEqual(await model.all().count(), 0, model.__name__)
+
+    async def test_damaged_credential_cannot_move_previous_records_to_another_server(self):
+        (self.root / "credential.json").write_text("{broken", encoding="utf-8")
+        async with self.open_client(self.new_url) as client:
+            self.assertTrue(await client.prepare_credential())
+            await self.assert_new_database()
+            await client.restore_local_state()
+            self.assertTrue(client.upload_queue.empty())
+
+    async def test_return_to_bound_server_after_credential_replacement_keeps_its_data(self):
+        async with self.open_client(self.old_url) as client:
+            other_token = client.credentials.create(self.new_url)
+            self.assertTrue(await client.prepare_credential())
+            self.assertEqual(client.credentials.load().server_url, self.old_url)
+            self.assertNotEqual(client.access_token, other_token)
+            await self.assert_old_data()
+
+    async def test_binding_a_legacy_database_retries_when_another_writer_finishes(self):
+        async with self.open_client(self.old_url) as client:
+            await ServerBinding.all().delete()
+            await get_connection("default").execute_query("PRAGMA busy_timeout=0")
+            client.retry_interval = 0.01
+            previous = client.credentials.load()
+            with closing(sqlite3.connect(client.db_path)) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                waiting = asyncio.Event()
+                client.logger.warning.side_effect = lambda *args, **kwargs: waiting.set()
+                async with asyncio.TaskGroup() as tasks:
+                    prepared = tasks.create_task(client.prepare_credential())
+                    await asyncio.wait_for(waiting.wait(), timeout=1)
+                    self.assertIsNone(client.access_token)
+                    self.assertFalse(await ServerBinding.all().exists())
+                    writer.rollback()
+                    self.assertTrue(await asyncio.wait_for(prepared, timeout=1))
+            self.assertEqual(client.access_token, previous.credential)
+            await self.assert_old_data()
+
+    async def test_locked_switch_commit_retries_with_the_same_replacement_credential(self):
+        commit = SqliteTransactionWrapper.commit
+        attempts = []
+        async with self.open_client(self.new_url) as client:
+            client.retry_interval = 0.01
+
+            async def commit_after_lock(connection):
+                attempts.append(client.credentials.load().credential)
+                if len(attempts) == 1:
+                    error = sqlite3.OperationalError("table is locked")
+                    error.sqlite_errorcode = sqlite3.SQLITE_LOCKED_SHAREDCACHE
+                    raise error
+                await commit(connection)
+
+            with patch.object(SqliteTransactionWrapper, "commit", new=commit_after_lock):
+                self.assertTrue(await asyncio.wait_for(client.prepare_credential(), timeout=1))
+            self.assertEqual(attempts, [client.access_token, client.access_token])
+            await self.assert_new_database()
+
+    async def test_failed_switch_commit_restores_old_data_and_restart_retries_with_new_credential(self):
+        async with self.open_client(self.new_url) as client:
+            with patch.object(SqliteTransactionWrapper, "commit", side_effect=sqlite3.OperationalError("I/O error")):
+                self.assertFalse(await client.prepare_credential())
+
+            stored = client.credentials.load()
+            self.assertEqual(stored.server_url, self.new_url)
+            self.assertIsNone(client.access_token)
+            await self.assert_old_data()
+            await client.restore_local_state()
+            self.assertEqual(client.upload_queue.get_nowait(), self.pending.uuid)
+
+        async with self.open_client(self.new_url) as restarted:
+            self.assertTrue(await restarted.prepare_credential())
+            self.assertEqual(restarted.access_token, stored.credential)
+            await self.assert_new_database()
+
+    async def test_lost_ack_after_switch_commit_does_not_repeat_cleanup(self):
+        commit = SqliteTransactionWrapper.commit
+
+        async def commit_then_fail(connection):
+            await commit(connection)
+            raise sqlite3.OperationalError("acknowledgement lost")
+
+        async with self.open_client(self.new_url) as client:
+            with patch.object(SqliteTransactionWrapper, "commit", new=commit_then_fail):
+                self.assertFalse(await client.prepare_credential())
+            self.assertIsNone(client.access_token)
+            await self.assert_new_database()
+            new_event = WeighingCompletedEvent(station_id=2, rfid_card_uid="12345678", weight=125)
+            await client.save_record(new_event)
+
+        async with self.open_client(self.new_url) as restarted:
+            self.assertTrue(await restarted.prepare_credential())
+            await restarted.restore_local_state()
+            self.assertEqual(restarted.upload_queue.get_nowait(), new_event.uuid)

@@ -167,3 +167,5 @@ class SettingsSnapshot:
             await Species.bulk_create(self._species, using_db=connection)
             await Producer.bulk_create(self._producers, using_db=connection)
             await RFIDCard.bulk_create(self._rfid_cards, using_db=connection)
+            # Roll back a failed SQLite COMMIT before the connection accepts local measurements.
+            await connection.commit()

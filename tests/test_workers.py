@@ -107,13 +107,86 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.post.side_effect = [
             httpx2.Response(503),
             httpx2.Response(400, text="<html>Bad request</html>"),
+            httpx2.Response(422, json={"weight": [{}]}),
             httpx2.Response(201, json=self.body),
         ]
         await self.process_queue()
-        self.assertEqual(self.post.await_count, 3)
+        self.assertEqual(self.post.await_count, 4)
         result = await RecordUploadResult.get(record_id=self.record_uuid)
         self.assertEqual(result.daily_number, 18)
         self.assertIsNone(result.error)
+
+    async def test_response_timeout_allows_next_station_to_upload_before_retry(self):
+        following = await Record.create(
+            uuid=uuid.uuid4(), rfid_card_uid="next-card", station_id=8,
+            weight=32, measured_at=self.record.measured_at,
+        )
+        self.queue.put_nowait(str(following.uuid))
+
+        class DelayedBody(httpx2.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"{"
+                await asyncio.Event().wait()
+
+        self.worker.upload_timeout = 0.03
+        self.post.side_effect = [
+            httpx2.Response(201, stream=DelayedBody()),
+            httpx2.Response(201, json=self.body | {
+                "uuid": str(following.uuid), "station_id": 8, "weight": 32, "daily_number": 19,
+            }),
+            httpx2.Response(200, json=self.body),
+        ]
+        await self.process_queue()
+        requests = [json.loads(call.args[0].content) for call in self.post.await_args_list]
+        self.assertEqual([row["uuid"] for row in requests], [self.record_uuid, str(following.uuid), self.record_uuid])
+        self.assertEqual(requests[0], requests[2])
+        self.assertEqual((await RecordUploadResult.get(record_id=following.uuid)).daily_number, 19)
+        self.assertEqual((await RecordUploadResult.get(record_id=self.record.uuid)).daily_number, 18)
+
+    async def test_json_decoder_depth_error_retries_without_restarting_worker(self):
+        broken = [httpx2.Response(status, content=b"{}") for status in (201, 400)]
+        for response in broken:
+            self.enterContext(patch.object(response, "json", side_effect=RecursionError))
+        self.post.side_effect = [*broken, httpx2.Response(200, json=self.body)]
+        await self.process_queue()
+        self.assertEqual(self.post.await_count, 3)
+        self.assertEqual((await RecordUploadResult.get(record_id=self.record.uuid)).daily_number, 18)
+
+    async def test_slow_local_commit_is_outside_http_timeout(self):
+        create_result = RecordUploadResult.create
+        self.worker.upload_timeout = 0.03
+
+        async def delayed_commit(**fields):
+            await asyncio.sleep(self.worker.upload_timeout * 2)
+            return await create_result(**fields)
+
+        with patch.object(RecordUploadResult, "create", side_effect=delayed_commit):
+            await self.process_queue()
+        self.post.assert_awaited_once()
+        self.assertEqual((await RecordUploadResult.get(record_id=self.record.uuid)).daily_number, 18)
+
+    async def test_incomplete_acknowledgments_retry_original_until_duplicate_is_confirmed(self):
+        incomplete = self.body.copy()
+        del incomplete["number_date"]
+        self.post.side_effect = [
+            httpx2.Response(204),
+            httpx2.Response(201, content=b""),
+            httpx2.Response(200, text="<html>Temporarily offline</html>"),
+            httpx2.Response(200, json={"status": "pending"}),
+            httpx2.Response(200, json=self.body | {"station_id": "7"}),
+            httpx2.Response(200, json=self.body | {"daily_number": 0}),
+            httpx2.Response(200, json=incomplete),
+            httpx2.Response(200, json=self.body | {"measured_at": "yesterday"}),
+            httpx2.Response(200, json=self.body),
+        ]
+        await self.process_queue()
+        payloads = [json.loads(call.args[0].content) for call in self.post.await_args_list]
+        self.assertEqual(len(payloads), 9)
+        self.assertEqual(payloads, [payloads[0]] * 9)
+        self.assertEqual((payloads[0]["uuid"], payloads[0]["weight"]), (self.record_uuid, 85))
+        result = await RecordUploadResult.get(record_id=self.record.uuid)
+        self.assertIsNone(result.error)
+        self.assertEqual((result.daily_number, result.weight), (18, 58))
 
     async def test_lost_response_retries_original_and_preserves_cancelled_duplicate_receipt(self):
         cancelled_at = "2026-11-24T02:00:00+09:00"
@@ -184,8 +257,11 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unprocessable_record_marks_record_for_review(self):
         await self.assert_review(422, {"station_id": ["unknown station"]}, "unknown station")
 
-    async def test_mismatched_response_marks_original_for_review(self):
+    async def test_other_station_in_response_marks_original_for_review(self):
         await self.assert_review(200, self.body | {"station_id": 8}, "station_id")
+
+    async def test_other_uuid_in_response_marks_original_for_review(self):
+        await self.assert_review(200, self.body | {"uuid": str(uuid.uuid4())}, "UUID")
 
     async def test_database_write_failure_retries_same_uuid(self):
         create_result = RecordUploadResult.create

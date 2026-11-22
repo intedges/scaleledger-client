@@ -5,6 +5,7 @@ from contextlib import suppress
 import json
 import logging
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from urllib.parse import urlsplit
@@ -12,14 +13,15 @@ from urllib.parse import urlsplit
 import httpx2
 from structlog.stdlib import get_logger
 from tortoise import Tortoise
-from tortoise.exceptions import IntegrityError
+from tortoise.exceptions import IntegrityError, OperationalError, TransactionManagementError, ValidationError
 from tortoise.transactions import in_transaction
-from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.client import process_exception
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 import websockets
 
 from api import APIClient, AuthDegradedError
 from cache import MarketDataCache, RFIDInfo
-from config import ConfigError, load_settings, websocket_url
+from config import ConfigError, load_settings, normalize_server_url, websocket_url
 from credential import CredentialError, CredentialStore
 from device_configuration import DeviceConfiguration
 from paths import AppPaths, program_dir
@@ -27,7 +29,7 @@ from reprint import ReprintRequest, ReprintRequestError
 from events import BaseEvent, WeighingCompletedEvent
 from logconfig import RepeatedFailureLog, setup_logging
 from managers import WeighingStationManager
-from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, ServerBinding, Species, WeighingStation
 from schema import migrate_optional_card_species
 from settings_sync import SettingsSnapshot, load_configuration
 from suwol1000 import PrinterStatus, ZeroRequestError, ZeroResult
@@ -35,6 +37,15 @@ from telemetry import LatestTelemetryBuffer, StationTelemetryPublisher
 from utils import acquire_instance_lock, get_hostname, get_ip_address, scan_peripherals
 from workers import RecordUploadWorker
 from windows_runtime import WindowsStopEvent, request_stop
+
+
+def _control_connect_error(exc: Exception) -> Exception | None:
+    if isinstance(exc, InvalidStatus) and exc.response.status_code in (401, 403):
+        return AuthDegradedError("Control socket rejected the credential")
+    if isinstance(exc, InvalidHandshake):
+        # A proxy may serve HTTP while its WebSocket route is unavailable.
+        return None
+    return process_exception(exc)
 
 
 class HeadlessClient:
@@ -65,11 +76,11 @@ class HeadlessClient:
         self.network_failures = RepeatedFailureLog(self.logger, "net.server", settle_time=0)
 
         self.retry_interval = 5
+        self.gateway_request_timeout = 30.0
 
         # This PC's credential; the server accepts it once an administrator approves it.
         self.access_token: str | None = None
         self.gateway_id: int | None = None
-        self._gateway_data: dict | None = None
         self._station_config_ready = asyncio.Event()
         self._settings_sync_requested = asyncio.Event()
         self._settings_sync_pending: asyncio.Future[bool] | None = None
@@ -202,7 +213,6 @@ class HeadlessClient:
         self.logger.warning("sys.auth.credentials.rejected")
         # Keep the credential; only an explicit revocation replaces it. Cached
         # settings keep the stations running until a complete snapshot arrives.
-        self._gateway_data = None
         self._station_config_ready.clear()
         # Approval may follow, so telemetry stopped by a rejection may publish again.
         self._telemetry_stop_code = None
@@ -210,11 +220,11 @@ class HeadlessClient:
     async def bootstrap(self) -> bool:
         self.log_step("sys.boot.remote_api.syncing")
         try:
-            retrieved_gateway = await self.api_client.retrieve_gateway_self(self.access_token)
+            async with asyncio.timeout(self.gateway_request_timeout):
+                retrieved_gateway = await self.api_client.retrieve_gateway_self(self.access_token)
             # Resolve the authenticated route without publishing partial settings.
             # Keep the cached Gateway ID and Stations until a complete snapshot arrives.
             SettingsSnapshot.from_responses(retrieved_gateway, [], [], [], [])
-            self._gateway_data = retrieved_gateway
             self.gateway_id = retrieved_gateway["id"]
             self.logger.info("sys.boot.remote_api.success", gateway_id=self.gateway_id)
             return True
@@ -227,11 +237,13 @@ class HeadlessClient:
                 self.network_failures.failure(
                     "sys.boot.remote_api.error", e, traceback=False, status=e.response.status_code,
                 )
-        except httpx2.RequestError as e:
+        except (httpx2.RequestError, TimeoutError) as e:
             self.network_failures.failure(
                 "sys.boot.network.offline", e, level=logging.WARNING, traceback=False,
                 action="fallback_to_local_cache",
             )
+        except (ValueError, KeyError, ValidationError, RecursionError) as e:
+            self.network_failures.failure("sys.boot.remote_api.invalid_response", e, traceback=False)
         return False
     
     def request_settings_sync(self) -> asyncio.Future[bool]:
@@ -383,11 +395,8 @@ class HeadlessClient:
         while True:
             try:
                 await self.wait_for_approval()
-                await self.bootstrap()
-                if self.gateway_id is None:
-                    await asyncio.sleep(self.retry_interval)
-                else:
-                    await self.run_active_loop()
+                self._station_config_ready.clear()
+                await self.run_active_loop()
 
             except* AuthDegradedError:
                 self.logger.warning("sys.loop.auth_degraded", action="check_enrollment")
@@ -399,35 +408,53 @@ class HeadlessClient:
                 await asyncio.sleep(self.retry_interval)
 
     async def prepare_credential(self) -> bool:
-        try:
+        server_url = normalize_server_url(self.base_url)
+        self.access_token = None
+        while True:
             try:
-                stored = self.credentials.load()
-            except CredentialError as exc:
-                # A damaged file only costs a new approval; the cached settings stay.
-                self.logger.warning("sys.auth.credential.invalid", error=str(exc))
-                stored = None
-            if stored is not None and stored.server_url == self.base_url:
-                self.access_token = stored.credential
+                self.access_token = await self._credential_for_server(server_url)
                 return True
-            if stored is not None:
-                # A Gateway belongs to one server. Moving starts over with a new approval,
-                # without sending the previous server's settings or records to the new one.
-                discarded = await self.discard_server_data()
-                self.logger.warning(
-                    "sys.auth.server_changed", previous=stored.server_url, current=self.base_url,
-                    discarded_records=discarded,
+            except OSError as exc:
+                # Keep weighing; an unreadable file may still hold the approved credential.
+                self.logger.error(
+                    "sys.auth.credential.unusable", error=str(exc), action="check_data_folder_then_restart",
                 )
-            self.access_token = self.credentials.create(self.base_url)
-            self.logger.info("sys.auth.credential.created")
-        except OSError as exc:
-            # Keep weighing; an unreadable file may still hold the approved credential.
-            self.logger.error(
-                "sys.auth.credential.unusable", error=str(exc), action="check_data_folder_then_restart",
-            )
-            return False
-        return True
+                return False
+            except (OperationalError, TransactionManagementError, sqlite3.Error) as exc:
+                # Tortoise wraps SQLite statement errors; COMMIT exposes the driver error directly.
+                cause = exc.args[0] if isinstance(exc, OperationalError) and exc.args else exc
+                primary_code = getattr(cause, "sqlite_errorcode", 0) & 0xff
+                if primary_code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    self.logger.exception("sys.db.server_binding.failed", action="check_data_folder_then_restart")
+                    return False
+                self.logger.warning("sys.db.server_binding.locked", retry_in=self.retry_interval)
+                await asyncio.sleep(self.retry_interval)
 
-    async def discard_server_data(self) -> int:
+    async def _credential_for_server(self, server_url: str) -> str:
+        try:
+            stored = self.credentials.load()
+        except CredentialError as exc:
+            self.logger.warning("sys.auth.credential.invalid", error=str(exc))
+            stored = None
+        binding = await ServerBinding.get_or_none(id=1)
+        if binding is None:
+            # Older databases only had the credential file to identify their server.
+            # With neither source available, retain the existing enrollment policy.
+            binding = await ServerBinding.create(id=1, server_url=stored.server_url if stored else server_url)
+        if stored is not None and stored.server_url == server_url:
+            token = stored.credential
+        else:
+            token = self.credentials.create(server_url)
+            self.logger.info("sys.auth.credential.created")
+        if binding.server_url != server_url:
+            discarded = await self.discard_server_data(new_server_url=server_url)
+            self.logger.warning(
+                "sys.auth.server_changed", previous=binding.server_url, current=server_url,
+                discarded_records=discarded,
+            )
+        return token
+
+    async def discard_server_data(self, *, new_server_url: str | None = None) -> int:
         async with in_transaction() as connection:
             # Children first, as in a settings snapshot.
             for model in (RFIDCard, Producer, Species, WeighingStation, Gateway, CachedDeviceConfiguration):
@@ -436,6 +463,10 @@ class HeadlessClient:
             records = Record.all().using_db(connection)
             discarded = await records.count()
             await records.delete()
+            if new_server_url is not None:
+                await ServerBinding.filter(id=1).using_db(connection).update(server_url=new_server_url)
+            # Keep a failed SQLite COMMIT inside the transaction's rollback path.
+            await connection.commit()
         self.configuration = DeviceConfiguration()
         return discarded
 
@@ -443,15 +474,15 @@ class HeadlessClient:
         announced = False
         while True:
             try:
-                status = await self.api_client.request_enrollment(
-                    self.access_token, hostname=self.hostname,
-                    # Resolved per request in a thread: a slow DNS lookup must not
-                    # delay the stations at startup or stall the event loop.
-                    ip_address=await asyncio.to_thread(get_ip_address, self.server_host),
-                )
-            except (httpx2.HTTPStatusError, ValueError) as exc:
+                # Resolve the route off the hardware event loop.
+                ip_address = await asyncio.to_thread(get_ip_address, self.server_host)
+                async with asyncio.timeout(self.gateway_request_timeout):
+                    status = await self.api_client.request_enrollment(
+                        self.access_token, hostname=self.hostname, ip_address=ip_address,
+                    )
+            except (httpx2.HTTPStatusError, ValueError, RecursionError) as exc:
                 self.network_failures.failure("net.api.enrollment.server_error", exc, traceback=False)
-            except httpx2.RequestError as exc:
+            except (httpx2.RequestError, TimeoutError) as exc:
                 self.network_failures.failure(
                     "net.api.enrollment.network_error", exc, level=logging.WARNING, traceback=False,
                 )
@@ -505,9 +536,7 @@ class HeadlessClient:
     async def run_active_ws_loop(self):
         # A cached ID may belong to settings saved before re-registration.
         # HTTP workers can already use the token while its current ID is resolved.
-        while self._gateway_data is None:
-            if await self.bootstrap():
-                break
+        while not await self.bootstrap():
             await asyncio.sleep(self.retry_interval)
 
         # REST can be reachable even when the control socket is unavailable.
@@ -515,24 +544,18 @@ class HeadlessClient:
         target_ws_url = f"{self.ws_url}/ws/devices/gateways/{self.gateway_id}/"
         self.log_step("net.ws.active.connecting", url=target_ws_url)
 
-        try:
-            async for ws in websockets.connect(
-                target_ws_url, additional_headers={"Authorization": f"Gateway {self.access_token}"},
-                **self.ws_kwargs,
-            ):
-                self.log_step("net.ws.active.connected")
-                try:
-                    self.request_settings_sync()
-                    await self.listen_active_ws(ws)
-                except* ConnectionClosed:
-                    self.logger.warning("net.ws.active.disconnected")
-                # Reconnect on normal closes as well; settings retries stay independent.
-                await asyncio.sleep(self.retry_interval)
-        except InvalidStatus as exc:
-            # websockets retries only server errors; a rejected credential needs enrollment.
-            if exc.response.status_code in (401, 403):
-                raise AuthDegradedError("Control socket rejected the credential") from exc
-            raise
+        async for ws in websockets.connect(
+            target_ws_url, additional_headers={"Authorization": f"Gateway {self.access_token}"},
+            process_exception=_control_connect_error, **self.ws_kwargs,
+        ):
+            self.log_step("net.ws.active.connected")
+            try:
+                self.request_settings_sync()
+                await self.listen_active_ws(ws)
+            except* ConnectionClosed:
+                self.logger.warning("net.ws.active.disconnected")
+            # Reconnect on normal closes as well; settings retries stay independent.
+            await asyncio.sleep(self.retry_interval)
     
     async def listen_active_ws(self, ws):
         # Heartbeat calls belong to this connection and must not survive reconnects.
@@ -690,6 +713,8 @@ class HeadlessClient:
             self.logger.error("net.api.heartbeat.server_error", status=e.response.status_code)
         except httpx2.RequestError as e:
             self.logger.warning("net.api.heartbeat.network_error", error=repr(e))
+        except (ValueError, RecursionError) as e:
+            self.logger.warning("net.api.heartbeat.invalid_response", error=repr(e))
 
 
 async def run_client(

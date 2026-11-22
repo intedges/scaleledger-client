@@ -19,6 +19,10 @@ class InvalidRecordResponse(ValueError):
     """The server did not acknowledge the submitted measurement as expected."""
 
 
+class MismatchedRecordResponse(InvalidRecordResponse):
+    """The returned UUID or station identifies a different measurement."""
+
+
 def _receipt_timestamp(value, field: str) -> datetime:
     try:
         timestamp = datetime.fromisoformat(value)
@@ -53,10 +57,12 @@ class RecordReceiptDTO:
         except ValueError:
             raise InvalidRecordResponse("Invalid UUID in record response") from None
         if response_uuid != record.uuid:
-            raise InvalidRecordResponse("Record response UUID does not match the request")
+            raise MismatchedRecordResponse("Record response UUID does not match the request")
         station_id = body.get("station_id")
-        if type(station_id) is not int or station_id != record.station_id:
-            raise InvalidRecordResponse("Record response station_id does not match the request")
+        if type(station_id) is not int or not 1 <= station_id <= 9_223_372_036_854_775_807:
+            raise InvalidRecordResponse("Invalid station_id in record response")
+        if station_id != record.station_id:
+            raise MismatchedRecordResponse("Record response station_id does not match the request")
         weight = body.get("weight")
         if type(weight) is not int or not -2_147_483_648 <= weight <= 2_147_483_647:
             raise InvalidRecordResponse("Invalid weight in record response")
@@ -143,7 +149,7 @@ class APIClient:
             raise InvalidRecordResponse(f"Unexpected record response: HTTP {response.status_code}")
         try:
             body = response.json()
-        except ValueError:
+        except (ValueError, RecursionError):
             raise InvalidRecordResponse("Record response contains invalid JSON") from None
         return RecordReceiptDTO.from_response(body, record)
 

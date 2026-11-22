@@ -45,6 +45,7 @@ class CredentialStoreTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True)
         for content in (
             "", "not json", "[]", '{"server_url": "http://127.0.0.1:8000"}', '{"credential": "x"}',
+            "[" * 2000 + "]" * 2000,
             '{"server_url": "ftp://127.0.0.1", "credential": "x"}',
             '{"server_url": "http://127.0.0.1:8000", "credential": ""}',
             '{"server_url": 8000, "credential": "x"}',

@@ -1,8 +1,12 @@
 import asyncio
+from contextlib import closing, suppress
 from copy import deepcopy
 from datetime import UTC, datetime
+from pathlib import Path
+import sqlite3
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 import uuid
 
 from tortoise import Tortoise
@@ -11,6 +15,8 @@ from tortoise.exceptions import IntegrityError, ValidationError
 
 from cache import RFIDInfo
 from device_configuration import DeviceConfiguration
+from events import WeighingCompletedEvent
+from main import HeadlessClient
 from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
 from settings_sync import SettingsSnapshot, load_configuration
 from tests.test_device_configuration import configuration_response
@@ -319,6 +325,54 @@ class SettingsSnapshotTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await task
         self.assertEqual(await self.stored_state(), before)
+
+
+class SettingsCommitFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_acknowledged_measurement_survives_restart_after_failed_settings_commit(self):
+        db_path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "records.sqlite3"
+        client = HeadlessClient(None, db_path)
+        client.logger = Mock()
+        event = WeighingCompletedEvent(station_id=7, rfid_card_uid="test-card", weight=85)
+        try:
+            await client.setup()
+            await Gateway.create(id=1, name="Cached gateway")
+            snapshot = SettingsSnapshot.from_responses({"id": 1, "name": "Updated gateway"}, [], [], [], [])
+            db = get_connection("default")
+            # In rollback-journal mode a reader permits all the settings writes but blocks COMMIT.
+            await db.execute_query("PRAGMA journal_mode=DELETE")
+            await db.execute_query("PRAGMA busy_timeout=0")
+            with closing(sqlite3.connect(db_path)) as reader:
+                reader.execute("BEGIN")
+                reader.execute("SELECT id FROM gateway").fetchall()
+                with self.assertRaises(sqlite3.OperationalError) as failure:
+                    await snapshot.persist()
+                self.assertEqual(failure.exception.sqlite_errorcode, sqlite3.SQLITE_BUSY)
+
+            client.main_loop = asyncio.get_running_loop()
+            consumer = asyncio.create_task(client.event_consumer_worker())
+            try:
+                ack = client.handle_hardware_event(event)
+                self.assertIsNone(await asyncio.wait_for(asyncio.wrap_future(ack), timeout=1))
+                self.assertEqual(client.upload_queue.get_nowait(), event.uuid)
+            finally:
+                consumer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await consumer
+        finally:
+            await client.close()
+
+        restarted = HeadlessClient(None, db_path)
+        restarted.logger = Mock()
+        restarted.station_manager = Mock()
+        try:
+            await restarted.setup()
+            await restarted.restore_local_state()
+            self.assertEqual(restarted.upload_queue.get_nowait(), event.uuid)
+            saved = await Record.get(uuid=event.uuid)
+            self.assertEqual((saved.weight, saved.station_id, saved.measured_at), (85, 7, event.timestamp))
+            self.assertEqual((await Gateway.get(id=1)).name, "Cached gateway")
+        finally:
+            await restarted.close()
 
 
 if __name__ == "__main__":
