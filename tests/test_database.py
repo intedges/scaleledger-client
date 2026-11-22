@@ -1,15 +1,16 @@
 import asyncio
 from contextlib import chdir, suppress
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 import uuid
 
+from api import RecordReceiptDTO
 from events import WeighingCompletedEvent
 from main import HeadlessClient
-from models import Record, WeighingStation
+from models import Record, RecordUploadResult, WeighingStation
 from settings_sync import SettingsSnapshot
 from workers import RecordUploadWorker
 
@@ -82,7 +83,10 @@ class DatabaseLocationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restart_and_settings_replacement_upload_the_original_station(self):
         db_path = self.root / "offline.sqlite3"
-        event = WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=31)
+        event = WeighingCompletedEvent(
+            station_id=7, rfid_card_uid="12345678", weight=31,
+            timestamp=datetime(2026, 11, 23, 1, tzinfo=UTC),
+        )
 
         def snapshot(station_id):
             return SettingsSnapshot.from_responses(
@@ -115,7 +119,12 @@ class DatabaseLocationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await Record.get(uuid=event.uuid)).station_id, 7)
             await restarted.restore_local_state()
 
-            api = Mock(create_record=AsyncMock(return_value={}))
+            receipt = RecordReceiptDTO(
+                uuid=uuid.UUID(event.uuid), station_id=7, weight=28,
+                measured_at=event.timestamp + timedelta(minutes=5), cancelled_at=None,
+                daily_number=18, number_date=date(2026, 11, 23),
+            )
+            api = Mock(create_record=AsyncMock(return_value=receipt))
             uploader = RecordUploadWorker(api, restarted.upload_queue, "cached-token")
             uploader.logger = Mock()
             uploading = asyncio.create_task(uploader.run())
@@ -133,6 +142,51 @@ class DatabaseLocationTests(unittest.IsolatedAsyncioTestCase):
                  uploaded.weight, uploaded.measured_at),
                 (event.uuid, 7, event.rfid_card_uid, event.weight, event.timestamp),
             )
-            self.assertEqual(await Record.all().count(), 0)
+            await snapshot(9).persist()
+            original = await Record.get(uuid=event.uuid)
+            self.assertEqual(
+                (original.station_id, original.weight, original.measured_at),
+                (7, event.weight, event.timestamp),
+            )
+            confirmed = await RecordUploadResult.get(record_id=event.uuid)
+            self.assertEqual(
+                (confirmed.weight, confirmed.measured_at, confirmed.daily_number, confirmed.number_date),
+                (receipt.weight, receipt.measured_at, 18, receipt.number_date),
+            )
+            self.assertIsNone(confirmed.error)
+        finally:
+            await restarted.close()
+
+    async def test_restart_queues_only_records_without_a_result(self):
+        db_path = self.root / "upload-results.sqlite3"
+        client = self.make_client(db_path)
+        pending, confirmed, rejected = [
+            WeighingCompletedEvent(station_id=7, rfid_card_uid="12345678", weight=31)
+            for _ in range(3)
+        ]
+        try:
+            await client.setup()
+            for event in (pending, confirmed, rejected):
+                await client.save_record(event)
+            await RecordUploadResult.create(
+                record_id=confirmed.uuid, weight=29, measured_at=confirmed.timestamp,
+                cancelled_at=confirmed.timestamp + timedelta(hours=1),
+                daily_number=1, number_date=confirmed.timestamp.date(),
+            )
+            await RecordUploadResult.create(record_id=rejected.uuid, error="HTTP 422")
+        finally:
+            await client.close()
+
+        restarted = self.make_client(db_path)
+        try:
+            await restarted.setup()
+            await restarted.restore_local_state()
+            self.assertEqual(restarted.upload_queue.get_nowait(), pending.uuid)
+            self.assertTrue(restarted.upload_queue.empty())
+            self.assertEqual(await Record.all().count(), 3)
+            result = await RecordUploadResult.get(record_id=confirmed.uuid)
+            self.assertEqual(result.cancelled_at, confirmed.timestamp + timedelta(hours=1))
+            review = await RecordUploadResult.get(record_id=rejected.uuid)
+            self.assertEqual(review.error, "HTTP 422")
         finally:
             await restarted.close()

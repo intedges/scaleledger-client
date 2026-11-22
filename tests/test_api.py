@@ -1,12 +1,12 @@
 import json
-from datetime import datetime
+from datetime import date, datetime
 import unittest
 from unittest.mock import patch
 import uuid
 
 import httpx2
 
-from api import APIClient, RecordCreateDTO
+from api import APIClient, InvalidRecordResponse, RecordCreateDTO, RecordReceiptDTO
 
 
 class EnrollmentRequestTests(unittest.IsolatedAsyncioTestCase):
@@ -68,6 +68,8 @@ class RecordCreationTests(unittest.IsolatedAsyncioTestCase):
 
         def respond(request):
             requests.append(request)
+            if isinstance(body, bytes):
+                return httpx2.Response(status, content=body)
             return httpx2.Response(status, json=body)
 
         async_client = httpx2.AsyncClient
@@ -88,17 +90,25 @@ class RecordCreationTests(unittest.IsolatedAsyncioTestCase):
             measured_at=datetime.fromisoformat("2026-10-25T09:34:56+09:00"),
         )
 
-    async def test_sends_saved_station_with_record_for_created_and_duplicate_responses(self):
-        body = {
+        self.body = {
             "uuid": str(self.record.uuid),
             "station_id": 7,
-            "weight": 120,
-            "measured_at": "2026-10-25T00:34:56Z",
+            "weight": 118,
+            "measured_at": "2026-10-26T01:23:45Z",
+            "cancelled_at": None,
+            "daily_number": 3,
+            "number_date": "2026-10-25",
         }
+
+    async def test_sends_saved_station_with_record_for_created_and_duplicate_responses(self):
         for status in (201, 200):
             with self.subTest(status=status):
-                api, requests = self.client_answering(status, body)
-                self.assertEqual(await api.create_record("secret", self.record), body)
+                api, requests = self.client_answering(status, self.body)
+                self.assertEqual(await api.create_record("secret", self.record), RecordReceiptDTO(
+                    uuid=self.record.uuid, station_id=7, weight=118,
+                    measured_at=datetime.fromisoformat("2026-10-26T01:23:45Z"),
+                    cancelled_at=None, daily_number=3, number_date=date(2026, 10, 25),
+                ))
                 self.assertEqual(len(requests), 1)
                 request = requests[0]
                 self.assertEqual(request.method, "POST")
@@ -111,6 +121,59 @@ class RecordCreationTests(unittest.IsolatedAsyncioTestCase):
                     "weight": 120,
                     "measured_at": "2026-10-25T09:34:56+09:00",
                 })
+
+    async def test_duplicate_can_acknowledge_a_cancelled_record(self):
+        cancelled_at = "2026-10-28T18:54:32+09:00"
+        api, _ = self.client_answering(200, self.body | {"cancelled_at": cancelled_at})
+        receipt = await api.create_record("secret", self.record)
+        self.assertEqual(receipt.cancelled_at, datetime.fromisoformat(cancelled_at))
+        self.assertEqual(receipt.daily_number, 3)
+
+    async def test_legacy_response_has_no_daily_number_or_number_date(self):
+        legacy = self.body.copy()
+        del legacy["daily_number"], legacy["number_date"]
+        api, _ = self.client_answering(201, legacy)
+        receipt = await api.create_record("secret", self.record)
+        self.assertIsNone(receipt.daily_number)
+        self.assertIsNone(receipt.number_date)
+        self.assertEqual(receipt.weight, 118)
+
+    async def test_server_integer_limits_are_valid_receipt_values(self):
+        for weight, number in ((-2_147_483_648, 1), (2_147_483_647, 2_147_483_647)):
+            with self.subTest(weight=weight, number=number):
+                api, _ = self.client_answering(201, self.body | {"weight": weight, "daily_number": number})
+                receipt = await api.create_record("secret", self.record)
+                self.assertEqual((receipt.weight, receipt.daily_number), (weight, number))
+
+    async def test_invalid_acknowledgments_raise_record_response_error(self):
+        invalid_bodies = [
+            [], b"not JSON",
+            self.body | {"uuid": str(uuid.uuid4())}, self.body | {"uuid": 42},
+            self.body | {"uuid": "bad-uuid"}, self.body | {"station_id": 8},
+            self.body | {"station_id": 7.0}, self.body | {"weight": False},
+            self.body | {"weight": -2_147_483_649}, self.body | {"weight": 2_147_483_648},
+            self.body | {"measured_at": "2026-10-25T09:34:56"},
+            self.body | {"measured_at": "0001-01-01T00:00:00+09:00"},
+            self.body | {"cancelled_at": "9999-12-31T23:59:59-09:00"},
+            self.body | {"cancelled_at": "unknown"}, self.body | {"cancelled_at": 0},
+            self.body | {"daily_number": True}, self.body | {"daily_number": 0},
+            self.body | {"daily_number": 2_147_483_648}, self.body | {"weight": 2**100},
+            self.body | {"daily_number": None, "number_date": None},
+            self.body | {"number_date": "2026-02-30"}, self.body | {"number_date": "20261025"},
+            self.body | {"number_date": None},
+        ]
+        for field in self.body:
+            invalid_bodies.append({k: v for k, v in self.body.items() if k != field})
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                api, _ = self.client_answering(200, body)
+                with self.assertRaises(InvalidRecordResponse):
+                    await api.create_record("secret", self.record)
+
+    async def test_other_success_status_does_not_acknowledge_a_record(self):
+        api, _ = self.client_answering(202, self.body)
+        with self.assertRaises(InvalidRecordResponse):
+            await api.create_record("secret", self.record)
 
     async def test_station_and_uuid_rejections_propagate_to_the_uploader(self):
         for field in ("station_id", "uuid"):

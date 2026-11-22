@@ -60,9 +60,28 @@ class Record(Model):
 
     class Meta:
         table = "record"
-    
+
+    @classmethod
+    def pending_uploads(cls):
+        return cls.filter(upload_result__record_id__isnull=True)
+
     def __repr__(self):
         return f"<Record(rfid_card_uid={self.rfid_card_uid}, weight={self.weight}, measured_at={self.measured_at})>"
+
+
+class RecordUploadResult(Model):
+    record = fields.OneToOneField("models.Record", related_name="upload_result", primary_key=True)
+    weight = fields.IntField(null=True)
+    measured_at = fields.DatetimeField(null=True)
+    cancelled_at = fields.DatetimeField(null=True)
+    daily_number = fields.IntField(null=True)
+    number_date = fields.DateField(null=True)
+    # A rejection or invalid response needs review and ends automatic retries.
+    error = fields.TextField(null=True)
+    received_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "record_upload_result"
 
 
 class Species(Model):

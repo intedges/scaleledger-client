@@ -117,7 +117,6 @@ class HeadlessClient:
                 )
             else:
                 # No await between commit, upload handoff and acknowledgement.
-                # Upload may subsequently purge the row; the acknowledgement stays valid.
                 if isinstance(event, WeighingCompletedEvent):
                     self.upload_queue.put_nowait(event.uuid)
                 result.set_result(None)
@@ -182,7 +181,7 @@ class HeadlessClient:
     
     async def restore_local_state(self):
         self.configuration = await load_configuration()
-        unsynced_records = await Record.all().values_list("uuid", flat=True)
+        unsynced_records = await Record.pending_uploads().values_list("uuid", flat=True)
         for record_uuid in unsynced_records:
             self.upload_queue.put_nowait(str(record_uuid))
         self.logger.info("sys.recovery.records_enqueued", count=len(unsynced_records))
@@ -433,7 +432,10 @@ class HeadlessClient:
             # Children first, as in a settings snapshot.
             for model in (RFIDCard, Producer, Species, WeighingStation, Gateway, CachedDeviceConfiguration):
                 await model.all().using_db(connection).delete()
-            discarded = await Record.all().using_db(connection).delete()
+            # SQLite's affected-row count also includes cascaded upload results.
+            records = Record.all().using_db(connection)
+            discarded = await records.count()
+            await records.delete()
         self.configuration = DeviceConfiguration()
         return discarded
 

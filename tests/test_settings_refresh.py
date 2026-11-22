@@ -9,7 +9,7 @@ import uuid
 import httpx2
 
 from api import AuthDegradedError
-from models import Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from models import Gateway, Producer, RecordUploadResult, RFIDCard, Species, WeighingStation
 from tests import test_client as lifecycle
 
 
@@ -261,7 +261,7 @@ class SettingsRefreshTests(unittest.IsolatedAsyncioTestCase):
         event = await self.emit_and_save()
         await self.wait_for(self.client.upload_queue.join())
         self.assertEqual(str(self.api.create_record.call_args.kwargs["record"].uuid), event.uuid)
-        self.assertFalse(await Record.filter(uuid=event.uuid).exists())
+        self.assertIsNone((await RecordUploadResult.get(record_id=event.uuid)).error)
         self.assertFalse(release.is_set())
         release.set()
 

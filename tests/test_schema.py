@@ -14,7 +14,9 @@ from tortoise.exceptions import IntegrityError
 
 from main import HeadlessClient
 from device_configuration import DeviceConfiguration
-from models import CachedDeviceConfiguration, Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from models import (
+    CachedDeviceConfiguration, Gateway, Producer, Record, RecordUploadResult, RFIDCard, Species, WeighingStation,
+)
 from schema import migrate_optional_card_species
 from settings_sync import SettingsSnapshot, load_configuration
 from tests.test_device_configuration import configuration_response
@@ -106,6 +108,23 @@ class OptionalCardSpeciesMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.stored_data(), before)
             self.assertEqual(await load_configuration(), DeviceConfiguration())
             self.assertEqual(await CachedDeviceConfiguration.all().count(), 0)
+        finally:
+            await client.close()
+
+    async def test_startup_adds_upload_results_and_recovers_previous_pending_records(self):
+        await get_connection("default").execute_query('DROP TABLE "record_upload_result"')
+        before = await self.stored_data()
+        await Tortoise.close_connections()
+        client = HeadlessClient(base_url=None, db_path=self.db_path)
+        client.logger = Mock()
+        client.station_manager = Mock()
+        try:
+            await client.setup()
+            await client.restore_local_state()
+            self.assertEqual(await self.stored_data(), before)
+            self.assertEqual(await RecordUploadResult.all().count(), 0)
+            self.assertEqual(client.upload_queue.get_nowait(), str(self.record.uuid))
+            self.assertTrue(client.upload_queue.empty())
         finally:
             await client.close()
 

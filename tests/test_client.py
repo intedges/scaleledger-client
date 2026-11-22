@@ -17,7 +17,8 @@ from websockets.http11 import Response
 from api import APIClient
 from events import WeighingCompletedEvent
 from main import HeadlessClient
-from models import Gateway, Producer, Record, RFIDCard, Species, WeighingStation
+from models import Gateway, Producer, Record, RecordUploadResult, RFIDCard, Species, WeighingStation
+from tests.helpers import accepted_receipt
 
 
 SERVER_URL = "http://127.0.0.1:8000"
@@ -179,12 +180,12 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "issued_at": self.now.isoformat(),
             }],
             "send_heartbeat": {},
-            "create_record": {},
         }
         for name, value in responses.items():
             method = getattr(self.api, name)
             method.side_effect = None
             method.return_value = value
+        self.api.create_record.side_effect = accepted_receipt
 
     async def emit_and_save(self):
         event = WeighingCompletedEvent(station_id=1, rfid_card_uid="12345678", weight=12)
@@ -203,6 +204,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         record = await Record.get(uuid=event.uuid)
         self.assertEqual(record.weight, 12)
         self.assertEqual(record.station_id, self.station.id)
+        self.assertFalse(await RecordUploadResult.filter(record_id=event.uuid).exists())
         self.assertEqual(self.client.gateway_id, self.gateway.id)
         self.assertEqual(self.client.market_cache.gateway_name, "Cached gateway")
         self.assertEqual(self.client.market_cache.get_rfid_info("12345678").producer_name, "Cached producer")
@@ -217,24 +219,16 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             StubWebSocket(failure=ConnectionClosedError(None, None)),
             connected,
         ]
-        uploaded = asyncio.Event()
-
-        async def accept_record(**kwargs):
-            uploaded.set()
-            return {}
-
-        self.api.create_record.side_effect = accept_record
         self.start(self.client.run())
         await self.wait_for(connected.listening.wait())
         event = await self.emit_and_save()
-        await self.wait_for(uploaded.wait())
         await self.wait_for(self.client.upload_queue.join())
 
         self.assertEqual(self.connections.opened.qsize(), 3)
         self.api.send_heartbeat.assert_not_awaited()
         self.assertEqual(str(self.api.create_record.call_args.kwargs["record"].uuid), event.uuid)
         self.assertEqual(self.api.create_record.call_args.kwargs["record"].station_id, event.station_id)
-        self.assertFalse(await Record.filter(uuid=event.uuid).exists())
+        self.assertIsNone((await RecordUploadResult.get(record_id=event.uuid)).error)
         self.manager.stop_all.assert_not_called()
 
     async def test_cached_pending_record_uploads_without_a_websocket_connection(self):
@@ -248,7 +242,7 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         async def accept_record(**kwargs):
             uploaded.set()
-            return {}
+            return accepted_receipt(**kwargs)
 
         self.api.create_record.side_effect = accept_record
         self.start(self.client.run())
@@ -259,23 +253,17 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.api.create_record.assert_awaited_once()
         self.assertEqual(self.api.create_record.call_args.kwargs["record"].uuid, record.uuid)
         self.assertEqual(self.api.create_record.call_args.kwargs["record"].station_id, 7)
-        self.assertFalse(await Record.filter(uuid=record.uuid).exists())
+        self.assertEqual((await Record.get(uuid=record.uuid)).weight, 19)
+        self.assertEqual((await RecordUploadResult.get(record_id=record.uuid)).daily_number, 18)
         self.manager.stop_all.assert_not_called()
 
     async def test_measurement_time_keeps_its_local_offset_through_storage_and_upload(self):
         await self.cached_setup()
         self.online_responses()
-        uploaded = asyncio.Event()
-
-        async def accept_record(**kwargs):
-            uploaded.set()
-            return {}
-
-        self.api.create_record.side_effect = accept_record
         self.start(self.client.run())
         await self.wait_for(self.started.wait())
         event = await self.emit_and_save()
-        await self.wait_for(uploaded.wait())
+        await self.wait_for(self.client.upload_queue.join())
 
         measured_at = self.api.create_record.call_args.kwargs["record"].measured_at
         self.assertEqual(event.timestamp.utcoffset(), datetime.now().astimezone().utcoffset())
@@ -699,6 +687,12 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
             encoding="utf-8",
         )
         await Record.create(uuid=uuid.uuid4(), station_id=1, rfid_card_uid="12345678", weight=19, measured_at=self.now)
+        confirmed = await Record.create(
+            uuid=uuid.uuid4(), station_id=1, rfid_card_uid="12345678", weight=27, measured_at=self.now,
+        )
+        await RecordUploadResult.create(
+            record=confirmed, weight=27, measured_at=self.now, daily_number=1, number_date=self.now.date(),
+        )
         requested = asyncio.Event()
 
         async def pending(token, **identity):
@@ -715,14 +709,14 @@ class ClientLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.api.request_enrollment.assert_awaited_with(
             stored["credential"], hostname="test-gateway", ip_address="127.0.0.1",
         )
-        for model in (Record, Gateway, WeighingStation, Species, Producer, RFIDCard):
+        for model in (Record, RecordUploadResult, Gateway, WeighingStation, Species, Producer, RFIDCard):
             self.assertEqual(await model.all().count(), 0, model.__name__)
         self.assertIsNone(self.client.gateway_id)
         self.assertTrue(self.client.upload_queue.empty())
         self.assertFalse(any(call.args[0] for call in self.manager.sync.call_args_list))
         self.assertIn(
             call("sys.auth.server_changed", previous="http://previous-server:8000",
-                 current=SERVER_URL, discarded_records=1),
+                 current=SERVER_URL, discarded_records=2),
             self.client.logger.warning.call_args_list,
         )
 
