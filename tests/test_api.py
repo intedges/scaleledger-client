@@ -132,11 +132,23 @@ class RecordCreationTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_response_has_no_daily_number_or_number_date(self):
         legacy = self.body.copy()
         del legacy["daily_number"], legacy["number_date"]
+        legacy["cancelled_at"] = "2026-10-28T18:54:32+09:00"
         api, _ = self.client_answering(201, legacy)
         receipt = await api.create_record("secret", self.record)
+        self.assertEqual(receipt.cancelled_at, datetime.fromisoformat(legacy["cancelled_at"]))
         self.assertIsNone(receipt.daily_number)
         self.assertIsNone(receipt.number_date)
         self.assertEqual(receipt.weight, 118)
+
+    async def test_four_field_response_from_before_cancellation_support_is_acknowledged(self):
+        legacy = {key: self.body[key] for key in ("uuid", "station_id", "weight", "measured_at")}
+        for status in (200, 201):
+            with self.subTest(status=status):
+                api, _ = self.client_answering(status, legacy)
+                receipt = await api.create_record("secret", self.record)
+                self.assertEqual((receipt.uuid, receipt.station_id, receipt.weight), (self.record.uuid, 7, 118))
+                self.assertEqual(receipt.measured_at, datetime.fromisoformat(legacy["measured_at"]))
+                self.assertEqual((receipt.cancelled_at, receipt.daily_number, receipt.number_date), (None, None, None))
 
     async def test_server_integer_limits_are_valid_receipt_values(self):
         for weight, number in ((-2_147_483_648, 1), (2_147_483_647, 2_147_483_647)):

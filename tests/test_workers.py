@@ -211,13 +211,14 @@ class RecordUploadWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_success_completes_without_a_number(self):
         body = self.body.copy()
-        del body["daily_number"], body["number_date"]
+        del body["daily_number"], body["number_date"], body["cancelled_at"]
         self.post.return_value = httpx2.Response(200, json=body)
         self.queue.put_nowait(self.record_uuid)
         await self.process_queue()
         self.post.assert_awaited_once()
         result = await RecordUploadResult.get(record_id=self.record_uuid)
         self.assertEqual(result.weight, 58)
+        self.assertIsNone(result.cancelled_at)
         self.assertIsNone(result.daily_number)
         self.assertIsNone(result.number_date)
         self.assertIsNone(result.error)

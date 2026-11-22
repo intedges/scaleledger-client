@@ -67,15 +67,16 @@ class RecordReceiptDTO:
         if type(weight) is not int or not -2_147_483_648 <= weight <= 2_147_483_647:
             raise InvalidRecordResponse("Invalid weight in record response")
         measured_at = _receipt_timestamp(body.get("measured_at"), "measured_at")
-        if "cancelled_at" not in body:
-            raise InvalidRecordResponse("Missing cancelled_at in record response")
-        cancelled_at = body["cancelled_at"]
+        # Servers predating cancellation acknowledged only UUID, station, weight and time.
+        cancelled_at = body.get("cancelled_at")
         if cancelled_at is not None:
             cancelled_at = _receipt_timestamp(cancelled_at, "cancelled_at")
 
         # Earlier servers acknowledged a saved record without issuing a number.
         daily_number = number_date = None
         if "daily_number" in body or "number_date" in body:
+            if "cancelled_at" not in body:
+                raise InvalidRecordResponse("Missing cancelled_at in record response")
             daily_number = body.get("daily_number")
             if type(daily_number) is not int or not 1 <= daily_number <= 2_147_483_647:
                 raise InvalidRecordResponse("Invalid daily_number in record response")
