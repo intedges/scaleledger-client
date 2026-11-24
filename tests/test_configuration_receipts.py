@@ -2,6 +2,7 @@ from concurrent.futures import Future
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
+import json
 import unittest
 from unittest.mock import Mock, patch
 import uuid
@@ -12,7 +13,7 @@ from managers import WeighingStationManager
 from models import WeighingStation
 from printer import EscPosBuilder, Receipt, ReceiptTemplate
 from suwol1000 import PrinterRequestPacket, WorkerState
-from tests.helpers import prepare_vehicle
+from tests.helpers import prepare_vehicle, receipt_text_and_qrs
 
 
 class ConfigurationReceiptTests(unittest.TestCase):
@@ -33,27 +34,35 @@ class ConfigurationReceiptTests(unittest.TestCase):
         self.assertIn("저울 1", named)
         self.assertLess(named.index("동해수산물경매장"), named.index("계량번호"))
 
-    def test_receipts_print_the_full_original_uuid_as_text_and_in_the_qr(self):
+    def test_receipts_lead_with_number_and_weight_and_print_uuid_and_qr(self):
         receipt = self.receipt(source_station_id=11)
-        record_id = str(receipt.record_uuid).encode("ascii")
-        qr = b'{"uuid":"' + record_id + b'","station_id":11}'
         for number, day, label in (
             (None, None, "계량번호 미확인"),
             (18, date(2026, 11, 14), "계량번호 18번"),
         ):
             with self.subTest(number=number):
                 raw = ReceiptTemplate.render(replace(receipt, daily_number=number, number_date=day))
-                self.assertIn(label.encode("cp949"), raw)
-                self.assertIn(b"\n" + record_id + b"\n", raw)
-                self.assertIn(
-                    b"\x1d(k" + (len(qr) + 3).to_bytes(2, "little") + b"1P0" + qr
-                    + b"\x1d(k\x03\x001Q0", raw,
-                )
+                text, qrs = receipt_text_and_qrs(raw)
+                qr, = qrs
+                self.assertEqual(qr, {
+                    "uuid": str(receipt.record_uuid), "station_id": 11, "rfid_card_uid": "12345678",
+                    "weight": 123, "measured_at": "2026-11-15T00:00:00+00:00",
+                })
+                self.assertIs(type(qr["weight"]), int)
+                self.assertIn(json.dumps(qr, separators=(",", ":")).encode(), raw)
+                weight_at = text.index("123 kg")
+                uuid_at = text.index(f"\n{receipt.record_uuid}\n")
+                self.assertLess(text.index(label), weight_at)
+                for detail in (receipt.producer_name, receipt.rfid_card_uid, receipt.gateway_name,
+                               receipt.station_name, "계량일시"):
+                    detail_at = text.index(detail)
+                    self.assertLess(weight_at, detail_at)
+                    self.assertLess(detail_at, uuid_at)
                 if day:
-                    self.assertIn("기준일 2026-11-14".encode("cp949"), raw)
-                    self.assertNotIn("미확인".encode("cp949"), raw)
+                    self.assertIn("기준일 2026-11-14", text)
+                    self.assertNotIn("미확인", text)
                 else:
-                    self.assertNotIn("기준일".encode("cp949"), raw)
+                    self.assertNotIn("기준일", text)
 
     def test_long_korean_header_wraps_without_splitting_characters(self):
         name = ("가나다라마바ABC " * 10)[:100]
@@ -109,7 +118,7 @@ class ConfigurationReceiptTests(unittest.TestCase):
         request = worker.exchange.call_args.args[0]
         self.assertIsInstance(request, PrinterRequestPacket)
         self.assertEqual(request.copies, 2)
-        text = request.document_bytes.decode("cp949")
+        text, _ = receipt_text_and_qrs(request.document_bytes)
         for original in ("기존 경매장", "기존 PC", "기존 저울", "기존 생산자", "기존 품목"):
             self.assertIn(original, text)
         for changed in ("새 경매장", "새 PC", "새 저울", "새 생산자", "새 품목"):

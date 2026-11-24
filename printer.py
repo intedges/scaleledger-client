@@ -6,6 +6,8 @@ from typing import Self
 import json
 import uuid
 
+from api import RecordCreateDTO
+
 
 ESC = 0x1B  # 27
 FS  = 0x1C  # 28
@@ -190,72 +192,63 @@ class Receipt:
     daily_number: int | None = None
     number_date: date | None = None
 
+    def registration_record(self) -> RecordCreateDTO | None:
+        # Older reprints lack the source station. An unassigned card is display text.
+        if self.source_station_id is None or self.rfid_card_uid.strip() in ("", "미지정"):
+            return None
+        weight = int(self.weight)
+        if weight != self.weight or self.measured_at.utcoffset() is None:
+            return None
+        return RecordCreateDTO(
+            uuid=self.record_uuid, station_id=self.source_station_id,
+            rfid_card_uid=self.rfid_card_uid, weight=weight, measured_at=self.measured_at,
+        )
+
 
 class ReceiptTemplate:
     @staticmethod
     def render(receipt: Receipt) -> bytes:
-        record_id = str(receipt.record_uuid)
-        qr_data = record_id
-        if receipt.source_station_id is not None:
-            qr_data = json.dumps(
-                {"uuid": record_id, "station_id": receipt.source_station_id}, separators=(",", ":"),
-            )
-
         builder = (
             EscPosBuilder()
-
-            # Header
             .set_align(Alignment.CENTER)
-            .set_quadruple(True)
             .set_bold(True)
-            .add_text("계 량 전 표")
-            .set_quadruple(False)
+            .add_text("계 량 전 표").feed_lines()
             .set_bold(False)
-            .feed_lines(2)
         )
         if receipt.auction_name:
-            builder.add_wrapped_text(receipt.auction_name).feed_lines(1)
+            builder.add_wrapped_text(receipt.auction_name)
 
         numbered = receipt.daily_number is not None and receipt.number_date is not None
         number_label = f"계량번호 {receipt.daily_number}번" if numbered else "계량번호 미확인"
-        builder.set_quadruple(True).set_bold(True).add_text(number_label).feed_lines(1)
+        builder.add_separator()
+        builder.set_quadruple(True).set_bold(True).add_text(number_label).feed_lines()
         builder.set_quadruple(False).set_bold(False)
         if numbered:
-            builder.add_text(f"기준일 {receipt.number_date.isoformat()}").feed_lines(1)
+            builder.add_text(f"기준일 {receipt.number_date.isoformat()}").feed_lines()
 
-        builder = (
+        (
             builder
-            # Meta Data
-            .set_align(Alignment.LEFT)
-            .add_separator("=", 42)
-            .add_kv("계량일시", receipt.measured_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
-            .add_kv("계 량 기", receipt.gateway_name)
-            .add_kv("계 근 대", receipt.station_name)
-            .add_separator("-", 42)
-            
-            # Body
-            .add_kv("생산자명", receipt.producer_name)
-            .add_kv("품 목 명", receipt.species_name)
-            .add_kv("카드번호", receipt.rfid_card_uid)
-            
-            # Weight
-            .set_align(Alignment.RIGHT)
             .set_quadruple(True)
             .set_bold(True)
-            .add_text(f"{receipt.weight:,} kg")
-            .feed_lines(1)
+            .add_text(f"{receipt.weight:,} kg").feed_lines()
             .set_quadruple(False)
             .set_bold(False)
-            
-            # Footer
+            .set_align(Alignment.LEFT)
+            .add_separator("=")
+            .add_kv("생산자명", receipt.producer_name)
+            .add_kv("품목명", receipt.species_name)
+            .add_kv("계량일시", receipt.measured_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+            .add_separator()
+            .add_kv("계량 PC", receipt.gateway_name)
+            .add_kv("계근대", receipt.station_name)
+            .add_kv("카드번호", receipt.rfid_card_uid)
+            .add_separator()
             .set_align(Alignment.CENTER)
-            .add_separator("=", 42)
-            .add_text("원본 UUID").feed_lines(1)
-            .add_text(record_id).feed_lines(2)
-            .add_qr_code(qr_data, size=4).feed_lines(2)
-            .add_text("SUWOL ScaleLedger System")
-
-            .cut()
+            .add_text("원본 UUID").feed_lines()
+            .add_text(str(receipt.record_uuid)).feed_lines(2)
         )
-        
-        return builder.build()
+        record = receipt.registration_record()
+        if record is not None:
+            qr_data = json.dumps(record.to_payload(), separators=(",", ":"))
+            builder.add_qr_code(qr_data, size=4).feed_lines(2)
+        return builder.add_text("SUWOL ScaleLedger System").cut().build()

@@ -14,6 +14,15 @@ class RecordCreateDTO:
     weight: int
     measured_at: datetime
 
+    def to_payload(self) -> dict[str, str | int]:
+        return {
+            "uuid": str(self.uuid),
+            "station_id": self.station_id,
+            "rfid_card_uid": self.rfid_card_uid,
+            "weight": self.weight,
+            "measured_at": self.measured_at.isoformat(),
+        }
+
 
 class InvalidRecordResponse(ValueError):
     """The server did not acknowledge the submitted measurement as expected."""
@@ -142,14 +151,7 @@ class APIClient:
 
     async def create_record(self, access_token: str, record: RecordCreateDTO) -> RecordReceiptDTO:
         headers = {"Authorization": f"Gateway {access_token}"}
-        payload = {
-            "uuid": str(record.uuid),
-            "rfid_card_uid": record.rfid_card_uid,
-            "station_id": record.station_id,
-            "weight": record.weight,
-            "measured_at": record.measured_at.isoformat(),
-        }
-        response = await self.client.post("weighing/api/records/", json=payload, headers=headers)
+        response = await self.client.post("weighing/api/records/", json=record.to_payload(), headers=headers)
         response.raise_for_status()
         if response.status_code not in (200, 201):
             raise InvalidRecordResponse(f"Unexpected record response: HTTP {response.status_code}")
