@@ -15,6 +15,7 @@ from main import HeadlessClient
 from models import CachedDeviceConfiguration, Gateway, Producer, Record, RecordUploadResult, RFIDCard, WeighingStation
 from printer import ReceiptTemplate
 from suwol1000 import PrinterRequestPacket, ResponsePacket, WorkerState
+from tests.helpers import receipt_text_and_qrs
 from weighing_cycle import CycleState
 
 
@@ -112,7 +113,13 @@ class FirstReceiptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         document, = self.printed(station_id)
         self.assertIn(label.encode("cp949"), document)
         self.assertIn(f"{weight} kg".encode(), document)
-        self.assertIn(f'1P0{{"uuid":"{original.uuid}","station_id":{station_id}}}'.encode(), document)
+        text, qrs = receipt_text_and_qrs(document)
+        self.assertIn(f"\n{original.uuid}\n", text)
+        self.assertEqual(qrs, [{
+            "uuid": str(original.uuid), "station_id": station_id,
+            "rfid_card_uid": original.rfid_card_uid, "weight": weight,
+            "measured_at": original.measured_at.astimezone().isoformat(),
+        }])
         return original
 
     async def test_simultaneous_tags_receive_their_own_numbers_and_original_weights(self):

@@ -12,7 +12,7 @@ from printer import Receipt
 from suwol1000 import (
     DeviceResponseTimeout, PrinterRequestPacket, VoiceCode, WeighingStationWorker, WorkerState,
 )
-from tests.helpers import prepare_vehicle
+from tests.helpers import prepare_vehicle, receipt_text_and_qrs
 from tests.test_station_cycle import Clock, CycleScale, FIRST_CARD, SECOND_CARD
 from weighing_cycle import CycleState
 
@@ -66,7 +66,7 @@ class StationReceiptWaitTests(unittest.TestCase):
         self.assertEqual(self.step("print"), WorkerState.IDLE)
 
     def documents(self):
-        return [request.document_bytes.decode("cp949") for request in self.scale.requests
+        return [receipt_text_and_qrs(request.document_bytes)[0] for request in self.scale.requests
                 if isinstance(request, PrinterRequestPacket)]
 
     def test_number_available_by_cutoff_survives_a_slow_poll_with_original_weight(self):

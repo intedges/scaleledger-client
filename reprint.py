@@ -35,8 +35,8 @@ class ReprintRequest:
         if not isinstance(receipt, dict):
             raise ReprintRequestError("invalid_receipt")
         source_station_id = daily_number = number_date = None
-        # Older reprint messages supplied only the destination. A corrected
-        # station may differ from the original, so it cannot identify the QR.
+        # Older reprint messages supplied only the destination station,
+        # which can differ from the original weighing station.
         if receipt.keys() & {"source_station_id", "daily_number", "number_date"}:
             source_station_id = receipt.get("source_station_id")
             if type(source_station_id) is not int or not 1 <= source_station_id <= 9_223_372_036_854_775_807:
