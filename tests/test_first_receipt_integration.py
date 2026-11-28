@@ -114,7 +114,7 @@ class FirstReceiptIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(label.encode("cp949"), document)
         self.assertIn(f"{weight} kg".encode(), document)
         text, qrs = receipt_text_and_qrs(document)
-        self.assertIn(f"\n{original.uuid}\n", text)
+        self.assertIn(f"\nUUID  {original.uuid}\n", text)
         self.assertEqual(qrs, [{
             "uuid": str(original.uuid), "station_id": station_id,
             "rfid_card_uid": original.rfid_card_uid, "weight": weight,
@@ -134,7 +134,7 @@ class FirstReceiptIntegrationTests(unittest.IsolatedAsyncioTestCase):
             station_id = original.station_id
             result = await RecordUploadResult.get(record_id=original.uuid)
             self.assertEqual((result.weight, result.daily_number), (58, 100 + station_id))
-            self.assertIn("기준일 2026-11-22".encode("cp949"), self.printed(station_id)[0])
+            self.assertIn(b"2026-11-22\n", self.printed(station_id)[0])
 
     async def test_stalled_upload_allows_both_stations_to_save_and_print_then_only_updates_db(self):
         started, release = asyncio.Event(), asyncio.Event()

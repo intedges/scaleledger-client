@@ -24,15 +24,22 @@ class ConfigurationReceiptTests(unittest.TestCase):
             weight=Decimal(123), measured_at=datetime(2026, 11, 15, tzinfo=UTC), **values,
         )
 
-    def test_auction_header_is_optional_and_preserves_gateway_and_station(self):
+    def test_auction_footer_is_optional_and_preserves_gateway_and_station(self):
         base = self.receipt()
         original = ReceiptTemplate.render(base).decode("cp949")
         named = ReceiptTemplate.render(replace(base, auction_name="동해수산물경매장")).decode("cp949")
         self.assertNotIn("동해수산물경매장", original)
-        self.assertIn("동해수산물경매장", named)
+        self.assertEqual(named.count("동해수산물경매장"), 1)
         self.assertIn("현장 PC", named)
         self.assertIn("저울 1", named)
-        self.assertLess(named.index("동해수산물경매장"), named.index("계량번호"))
+        self.assertLess(named.index(str(base.record_uuid)), named.index("동해수산물경매장"))
+        for text in (original, named):
+            self.assertNotIn("SUWOL", text)
+
+    def test_title_number_and_weight_are_double_size(self):
+        raw = ReceiptTemplate.render(self.receipt(daily_number=18, number_date=date(2026, 11, 14)))
+        for large in ("계 량 전 표\n", "계량번호 18번\n123 kg\n"):
+            self.assertIn(b"\x1d!\x11\x1bE\x01" + large.encode("cp949") + b"\x1d!\x00", raw)
 
     def test_receipts_lead_with_number_and_weight_and_print_uuid_and_qr(self):
         receipt = self.receipt(source_station_id=11)
@@ -50,21 +57,26 @@ class ConfigurationReceiptTests(unittest.TestCase):
                 })
                 self.assertIs(type(qr["weight"]), int)
                 self.assertIn(json.dumps(qr, separators=(",", ":")).encode(), raw)
+                # One line feed follows the QR code, then the feed that clears the cutter.
+                self.assertTrue(raw.endswith(b"1Q0\n\x1bd\x03\x1dV\x00"))
                 weight_at = text.index("123 kg")
-                uuid_at = text.index(f"\n{receipt.record_uuid}\n")
+                uuid_at = text.index(f"\nUUID  {receipt.record_uuid}\n")
                 self.assertLess(text.index(label), weight_at)
                 for detail in (receipt.producer_name, receipt.rfid_card_uid, receipt.gateway_name,
                                receipt.station_name, "계량일시"):
                     detail_at = text.index(detail)
                     self.assertLess(weight_at, detail_at)
                     self.assertLess(detail_at, uuid_at)
+                # The numbering date takes its own unlabeled line right above the number.
+                above = text[text.index("-" * 42):text.index(label)]
+                self.assertEqual(above.count("\n"), 2 if day else 1)
+                self.assertEqual(text[text.index(label):weight_at].count("\n"), 1)
+                self.assertNotIn("기준일", text)
                 if day:
-                    self.assertIn("기준일 2026-11-14", text)
+                    self.assertIn("\n2026-11-14\n", above)
                     self.assertNotIn("미확인", text)
-                else:
-                    self.assertNotIn("기준일", text)
 
-    def test_long_korean_header_wraps_without_splitting_characters(self):
+    def test_long_korean_auction_name_wraps_without_splitting_characters(self):
         name = ("가나다라마바ABC " * 10)[:100]
         rendered = EscPosBuilder().add_wrapped_text(name).build()[3:]
         lines = rendered.splitlines()
