@@ -118,7 +118,7 @@ class EscPosBuilder:
         return self
 
     def add_wrapped_text(self, text: str, columns: int = 42) -> Self:
-        """Wrap the normal-width header without splitting a Korean character."""
+        """Wrap normal-width text without splitting a Korean character."""
         line = ""
         width = 0
         for character in text:
@@ -211,25 +211,24 @@ class ReceiptTemplate:
         builder = (
             EscPosBuilder()
             .set_align(Alignment.CENTER)
+            .set_quadruple(True)
             .set_bold(True)
             .add_text("계 량 전 표").feed_lines()
+            .set_quadruple(False)
             .set_bold(False)
         )
-        if receipt.auction_name:
-            builder.add_wrapped_text(receipt.auction_name)
 
         numbered = receipt.daily_number is not None and receipt.number_date is not None
         number_label = f"계량번호 {receipt.daily_number}번" if numbered else "계량번호 미확인"
         builder.add_separator()
-        builder.set_quadruple(True).set_bold(True).add_text(number_label).feed_lines()
-        builder.set_quadruple(False).set_bold(False)
         if numbered:
-            builder.add_text(f"기준일 {receipt.number_date.isoformat()}").feed_lines()
+            builder.add_text(receipt.number_date.isoformat()).feed_lines()
 
         (
             builder
             .set_quadruple(True)
             .set_bold(True)
+            .add_text(number_label).feed_lines()
             .add_text(f"{receipt.weight:,} kg").feed_lines()
             .set_quadruple(False)
             .set_bold(False)
@@ -243,12 +242,18 @@ class ReceiptTemplate:
             .add_kv("계근대", receipt.station_name)
             .add_kv("카드번호", receipt.rfid_card_uid)
             .add_separator()
+            # The label, two spaces and the 36-character value fill the 42 columns exactly.
+            .add_kv("UUID", str(receipt.record_uuid))
             .set_align(Alignment.CENTER)
-            .add_text("원본 UUID").feed_lines()
-            .add_text(str(receipt.record_uuid)).feed_lines(2)
+            .feed_lines()
         )
         record = receipt.registration_record()
         if record is not None:
             qr_data = json.dumps(record.to_payload(), separators=(",", ":"))
-            builder.add_qr_code(qr_data, size=4).feed_lines(2)
-        return builder.add_text("SUWOL ScaleLedger System").cut().build()
+            builder.add_qr_code(qr_data, size=4).feed_lines()
+        if receipt.auction_name:
+            builder.add_wrapped_text(receipt.auction_name)
+        # The cutter sits past the print head, so this feed first carries the last line to the blade
+        # and only the rest is bottom margin. That split is unmeasured, so keep the four lines used in
+        # the field. The last line already ends with a line feed, which leaves three.
+        return builder.cut(pre_feed_lines=3).build()

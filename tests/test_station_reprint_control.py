@@ -64,7 +64,7 @@ class ReprintPayloadTests(unittest.TestCase):
         self.assertEqual(receipt.measured_at.utcoffset(), timedelta(hours=9))
         self.assertEqual(receipt.weight, Decimal(240))
         text, qrs = receipt_text_and_qrs(ReceiptTemplate.render(receipt))
-        for value in (f"\n{receipt.record_uuid}\n", "기준일 2026-11-14", "계량번호 18번",
+        for value in (f"\nUUID  {receipt.record_uuid}\n", "2026-11-14\n", "계량번호 18번",
                       "서버의 생산자", "미지정", "변경된 경매장 PC", "지정한 계량대", "240 kg"):
             self.assertIn(value, text)
         self.assertEqual(qrs, [{
@@ -81,7 +81,7 @@ class ReprintPayloadTests(unittest.TestCase):
         self.assertIsNone(request.receipt.source_station_id)
         text = ReceiptTemplate.render(request.receipt).decode("cp949")
         self.assertIn("계량번호 미확인", text)
-        self.assertIn(f"\n{request.receipt.record_uuid}\n", text)
+        self.assertIn(f"\nUUID  {request.receipt.record_uuid}\n", text)
         self.assertNotIn("\x1d(k", text)
 
     def test_reprint_without_a_card_prints_the_original_uuid_and_omits_qr(self):
@@ -91,7 +91,7 @@ class ReprintPayloadTests(unittest.TestCase):
                 payload["receipt"]["rfid_card_uid"] = card
                 receipt = ReprintRequest.from_payload(payload).receipt
                 document = ReceiptTemplate.render(receipt)
-                self.assertIn(f"\n{receipt.record_uuid}\n".encode(), document)
+                self.assertIn(f"\nUUID  {receipt.record_uuid}\n".encode(), document)
                 self.assertNotIn(b"\x1d(k", document)
 
     def test_required_fields_and_types_are_not_defaulted_or_coerced(self):

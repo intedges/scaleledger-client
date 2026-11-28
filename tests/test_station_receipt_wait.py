@@ -75,7 +75,7 @@ class StationReceiptWaitTests(unittest.TestCase):
         self.clock.now = 3.0
         self.finish()
         document, = self.documents()
-        for expected in ("계량번호 18번", "기준일 2026-11-22", self.event.uuid, "120 kg"):
+        for expected in ("계량번호 18번", "2026-11-22\n", self.event.uuid, "120 kg"):
             self.assertIn(expected, document)
         self.assertNotIn("103 kg", document)
         self.assertEqual(self.worker.cycle.state, CycleState.LOCKED)
